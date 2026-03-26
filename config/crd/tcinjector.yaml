@@ -24,6 +24,19 @@ spec:
               type: object
               required: [rules]
               properties:
+                enablePeriodicDelayRotation:
+                  type: boolean
+                  default: false
+                  description: >
+                    When true, the controller periodically re-randomizes delays within [minDelay, maxDelay]
+                    at the interval specified by delayInterval. Defaults to false.
+                delayInterval:
+                  type: string
+                  default: "30s"
+                  description: >
+                    Interval between periodic delay re-randomizations.
+                    Only takes effect when enablePeriodicDelayRotation is true.
+                    Accepts Go duration strings (e.g. "30s", "1m", "2m30s"). Defaults to "30s".
                 rules:
                   type: array
                   items:

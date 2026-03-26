@@ -166,8 +166,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 	}
 
-	// Re-randomize delays periodically so the delay stays in [min,max].
-	return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+	// If any TCInjector has periodic delay rotation enabled, requeue after the shortest interval.
+	var requeueAfter time.Duration
+	for _, injector := range injectorList.Items {
+		if injector.DeletionTimestamp != nil || !injector.Spec.EnablePeriodicDelayRotation {
+			continue
+		}
+		interval := 30 * time.Second
+		if injector.Spec.DelayInterval != nil && injector.Spec.DelayInterval.Duration > 0 {
+			interval = injector.Spec.DelayInterval.Duration
+		}
+		if requeueAfter == 0 || interval < requeueAfter {
+			requeueAfter = interval
+		}
+	}
+	return reconcile.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // SetupWithManager registers the controller with the manager, watching both

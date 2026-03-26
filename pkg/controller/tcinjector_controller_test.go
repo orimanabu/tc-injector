@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -155,6 +156,21 @@ func tcInjector(name string, rules []tcv1alpha1.DelayRule) *tcv1alpha1.TCInjecto
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec:       tcv1alpha1.TCInjectorSpec{Rules: rules},
 	}
+}
+
+func tcInjectorWithRotation(name string, rules []tcv1alpha1.DelayRule, enabled bool, interval *metav1.Duration) *tcv1alpha1.TCInjector {
+	return &tcv1alpha1.TCInjector{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: tcv1alpha1.TCInjectorSpec{
+			Rules:                       rules,
+			EnablePeriodicDelayRotation: enabled,
+			DelayInterval:               interval,
+		},
+	}
+}
+
+func durationPtr(d time.Duration) *metav1.Duration {
+	return &metav1.Duration{Duration: d}
 }
 
 func reconcileReq(name string) reconcile.Request {
@@ -373,15 +389,191 @@ func TestReconcile_VethFinderError_SkipsPod(t *testing.T) {
 	}
 }
 
-func TestReconcile_RequeuesAfter30s(t *testing.T) {
+func TestReconcile_NoRequeueWhenNoTCInjectors(t *testing.T) {
+	// With no TCInjectors at all, periodic rotation cannot be enabled → no requeue.
 	r, _ := buildReconciler(t, nil, newFakeVethFinder(nil), newFakeTCApplier())
 	result, err := r.Reconcile(context.Background(), reconcileReq(""))
 	if err != nil {
 		t.Fatalf("Reconcile error: %v", err)
 	}
-	want := 30 * 1e9 // 30 seconds in nanoseconds
-	if result.RequeueAfter.Nanoseconds() != int64(want) {
-		t.Errorf("RequeueAfter = %v, want 30s", result.RequeueAfter)
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter = %v, want 0 (no requeue)", result.RequeueAfter)
+	}
+}
+
+// ---- periodic delay rotation tests ----
+
+func TestReconcile_PeriodicRotation_DisabledByDefault_NoRequeue(t *testing.T) {
+	// enablePeriodicDelayRotation defaults to false → reconciler must not requeue.
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+			MinDelay: 10, MaxDelay: 10,
+		},
+	})
+	r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+
+	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter = %v, want 0 when enablePeriodicDelayRotation is false", result.RequeueAfter)
+	}
+}
+
+func TestReconcile_PeriodicRotation_ExplicitlyDisabled_NoRequeue(t *testing.T) {
+	// enablePeriodicDelayRotation: false explicitly → no requeue.
+	injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+			MinDelay: 10, MaxDelay: 10,
+		},
+	}, false, durationPtr(5*time.Second))
+	r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+
+	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter = %v, want 0 when enablePeriodicDelayRotation is false", result.RequeueAfter)
+	}
+}
+
+func TestReconcile_PeriodicRotation_Enabled_DefaultInterval(t *testing.T) {
+	// enablePeriodicDelayRotation: true, delayInterval: nil → default 30s.
+	injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+			MinDelay: 10, MaxDelay: 10,
+		},
+	}, true, nil)
+	r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+
+	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Errorf("RequeueAfter = %v, want 30s (default)", result.RequeueAfter)
+	}
+}
+
+func TestReconcile_PeriodicRotation_Enabled_CustomInterval(t *testing.T) {
+	// enablePeriodicDelayRotation: true with a custom delayInterval → use that interval.
+	injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+			MinDelay: 10, MaxDelay: 10,
+		},
+	}, true, durationPtr(2*time.Minute))
+	r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+
+	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if result.RequeueAfter != 2*time.Minute {
+		t.Errorf("RequeueAfter = %v, want 2m", result.RequeueAfter)
+	}
+}
+
+func TestReconcile_PeriodicRotation_MultipleInjectors_MinIntervalUsed(t *testing.T) {
+	// Two injectors both enabled with different intervals → shortest wins.
+	injectorA := tcInjectorWithRotation("injector-a", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}},
+			MinDelay: 10, MaxDelay: 10,
+		},
+	}, true, durationPtr(1*time.Minute))
+	injectorB := tcInjectorWithRotation("injector-b", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "b"}},
+			MinDelay: 20, MaxDelay: 20,
+		},
+	}, true, durationPtr(15*time.Second))
+	r, _ := buildReconciler(t, []client.Object{injectorA, injectorB}, newFakeVethFinder(nil), newFakeTCApplier())
+
+	result, err := r.Reconcile(context.Background(), reconcileReq("injector-a"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if result.RequeueAfter != 15*time.Second {
+		t.Errorf("RequeueAfter = %v, want 15s (minimum of 60s and 15s)", result.RequeueAfter)
+	}
+}
+
+func TestReconcile_PeriodicRotation_OnlyEnabledInjectorCounted(t *testing.T) {
+	// One injector enabled, one disabled → use only the enabled one's interval.
+	enabled := tcInjectorWithRotation("enabled", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}},
+			MinDelay: 10, MaxDelay: 10,
+		},
+	}, true, durationPtr(45*time.Second))
+	disabled := tcInjectorWithRotation("disabled", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "b"}},
+			MinDelay: 20, MaxDelay: 20,
+		},
+	}, false, durationPtr(5*time.Second))
+	r, _ := buildReconciler(t, []client.Object{enabled, disabled}, newFakeVethFinder(nil), newFakeTCApplier())
+
+	result, err := r.Reconcile(context.Background(), reconcileReq("enabled"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if result.RequeueAfter != 45*time.Second {
+		t.Errorf("RequeueAfter = %v, want 45s (disabled injector must be ignored)", result.RequeueAfter)
+	}
+}
+
+func TestReconcile_PeriodicRotation_ZeroInterval_FallsBackToDefault(t *testing.T) {
+	// delayInterval of 0 is treated as unset → fall back to 30s default.
+	injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+			MinDelay: 10, MaxDelay: 10,
+		},
+	}, true, durationPtr(0))
+	r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+
+	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Errorf("RequeueAfter = %v, want 30s when delayInterval is zero", result.RequeueAfter)
+	}
+}
+
+func TestReconcile_PeriodicRotation_Enabled_AppliesDelay(t *testing.T) {
+	// Verifies that with periodic rotation enabled, tc rules are still applied normally.
+	pod := readyPod("pod1", "default", "node-1", "containerd://rot1",
+		map[string]string{"app": "backend"})
+	injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+			MinDelay: 100, MaxDelay: 100,
+		},
+	}, true, durationPtr(10*time.Second))
+	finder := newFakeVethFinder(map[string]string{"containerd://rot1": "vethR1"})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if !applier.isApplied("vethR1") {
+		t.Error("expected tc rule applied to vethR1")
+	}
+	if applier.applied["vethR1"] != 100 {
+		t.Errorf("delay = %d, want 100", applier.applied["vethR1"])
+	}
+	if result.RequeueAfter != 10*time.Second {
+		t.Errorf("RequeueAfter = %v, want 10s", result.RequeueAfter)
 	}
 }
 

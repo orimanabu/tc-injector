@@ -22,6 +22,15 @@ type TCInjector struct {
 type TCInjectorSpec struct {
 	// Rules is a list of label selectors paired with delay parameters.
 	Rules []DelayRule `json:"rules"`
+	// EnablePeriodicDelayRotation enables periodic re-randomization of delays within [MinDelay, MaxDelay].
+	// When false (default), delays are applied once and only updated on resource or pod changes.
+	// +kubebuilder:default=false
+	EnablePeriodicDelayRotation bool `json:"enablePeriodicDelayRotation,omitempty"`
+	// DelayInterval is the interval between periodic delay re-randomizations.
+	// Only takes effect when EnablePeriodicDelayRotation is true.
+	// Defaults to 30s.
+	// +kubebuilder:default="30s"
+	DelayInterval *metav1.Duration `json:"delayInterval,omitempty"`
 }
 
 // DelayRule pairs a pod label selector with a delay range in milliseconds.
