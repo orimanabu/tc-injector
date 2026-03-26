@@ -1697,3 +1697,521 @@ maxDelay」のリストを設定します。カスタムコントローラtc-inj
 
 ✻ Cooked for 1m 23s
 ```
+
+```
+❯ makeを実行すると以下のエラーになりました。直してください
+go build -o bin/tc-injector ./cmd/
+# github.com/tc-injector/tc-injector/pkg/veth
+pkg/veth/finder.go:47:20: undefined: grpc.NewClient
+pkg/veth/finder.go:163:21: cannot range over status.Linux.Namespaces (variable of type *v1.Namespace)
+pkg/veth/finder.go:297:15: v.PeerIndex undefined (type *netlink.Veth has no field or method PeerIndex)
+pkg/veth/finder.go:300:12: v.PeerIndex undefined (type *netlink.Veth has no field or method PeerIndex)
+make: *** [build] Error 1
+
+⏺ Read 2 files (ctrl+o to expand)
+
+⏺ バージョン不整合による3つのエラーです。
+
+  ┌─────────────────────────────────────┬───────────────────────────────────────────────────────────────────────┐
+  │               エラー                │                                 原因                                  │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ grpc.NewClient                      │ v1.63.0で追加。go.modはv1.62.0を使用                                  │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ cannot range over .Linux.Namespaces │ cri-api v0.29.3ではNamespacesはスライスではなく*v1.Namespace単体      │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ v.PeerIndex undefined               │ netlink v1.1.0にはPeerIndexフィールドがなく、PeerNameを使う必要がある │
+  └─────────────────────────────────────┴───────────────────────────────────────────────────────────────────────┘
+
+⏺ Update(pkg/veth/finder.go)
+  ⎿  Added 3 lines, removed 1 line
+      44      return nil, err
+      45    }
+      46
+      47 -  conn, err := grpc.NewClient(
+      47 +  // grpc.NewClient was introduced in grpc-go v1.63.0; use grpc.Dial for v1.62.x.
+      48 +  //nolint:staticcheck
+      49 +  conn, err := grpc.Dial(
+      50      "unix://"+socket,
+      51      grpc.WithTransportCredentials(insecure.NewCredentials()),
+      52    )
+
+⏺ Update(pkg/veth/finder.go)
+  ⎿  Added 8 lines, removed 21 lines
+      156  // netnsFromLinuxNamespaces extracts the network namespace path from the
+      157  // sandbox status Linux.Namespaces field.
+      158  //
+      159 -// CRI-O stores paths like "/var/run/netns/crio-<hash>" here.
+      160 -// containerd typically leaves the list empty.
+      159 +// In cri-api v0.29, LinuxPodSandboxStatus.Namespaces is a single *v1.Namespace
+      160 +// struct whose Network field holds the netns path (e.g. "/var/run/netns/crio-<hash>").
+      161 +// CRI-O populates this reliably; containerd typically leaves it empty.
+      162  func netnsFromLinuxNamespaces(status *criapi.PodSandboxStatus) (string, bool) {
+      162 -  if status == nil || status.Linux == nil {
+      163 +  if status == nil || status.Linux == nil || status.Linux.Namespaces == nil {
+      164      return "", false
+      165    }
+      165 -  for _, ns := range status.Linux.Namespaces {
+      166 -    p := ns.GetPath()
+      167 -    if p == "" {
+      168 -      continue
+      169 -    }
+      170 -    // Match paths that refer to a network namespace: the path either lives
+      171 -    // under a "netns" directory or contains "net" in the last segment.
+      172 -    if isNetnsPath(p) {
+      173 -      return p, true
+      174 -    }
+      166 +  path := status.Linux.Namespaces.GetNetwork()
+      167 +  if path == "" {
+      168 +    return "", false
+      169    }
+      176 -  return "", false
+      170 +  return path, true
+      171  }
+      172
+      179 -// isNetnsPath returns true if the path looks like a network namespace file.
+      180 -func isNetnsPath(p string) bool {
+      181 -  lower := strings.ToLower(p)
+      182 -  // /var/run/netns/...  or  /proc/<pid>/ns/net
+      183 -  return strings.Contains(lower, "netns") || strings.HasSuffix(lower, "/ns/net")
+      184 -}
+      185 -
+      173  // pidFromInfoMap extracts the process PID from the CRI verbose info map.
+      174  //
+      175  // Both containerd and CRI-O encode the PID as a numeric field named "pid"
+  ⎿  Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ 次に PeerIndex → PeerName の修正。
+
+⏺ Update(pkg/veth/finder.go)
+  ⎿  Added 14 lines, removed 10 lines
+      247      return "", fmt.Errorf("enter pod netns: %w", err)
+      248    }
+      249
+      250 -  peerIndex, findErr := podVethPeerIndex()
+      250 +  peerName, findErr := podVethPeerName()
+      251
+      252    // Always restore the host namespace, even on error.
+      253    if restoreErr := netns.Set(hostNS); restoreErr != nil {
+     ...
+      256    }
+      257
+      258    if findErr != nil {
+      259 -    return "", fmt.Errorf("find veth peer index in pod netns: %w", findErr)
+      259 +    return "", fmt.Errorf("find veth peer name in pod netns: %w", findErr)
+      260    }
+      261
+      262 -  link, err := netlink.LinkByIndex(peerIndex)
+      262 +  link, err := netlink.LinkByName(peerName)
+      263    if err != nil {
+      264 -    return "", fmt.Errorf("lookup host link at peer index %d: %w", peerIndex, err)
+      264 +    return "", fmt.Errorf("lookup host link %q: %w", peerName, err)
+      265    }
+      266
+      267    return link.Attrs().Name, nil
+      268  }
+      269
+      270 -// podVethPeerIndex returns the host-side peer index of the first non-loopback
+      270 +// podVethPeerName returns the host-side peer name of the first non-loopback
+      271  // veth inside the currently active network namespace.
+      272 -func podVethPeerIndex() (int, error) {
+      272 +//
+      273 +// netlink v1.1.0 does not expose PeerIndex on the Veth struct; PeerName is
+      274 +// populated from the VETH_INFO_PEER netlink attribute and is sufficient to
+      275 +// look up the peer in the host network namespace.
+      276 +func podVethPeerName() (string, error) {
+      277    links, err := netlink.LinkList()
+      278    if err != nil {
+      275 -    return 0, fmt.Errorf("list links in pod netns: %w", err)
+      279 +    return "", fmt.Errorf("list links in pod netns: %w", err)
+      280    }
+      281
+      282    for _, link := range links {
+     ...
+      287        continue
+      288      }
+      289      v, ok := link.(*netlink.Veth)
+      286 -    if !ok || v.PeerIndex <= 0 {
+      290 +    if !ok || v.PeerName == "" {
+      291        continue
+      292      }
+      289 -    return v.PeerIndex, nil
+      293 +    return v.PeerName, nil
+      294    }
+      291 -  return 0, fmt.Errorf("no veth interface found in pod netns")
+      295 +  return "", fmt.Errorf("no veth interface found in pod netns")
+      296  }
+      297
+      298  // stripRuntimePrefix removes scheme prefixes like "containerd://", "cri-o://",
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ isNetnsPath を削除したのでテストも修正が必要です。確認します。
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ テストも同様に修正が必要です。isNetnsPath の削除と netnsFromLinuxNamespaces のAPI変更に対応します。
+
+⏺ Update(pkg/veth/finder_test.go)
+  ⎿  Added 27 lines, removed 50 lines
+      105    }
+      106  }
+      107
+      108 -// ---- isNetnsPath ----
+      109 -
+      110 -func TestIsNetnsPath(t *testing.T) {
+      111 -  tests := []struct {
+      112 -    path string
+      113 -    want bool
+      114 -  }{
+      115 -    {"/var/run/netns/crio-abc123", true},
+      116 -    {"/proc/12345/ns/net", true},
+      117 -    {"/var/run/netns/some-pod", true},
+      118 -    {"/run/netns/custom", true},
+      119 -    {"/proc/1/ns/net", true},
+      120 -    {"/proc/1/ns/pid", false},
+      121 -    {"/proc/1/ns/ipc", false},
+      122 -    {"/sys/class/net/eth0", false},
+      123 -    {"", false},
+      124 -  }
+      125 -  for _, tt := range tests {
+      126 -    got := isNetnsPath(tt.path)
+      127 -    if got != tt.want {
+      128 -      t.Errorf("isNetnsPath(%q) = %v, want %v", tt.path, got, tt.want)
+      129 -    }
+      130 -  }
+      131 -}
+      132 -
+      108  // ---- netnsFromLinuxNamespaces ----
+      109 +//
+      110 +// In cri-api v0.29, LinuxPodSandboxStatus.Namespaces is a single *v1.Namespace
+      111 +// with Network/Pid/Ipc string fields, not a slice.
+      112
+      113  func TestNetnsFromLinuxNamespaces_CRIOPath(t *testing.T) {
+      114    status := &criapi.PodSandboxStatus{
+      115      Linux: &criapi.LinuxPodSandboxStatus{
+      138 -      Namespaces: []*criapi.Namespace{
+      139 -        {Path: "/proc/1/ns/pid"},
+      140 -        {Path: "/var/run/netns/crio-abc"},
+      141 -        {Path: "/proc/1/ns/ipc"},
+      116 +      Namespaces: &criapi.Namespace{
+      117 +        Network: "/var/run/netns/crio-abc",
+      118 +        Pid:     "/proc/1/ns/pid",
+      119 +        Ipc:     "/proc/1/ns/ipc",
+      120        },
+      121      },
+      122    }
+     ...
+      132  func TestNetnsFromLinuxNamespaces_ProcPath(t *testing.T) {
+      133    status := &criapi.PodSandboxStatus{
+      134      Linux: &criapi.LinuxPodSandboxStatus{
+      157 -      Namespaces: []*criapi.Namespace{
+      158 -        {Path: "/proc/5678/ns/net"},
+      135 +      Namespaces: &criapi.Namespace{
+      136 +        Network: "/proc/5678/ns/net",
+      137        },
+      138      },
+      139    }
+     ...
+      146    }
+      147  }
+      148
+      171 -func TestNetnsFromLinuxNamespaces_NoNetnsEntry(t *testing.T) {
+      149 +func TestNetnsFromLinuxNamespaces_EmptyNetwork(t *testing.T) {
+      150 +  // Network field is empty; other namespaces populated — should return false.
+      151    status := &criapi.PodSandboxStatus{
+      152      Linux: &criapi.LinuxPodSandboxStatus{
+      174 -      Namespaces: []*criapi.Namespace{
+      175 -        {Path: "/proc/1/ns/pid"},
+      176 -        {Path: "/proc/1/ns/ipc"},
+      153 +      Namespaces: &criapi.Namespace{
+      154 +        Pid: "/proc/1/ns/pid",
+      155 +        Ipc: "/proc/1/ns/ipc",
+      156        },
+      157      },
+      158    }
+      159    _, ok := netnsFromLinuxNamespaces(status)
+      160    if ok {
+      182 -    t.Fatal("expected ok=false when no netns entry present")
+      161 +    t.Fatal("expected ok=false when Network path is empty")
+      162    }
+      163  }
+      164
+      165 +func TestNetnsFromLinuxNamespaces_NilNamespaces(t *testing.T) {
+      166 +  status := &criapi.PodSandboxStatus{
+      167 +    Linux: &criapi.LinuxPodSandboxStatus{
+      168 +      Namespaces: nil,
+      169 +    },
+      170 +  }
+      171 +  _, ok := netnsFromLinuxNamespaces(status)
+      172 +  if ok {
+      173 +    t.Fatal("expected ok=false for nil Namespaces")
+      174 +  }
+      175 +}
+      176 +
+      177  func TestNetnsFromLinuxNamespaces_NilStatus(t *testing.T) {
+      178    _, ok := netnsFromLinuxNamespaces(nil)
+      179    if ok {
+     ...
+      188    }
+      189  }
+      190
+      200 -func TestNetnsFromLinuxNamespaces_EmptyPath(t *testing.T) {
+      201 -  status := &criapi.PodSandboxStatus{
+      202 -    Linux: &criapi.LinuxPodSandboxStatus{
+      203 -      Namespaces: []*criapi.Namespace{
+      204 -        {Path: ""},
+      205 -      },
+      206 -    },
+      207 -  }
+      208 -  _, ok := netnsFromLinuxNamespaces(status)
+      209 -  if ok {
+      210 -    t.Fatal("expected ok=false when path is empty")
+      211 -  }
+      212 -}
+      213 -
+      191  // ---- stripRuntimePrefix ----
+      192
+      193  func TestStripRuntimePrefix(t *testing.T) {
+
+⏺ 最後にビルドを確認します。
+
+⏺ Bash(go build ./... 2>&1)
+  ⎿  Error: Exit code 1
+     # github.com/tc-injector/tc-injector/pkg/veth
+     pkg/veth/finder.go:166:34: status.Linux.Namespaces.GetNetwork undefined (type *v1.Namespace has no field or method GetNetwork)
+
+⏺ フィールド名が違います。実際の型を調べます。
+
+⏺ Bash(go doc k8s.io/cri-api/pkg/apis/runtime/v1.Namespace 2>&1)
+  ⎿  package v1 // import "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+     type Namespace struct {
+     … +22 lines (ctrl+o to expand)
+
+⏺ Bash(go doc k8s.io/cri-api/pkg/apis/runtime/v1.LinuxPodSandboxStatus 2>&1 && go doc k8s.io/cri-api/pkg/apis/runtime/v1.NamespaceOption 2>&1)
+  ⎿  package v1 // import "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+     type LinuxPodSandboxStatus struct {
+     … +34 lines (ctrl+o to expand)
+
+⏺ v1.Namespace は Options *NamespaceOption (モードのenum) しか持っておらず、ネットワーク名前空間のパスを格納していません。この版のAPIでは netnsFromLinuxNamespaces
+  は機能しません。該当するステップを削除します。
+
+⏺ Update(pkg/veth/finder.go)
+  ⎿  Added 7 lines, removed 28 lines
+      102  // Strategy (works for both containerd and CRI-O):
+      103  //  1. Call ContainerStatus(verbose=true) and extract the PID from the info map.
+      104  //     Both runtimes embed {"pid": N} somewhere in the verbose JSON.
+      105 -//  2. If PID extraction fails, call PodSandboxStatus(verbose=true) and look for
+      106 -//     a namespace path in Linux.Namespaces (CRI-O populates this reliably).
+      107 -//  3. As a last resort, extract the PID from the sandbox info map.
+      105 +//  2. If PID extraction fails, call PodSandboxStatus(verbose=true) and extract
+      106 +//     the PID from the sandbox info map.
+      107 +//
+      108 +// Note: In cri-api v0.29, LinuxPodSandboxStatus.Namespaces only carries
+      109 +// NamespaceOption (mode enum), not filesystem paths, so path-based lookup is
+      110 +// not available in this API version.
+      111  func (f *Finder) resolveNetnsPath(ctx context.Context, containerID string) (string, error) {
+      112    // --- Step 1: try PID from ContainerStatus ---
+      113    csResp, err := f.criClient.ContainerStatus(ctx, &criapi.ContainerStatusRequest{
+     ...
+      122      return procNetnsPath(pid), nil
+      123    }
+      124
+      122 -  // --- Step 2 & 3: fall back to sandbox ---
+      125 +  // --- Step 2: fall back to sandbox info map ---
+      126    containers, err := f.criClient.ListContainers(ctx, &criapi.ListContainersRequest{
+      127      Filter: &criapi.ContainerFilter{Id: containerID},
+      128    })
+     ...
+      142      return "", fmt.Errorf("PodSandboxStatus(%s): %w", sandboxID, err)
+      143    }
+      144
+      142 -  // CRI-O fills Linux.Namespaces with actual filesystem paths like
+      143 -  // /var/run/netns/crio-<hash>.  containerd may leave this empty.
+      144 -  if path, ok := netnsFromLinuxNamespaces(sbResp.GetStatus()); ok {
+      145 -    return path, nil
+      146 -  }
+      147 -
+      148 -  // Last resort: PID from sandbox info map (containerd, some CRI-O configs).
+      145    if pid, ok := pidFromInfoMap(sbResp.GetInfo()); ok {
+      146      return procNetnsPath(pid), nil
+      147    }
+     ...
+      149    return "", fmt.Errorf("could not determine netns for sandbox %s (container %s)", sandboxID, containerID)
+      150  }
+      151
+      156 -// netnsFromLinuxNamespaces extracts the network namespace path from the
+      157 -// sandbox status Linux.Namespaces field.
+      158 -//
+      159 -// In cri-api v0.29, LinuxPodSandboxStatus.Namespaces is a single *v1.Namespace
+      160 -// struct whose Network field holds the netns path (e.g. "/var/run/netns/crio-<hash>").
+      161 -// CRI-O populates this reliably; containerd typically leaves it empty.
+      162 -func netnsFromLinuxNamespaces(status *criapi.PodSandboxStatus) (string, bool) {
+      163 -  if status == nil || status.Linux == nil || status.Linux.Namespaces == nil {
+      164 -    return "", false
+      165 -  }
+      166 -  path := status.Linux.Namespaces.GetNetwork()
+      167 -  if path == "" {
+      168 -    return "", false
+      169 -  }
+      170 -  return path, true
+      171 -}
+      172 -
+      152  // pidFromInfoMap extracts the process PID from the CRI verbose info map.
+      153  //
+      154  // Both containerd and CRI-O encode the PID as a numeric field named "pid"
+
+⏺ strings パッケージの使用状況を確認してから、テストも更新します。
+
+⏺ Bash(go build ./... 2>&1)
+  ⎿  (No output)
+  ⎿  Found 6 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ ビルドが通りました。テストから削除した netnsFromLinuxNamespaces への参照を除去します。
+
+⏺ Update(pkg/veth/finder_test.go)
+  ⎿  Removed 83 lines
+      105    }
+      106  }
+      107
+      108 -// ---- netnsFromLinuxNamespaces ----
+      109 -//
+      110 -// In cri-api v0.29, LinuxPodSandboxStatus.Namespaces is a single *v1.Namespace
+      111 -// with Network/Pid/Ipc string fields, not a slice.
+      112 -
+      113 -func TestNetnsFromLinuxNamespaces_CRIOPath(t *testing.T) {
+      114 -  status := &criapi.PodSandboxStatus{
+      115 -    Linux: &criapi.LinuxPodSandboxStatus{
+      116 -      Namespaces: &criapi.Namespace{
+      117 -        Network: "/var/run/netns/crio-abc",
+      118 -        Pid:     "/proc/1/ns/pid",
+      119 -        Ipc:     "/proc/1/ns/ipc",
+      120 -      },
+      121 -    },
+      122 -  }
+      123 -  path, ok := netnsFromLinuxNamespaces(status)
+      124 -  if !ok {
+      125 -    t.Fatal("expected ok=true")
+      126 -  }
+      127 -  if path != "/var/run/netns/crio-abc" {
+      128 -    t.Errorf("path = %q, want /var/run/netns/crio-abc", path)
+      129 -  }
+      130 -}
+      131 -
+      132 -func TestNetnsFromLinuxNamespaces_ProcPath(t *testing.T) {
+      133 -  status := &criapi.PodSandboxStatus{
+      134 -    Linux: &criapi.LinuxPodSandboxStatus{
+      135 -      Namespaces: &criapi.Namespace{
+      136 -        Network: "/proc/5678/ns/net",
+      137 -      },
+      138 -    },
+      139 -  }
+      140 -  path, ok := netnsFromLinuxNamespaces(status)
+      141 -  if !ok {
+      142 -    t.Fatal("expected ok=true")
+      143 -  }
+      144 -  if path != "/proc/5678/ns/net" {
+      145 -    t.Errorf("path = %q", path)
+      146 -  }
+      147 -}
+      148 -
+      149 -func TestNetnsFromLinuxNamespaces_EmptyNetwork(t *testing.T) {
+      150 -  // Network field is empty; other namespaces populated — should return false.
+      151 -  status := &criapi.PodSandboxStatus{
+      152 -    Linux: &criapi.LinuxPodSandboxStatus{
+      153 -      Namespaces: &criapi.Namespace{
+      154 -        Pid: "/proc/1/ns/pid",
+      155 -        Ipc: "/proc/1/ns/ipc",
+      156 -      },
+      157 -    },
+      158 -  }
+      159 -  _, ok := netnsFromLinuxNamespaces(status)
+      160 -  if ok {
+      161 -    t.Fatal("expected ok=false when Network path is empty")
+      162 -  }
+      163 -}
+      164 -
+      165 -func TestNetnsFromLinuxNamespaces_NilNamespaces(t *testing.T) {
+      166 -  status := &criapi.PodSandboxStatus{
+      167 -    Linux: &criapi.LinuxPodSandboxStatus{
+      168 -      Namespaces: nil,
+      169 -    },
+      170 -  }
+      171 -  _, ok := netnsFromLinuxNamespaces(status)
+      172 -  if ok {
+      173 -    t.Fatal("expected ok=false for nil Namespaces")
+      174 -  }
+      175 -}
+      176 -
+      177 -func TestNetnsFromLinuxNamespaces_NilStatus(t *testing.T) {
+      178 -  _, ok := netnsFromLinuxNamespaces(nil)
+      179 -  if ok {
+      180 -    t.Fatal("expected ok=false for nil status")
+      181 -  }
+      182 -}
+      183 -
+      184 -func TestNetnsFromLinuxNamespaces_NilLinux(t *testing.T) {
+      185 -  _, ok := netnsFromLinuxNamespaces(&criapi.PodSandboxStatus{Linux: nil})
+      186 -  if ok {
+      187 -    t.Fatal("expected ok=false for nil Linux field")
+      188 -  }
+      189 -}
+      190 -
+      108  // ---- stripRuntimePrefix ----
+      109
+      110  func TestStripRuntimePrefix(t *testing.T) {
+
+⏺ criapi importが不要になった場合も確認します。
+
+⏺ Bash(go build ./... 2>&1 && go vet ./... 2>&1)
+  ⎿  Error: Exit code 1
+     # github.com/tc-injector/tc-injector/pkg/veth
+     # [github.com/tc-injector/tc-injector/pkg/veth]
+     vet: pkg/veth/finder_test.go:8:2: "k8s.io/cri-api/pkg/apis/runtime/v1" imported as criapi and not used
+
+⏺ Update(pkg/veth/finder_test.go)
+  ⎿  Removed 2 lines
+       4    "os"
+       5    "path/filepath"
+       6    "testing"
+       7 -
+       8 -  criapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+       7  )
+       8
+       9  // ---- pidFromInfoMap ----
+
+⏺ Bash(go build ./... 2>&1 && go vet ./... 2>&1)
+  ⎿  (No output)
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ ビルドとvetが通りました。make でも確認します。
+
+⏺ Bash(make build 2>&1)
+  ⎿  go mod tidy
+     go build -o bin/tc-injector ./cmd/
+
+⏺ make build が通りました。変更内容をまとめます。
+
+  ---
+  修正内容
+
+  エラー1: grpc.NewClient undefined
+
+  grpc.NewClient は v1.63.0 から追加。go.mod の v1.62.0 では未定義のため、grpc.Dial に変更。
+
+  エラー2: cannot range over status.Linux.Namespaces
+
+  cri-api v0.29.3 では LinuxPodSandboxStatus.Namespaces は *v1.Namespace 単体で、Namespace は Options
+  *NamespaceOption（名前空間モードのenum）しか持たない。ネットワーク名前空間のパスは含まれないため、netnsFromLinuxNamespaces
+  のステップごと削除。PIDベースの取得（ContainerStatus/PodSandboxStatus の info map）で代替。
+
+  エラー3: v.PeerIndex undefined
+
+  netlink v1.1.0 には Veth.PeerIndex フィールドがない。代わりに v.PeerName（VETH_INFO_PEER属性から取得）を使い、ホスト名前空間で netlink.LinkByName(peerName) で解決するよう変更。
+
+  テストの更新
+
+  - finder_test.go: netnsFromLinuxNamespaces 関連テスト（関数削除に伴い削除）と未使用 import を削除
+
+✻ Brewed for 6m 50s
+```

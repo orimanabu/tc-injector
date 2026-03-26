@@ -44,7 +44,9 @@ func NewFinder(criSocket string) (*Finder, error) {
 		return nil, err
 	}
 
-	conn, err := grpc.NewClient(
+	// grpc.NewClient was introduced in grpc-go v1.63.0; use grpc.Dial for v1.62.x.
+	//nolint:staticcheck
+	conn, err := grpc.Dial(
 		"unix://"+socket,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
@@ -100,9 +102,12 @@ func (f *Finder) FindHostVeth(ctx context.Context, containerID string) (string, 
 // Strategy (works for both containerd and CRI-O):
 //  1. Call ContainerStatus(verbose=true) and extract the PID from the info map.
 //     Both runtimes embed {"pid": N} somewhere in the verbose JSON.
-//  2. If PID extraction fails, call PodSandboxStatus(verbose=true) and look for
-//     a namespace path in Linux.Namespaces (CRI-O populates this reliably).
-//  3. As a last resort, extract the PID from the sandbox info map.
+//  2. If PID extraction fails, call PodSandboxStatus(verbose=true) and extract
+//     the PID from the sandbox info map.
+//
+// Note: In cri-api v0.29, LinuxPodSandboxStatus.Namespaces only carries
+// NamespaceOption (mode enum), not filesystem paths, so path-based lookup is
+// not available in this API version.
 func (f *Finder) resolveNetnsPath(ctx context.Context, containerID string) (string, error) {
 	// --- Step 1: try PID from ContainerStatus ---
 	csResp, err := f.criClient.ContainerStatus(ctx, &criapi.ContainerStatusRequest{
@@ -117,7 +122,7 @@ func (f *Finder) resolveNetnsPath(ctx context.Context, containerID string) (stri
 		return procNetnsPath(pid), nil
 	}
 
-	// --- Step 2 & 3: fall back to sandbox ---
+	// --- Step 2: fall back to sandbox info map ---
 	containers, err := f.criClient.ListContainers(ctx, &criapi.ListContainersRequest{
 		Filter: &criapi.ContainerFilter{Id: containerID},
 	})
@@ -137,48 +142,11 @@ func (f *Finder) resolveNetnsPath(ctx context.Context, containerID string) (stri
 		return "", fmt.Errorf("PodSandboxStatus(%s): %w", sandboxID, err)
 	}
 
-	// CRI-O fills Linux.Namespaces with actual filesystem paths like
-	// /var/run/netns/crio-<hash>.  containerd may leave this empty.
-	if path, ok := netnsFromLinuxNamespaces(sbResp.GetStatus()); ok {
-		return path, nil
-	}
-
-	// Last resort: PID from sandbox info map (containerd, some CRI-O configs).
 	if pid, ok := pidFromInfoMap(sbResp.GetInfo()); ok {
 		return procNetnsPath(pid), nil
 	}
 
 	return "", fmt.Errorf("could not determine netns for sandbox %s (container %s)", sandboxID, containerID)
-}
-
-// netnsFromLinuxNamespaces extracts the network namespace path from the
-// sandbox status Linux.Namespaces field.
-//
-// CRI-O stores paths like "/var/run/netns/crio-<hash>" here.
-// containerd typically leaves the list empty.
-func netnsFromLinuxNamespaces(status *criapi.PodSandboxStatus) (string, bool) {
-	if status == nil || status.Linux == nil {
-		return "", false
-	}
-	for _, ns := range status.Linux.Namespaces {
-		p := ns.GetPath()
-		if p == "" {
-			continue
-		}
-		// Match paths that refer to a network namespace: the path either lives
-		// under a "netns" directory or contains "net" in the last segment.
-		if isNetnsPath(p) {
-			return p, true
-		}
-	}
-	return "", false
-}
-
-// isNetnsPath returns true if the path looks like a network namespace file.
-func isNetnsPath(p string) bool {
-	lower := strings.ToLower(p)
-	// /var/run/netns/...  or  /proc/<pid>/ns/net
-	return strings.Contains(lower, "netns") || strings.HasSuffix(lower, "/ns/net")
 }
 
 // pidFromInfoMap extracts the process PID from the CRI verbose info map.
@@ -258,7 +226,7 @@ func findHostVethFromNetns(netnsPath string) (string, error) {
 		return "", fmt.Errorf("enter pod netns: %w", err)
 	}
 
-	peerIndex, findErr := podVethPeerIndex()
+	peerName, findErr := podVethPeerName()
 
 	// Always restore the host namespace, even on error.
 	if restoreErr := netns.Set(hostNS); restoreErr != nil {
@@ -267,23 +235,27 @@ func findHostVethFromNetns(netnsPath string) (string, error) {
 	}
 
 	if findErr != nil {
-		return "", fmt.Errorf("find veth peer index in pod netns: %w", findErr)
+		return "", fmt.Errorf("find veth peer name in pod netns: %w", findErr)
 	}
 
-	link, err := netlink.LinkByIndex(peerIndex)
+	link, err := netlink.LinkByName(peerName)
 	if err != nil {
-		return "", fmt.Errorf("lookup host link at peer index %d: %w", peerIndex, err)
+		return "", fmt.Errorf("lookup host link %q: %w", peerName, err)
 	}
 
 	return link.Attrs().Name, nil
 }
 
-// podVethPeerIndex returns the host-side peer index of the first non-loopback
+// podVethPeerName returns the host-side peer name of the first non-loopback
 // veth inside the currently active network namespace.
-func podVethPeerIndex() (int, error) {
+//
+// netlink v1.1.0 does not expose PeerIndex on the Veth struct; PeerName is
+// populated from the VETH_INFO_PEER netlink attribute and is sufficient to
+// look up the peer in the host network namespace.
+func podVethPeerName() (string, error) {
 	links, err := netlink.LinkList()
 	if err != nil {
-		return 0, fmt.Errorf("list links in pod netns: %w", err)
+		return "", fmt.Errorf("list links in pod netns: %w", err)
 	}
 
 	for _, link := range links {
@@ -294,12 +266,12 @@ func podVethPeerIndex() (int, error) {
 			continue
 		}
 		v, ok := link.(*netlink.Veth)
-		if !ok || v.PeerIndex <= 0 {
+		if !ok || v.PeerName == "" {
 			continue
 		}
-		return v.PeerIndex, nil
+		return v.PeerName, nil
 	}
-	return 0, fmt.Errorf("no veth interface found in pod netns")
+	return "", fmt.Errorf("no veth interface found in pod netns")
 }
 
 // stripRuntimePrefix removes scheme prefixes like "containerd://", "cri-o://",

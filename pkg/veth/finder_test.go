@@ -4,8 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	criapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 // ---- pidFromInfoMap ----
@@ -102,112 +100,6 @@ func TestPidFromInfoMap_NegativePID(t *testing.T) {
 	_, ok := pidFromInfoMap(info)
 	if ok {
 		t.Fatal("expected ok=false when pid<0")
-	}
-}
-
-// ---- isNetnsPath ----
-
-func TestIsNetnsPath(t *testing.T) {
-	tests := []struct {
-		path string
-		want bool
-	}{
-		{"/var/run/netns/crio-abc123", true},
-		{"/proc/12345/ns/net", true},
-		{"/var/run/netns/some-pod", true},
-		{"/run/netns/custom", true},
-		{"/proc/1/ns/net", true},
-		{"/proc/1/ns/pid", false},
-		{"/proc/1/ns/ipc", false},
-		{"/sys/class/net/eth0", false},
-		{"", false},
-	}
-	for _, tt := range tests {
-		got := isNetnsPath(tt.path)
-		if got != tt.want {
-			t.Errorf("isNetnsPath(%q) = %v, want %v", tt.path, got, tt.want)
-		}
-	}
-}
-
-// ---- netnsFromLinuxNamespaces ----
-
-func TestNetnsFromLinuxNamespaces_CRIOPath(t *testing.T) {
-	status := &criapi.PodSandboxStatus{
-		Linux: &criapi.LinuxPodSandboxStatus{
-			Namespaces: []*criapi.Namespace{
-				{Path: "/proc/1/ns/pid"},
-				{Path: "/var/run/netns/crio-abc"},
-				{Path: "/proc/1/ns/ipc"},
-			},
-		},
-	}
-	path, ok := netnsFromLinuxNamespaces(status)
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if path != "/var/run/netns/crio-abc" {
-		t.Errorf("path = %q, want /var/run/netns/crio-abc", path)
-	}
-}
-
-func TestNetnsFromLinuxNamespaces_ProcPath(t *testing.T) {
-	status := &criapi.PodSandboxStatus{
-		Linux: &criapi.LinuxPodSandboxStatus{
-			Namespaces: []*criapi.Namespace{
-				{Path: "/proc/5678/ns/net"},
-			},
-		},
-	}
-	path, ok := netnsFromLinuxNamespaces(status)
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if path != "/proc/5678/ns/net" {
-		t.Errorf("path = %q", path)
-	}
-}
-
-func TestNetnsFromLinuxNamespaces_NoNetnsEntry(t *testing.T) {
-	status := &criapi.PodSandboxStatus{
-		Linux: &criapi.LinuxPodSandboxStatus{
-			Namespaces: []*criapi.Namespace{
-				{Path: "/proc/1/ns/pid"},
-				{Path: "/proc/1/ns/ipc"},
-			},
-		},
-	}
-	_, ok := netnsFromLinuxNamespaces(status)
-	if ok {
-		t.Fatal("expected ok=false when no netns entry present")
-	}
-}
-
-func TestNetnsFromLinuxNamespaces_NilStatus(t *testing.T) {
-	_, ok := netnsFromLinuxNamespaces(nil)
-	if ok {
-		t.Fatal("expected ok=false for nil status")
-	}
-}
-
-func TestNetnsFromLinuxNamespaces_NilLinux(t *testing.T) {
-	_, ok := netnsFromLinuxNamespaces(&criapi.PodSandboxStatus{Linux: nil})
-	if ok {
-		t.Fatal("expected ok=false for nil Linux field")
-	}
-}
-
-func TestNetnsFromLinuxNamespaces_EmptyPath(t *testing.T) {
-	status := &criapi.PodSandboxStatus{
-		Linux: &criapi.LinuxPodSandboxStatus{
-			Namespaces: []*criapi.Namespace{
-				{Path: ""},
-			},
-		},
-	}
-	_, ok := netnsFromLinuxNamespaces(status)
-	if ok {
-		t.Fatal("expected ok=false when path is empty")
 	}
 }
 
