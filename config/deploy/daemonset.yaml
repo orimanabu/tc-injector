@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tc-injector
+  namespace: tc-injector-system
+  labels:
+    app: tc-injector
+spec:
+  selector:
+    matchLabels:
+      app: tc-injector
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: tc-injector
+    spec:
+      serviceAccountName: tc-injector
+      hostNetwork: false
+      # hostPID is required so that /proc/<pid>/ns/net of target containers
+      # is reachable from within the DaemonSet pod.
+      hostPID: true
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+      containers:
+        - name: tc-injector
+          image: tc-injector:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/tc-injector"]
+          args:
+            # --cri-socket is optional: omit it to enable auto-detection.
+            # Set explicitly if your runtime socket path is non-standard.
+            # - --cri-socket=/run/containerd/containerd.sock  # containerd
+            # - --cri-socket=/run/crio/crio.sock              # CRI-O
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true          # Required for tc(8) and netns operations.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            # containerd socket (present on containerd nodes).
+            - name: containerd-socket
+              mountPath: /run/containerd/containerd.sock
+            # CRI-O socket (present on CRI-O nodes).
+            - name: crio-socket
+              mountPath: /run/crio/crio.sock
+            # Host /proc lets us open /proc/<pid>/ns/net for any container.
+            - name: host-proc
+              mountPath: /proc
+              readOnly: true
+            # CRI-O stores named netns files here; mount with propagation so
+            # newly created namespaces become visible inside the pod.
+            - name: host-netns
+              mountPath: /var/run/netns
+              mountPropagation: HostToContainer
+      volumes:
+        - name: containerd-socket
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: FileOrCreate   # Non-existent on CRI-O nodes; harmless empty file.
+        - name: crio-socket
+          hostPath:
+            path: /run/crio/crio.sock
+            type: FileOrCreate   # Non-existent on containerd nodes; harmless empty file.
+        - name: host-proc
+          hostPath:
+            path: /proc
+        - name: host-netns
+          hostPath:
+            path: /var/run/netns
+            type: DirectoryOrCreate
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tc-injector-system

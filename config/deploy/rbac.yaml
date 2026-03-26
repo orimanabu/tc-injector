@@ -1,0 +1,43 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tc-injector
+  namespace: tc-injector-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tc-injector
+rules:
+  # Watch and read TCInjector custom resources.
+  - apiGroups: [tc-injector.example.com]
+    resources: [tcinjectors]
+    verbs: [get, list, watch]
+  # Update TCInjector status subresource.
+  - apiGroups: [tc-injector.example.com]
+    resources: [tcinjectors/status]
+    verbs: [update, patch]
+  # Read pods to find matching targets on the local node.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  # Read node info (optional, for labeling/filtering).
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tc-injector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tc-injector
+subjects:
+  - kind: ServiceAccount
+    name: tc-injector
+    namespace: tc-injector-system
