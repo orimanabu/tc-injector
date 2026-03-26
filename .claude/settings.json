@@ -5,7 +5,9 @@
       "Bash(git status)",
       "Bash(git diff)",
       "Bash(go build *)",
-      "Bash(go test *)"
+      "Bash(go test *)",
+      "Bash(go doc *)",
+      "Bash(grep *)"
     ],
     "deny": [
       "Read(./memo.md)",
