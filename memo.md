@@ -3393,3 +3393,95 @@ make: *** [build] Error 1
 
 ✻ Cooked for 1m 11s
 ```
+
+```
+❯ OpenShiftにデプロイすると、Podの状態はRunningになりましたが、以下のエラーが出ています。原因を調査してください
+go/pkg/mod/k8s.io/client-go@v0.29.3/tools/cache/reflector.go:229: failed to list *v1alpha1.TCInjector: v1.ListOptions is not suitable for converting to
+"tc-injector.setns.net/v1alpha1" in scheme "go/pkg/mod/k8s.io/apimachinery@v0.29.3/pkg/runtime/scheme.go:100
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ 原因が特定できました。register.go に2つの問題があります。
+
+  問題1（根本原因）: addKnownTypes 内で metav1.AddToGroupVersion を呼んでいません。client-go のリフレクタがオブジェクトをリストする際、ListOptions
+  をカスタムグループバージョン向けに変換する必要がありますが、その登録が欠けているため v1.ListOptions is not suitable for converting to "tc-injector.setns.net/v1alpha1"
+  というエラーになります。
+
+  問題2: init() 内で runtime.NewScheme() — 使い捨ての新しいスキームに登録しており、マネージャが使うスキームには何も登録されていません（cmd/main.go の init()
+  が正しく登録しているので致命的ではありませんが、不正なコードです）。
+
+⏺ Update(pkg/api/v1alpha1/register.go)
+  ⎿  Added 1 line, removed 1 line
+      1  package v1alpha1
+      2
+      3  import (
+      4 +  metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+      5    "k8s.io/apimachinery/pkg/runtime"
+      6    "k8s.io/apimachinery/pkg/runtime/schema"
+      6 -  utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+      7  )
+      8
+      9  const (
+
+⏺ Update(pkg/api/v1alpha1/register.go)
+  ⎿  Added 3 lines, removed 4 lines
+      22      &TCInjector{},
+      23      &TCInjectorList{},
+      24    )
+      25 +  // Register metav1 types (ListOptions, DeleteOptions, etc.) for this group version.
+      26 +  // Required for client-go's reflector to convert ListOptions when listing custom resources.
+      27 +  metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
+      28    return nil
+      29  }
+      27 -
+      28 -func init() {
+      29 -  utilruntime.Must(AddToScheme(runtime.NewScheme()))
+      30 -}
+  ⎿  Found 2 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ ファイルは正しく修正されています。ビルドで確認します。
+
+⏺ Bash(go build ./... 2>&1 && echo "OK")
+  ⎿  OK
+
+⏺ 修正内容を説明します。
+
+  ---
+  原因
+
+  register.go の addKnownTypes に metav1.AddToGroupVersion の呼び出しがありませんでした。
+
+  client-go のリフレクタがカスタムリソースを List する際、内部で metav1.ListOptions
+  をカスタムグループバージョン（tc-injector.setns.net/v1alpha1）向けに変換します。その変換ルールはスキームに登録されていなければならず、metav1.AddToGroupVersion
+  がその登録を行います。これが欠けていたため、以下のエラーが発生していました。
+
+  v1.ListOptions is not suitable for converting to "tc-injector.setns.net/v1alpha1" in scheme
+
+  また、元の init() では runtime.NewScheme() で作った使い捨てのスキームに登録しており、マネージャが使うスキームとは別物でした（cmd/main.go の init()
+  が正しく登録していたので動いていましたが、コードとして誤りでした）。この init() も合わせて削除しました。
+
+  修正内容
+
+  // Before
+  func addKnownTypes(scheme *runtime.Scheme) error {
+      scheme.AddKnownTypes(SchemeGroupVersion,
+          &TCInjector{},
+          &TCInjectorList{},
+      )
+      return nil
+  }
+
+  // After
+  func addKnownTypes(scheme *runtime.Scheme) error {
+      scheme.AddKnownTypes(SchemeGroupVersion,
+          &TCInjector{},
+          &TCInjectorList{},
+      )
+      metav1.AddToGroupVersion(scheme, SchemeGroupVersion)  // 追加
+      return nil
+  }
+
+✻ Sautéed for 53s
+```

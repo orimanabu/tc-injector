@@ -1,9 +1,9 @@
 package v1alpha1
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 )
 
 const (
@@ -22,9 +22,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&TCInjector{},
 		&TCInjectorList{},
 	)
+	// Register metav1 types (ListOptions, DeleteOptions, etc.) for this group version.
+	// Required for client-go's reflector to convert ListOptions when listing custom resources.
+	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil
-}
-
-func init() {
-	utilruntime.Must(AddToScheme(runtime.NewScheme()))
 }
