@@ -2804,3 +2804,80 @@ make: *** [build] Error 1
 
 ✻ Churned for 2m 51s
 ```
+
+```
+❯ tcの設定が確かに効いているかどうかを確認するにはどうするのがよいですか
+
+⏺ いくつかの確認方法を紹介します。
+
+  1. tc ルールが適用されているか確認（ノード上で直接）
+
+  DaemonSet の Pod に exec して確認：
+
+  # tc-injector の DaemonSet Pod に入る
+  kubectl exec -it -n tc-injector-system <tc-injector-pod> -- bash
+
+  # 対象 Pod の veth インターフェース名を特定
+  ip link show | grep veth
+
+  # そのインターフェースの qdisc を確認
+  tc qdisc show dev <veth-iface>
+
+  正常に適用されていれば以下のような出力が出ます：
+
+  qdisc netem 1: root refcnt 2 limit 1000 delay 30ms
+
+  2. 対象 Pod 内から ping / curl で遅延を計測
+
+  # 対象 Pod に exec
+  kubectl exec -it <target-pod> -- bash
+
+  # 別の Pod や外部への ping で RTT を確認
+  ping -c 10 <other-pod-ip>
+
+  # または curl で応答時間を計測
+  curl -o /dev/null -s -w "time_total: %{time_total}s\n" http://<service>/
+
+  遅延なし時と比べて RTT が minDelay〜maxDelay ms 程度増加していれば正常です。
+
+  3. tc-injector のログで確認
+
+  kubectl logs -n tc-injector-system -l app=tc-injector -f
+
+  正常に適用されていれば以下のようなログが出ます：
+
+  INFO  applying tc delay  pod=backend-xxx  iface=veth1a2b3c  delayMs=37  tcCmd="tc qdisc replace dev veth1a2b3c root handle 1: netem delay 37ms"
+
+  4. TCInjector の status を確認
+
+  kubectl get tcinjector example-delay -o yaml
+
+  status:
+    injectedPods: 3
+    conditions:
+      - type: Ready
+        status: "True"
+        message: "3 pod(s) injected on node worker-1"
+
+  injectedPods が 0 のままであれば、セレクタがマッチしていない可能性があります。
+
+  5. セレクタのデバッグ（マッチしない場合）
+
+  # Pod のラベルを確認
+  kubectl get pod <target-pod> -o jsonpath='{.metadata.labels}'
+
+  # Namespace のラベルを確認
+  kubectl get namespace <target-ns> --show-labels
+
+  # TCInjector のセレクタを確認
+  kubectl get tcinjector example-delay -o jsonpath='{.spec.rules}'
+
+  ---
+  典型的なトラブルシュートの流れ：
+
+  1. kubectl logs でログを見て applying tc delay が出ているか確認
+  2. 出ていなければ injectedPods: 0 → セレクタ不一致（Pod/Namespaceのラベルを再確認）
+  3. ログが出ているのに遅延を感じない → tc qdisc show でノード上のルールを直接確認
+  4. tc qdisc show でルールが出ているのに遅延がない → 通信経路が別のインターフェースを通っている可能性（Pod to Pod
+  が同一ノード内ルーティングの場合はegress側のvethに適用されているか確認）
+```
