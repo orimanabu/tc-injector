@@ -24,6 +24,9 @@ build: tidy
 ## Build the container image.
 image:
 	podman build -t $(IMAGE) .
+## Push the container image.
+push:
+	podman push $(IMAGE)
 
 ## Install the CRD into the cluster.
 install-crd:
