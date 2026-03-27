@@ -17,10 +17,6 @@ spec:
         app: tc-injector
     spec:
       serviceAccountName: tc-injector
-      # hostNetwork is required so that the DaemonSet pod shares the host's
-      # default network namespace. Without this, netlink calls and tc(8) run
-      # in the pod's own netns and cannot see the host-side veth interfaces
-      # (e.g. OVN-Kubernetes ports mastered by ovs-system).
       hostNetwork: true
       # hostPID is required so that /proc/<pid>/ns/net of target containers
       # is reachable from within the DaemonSet pod.
@@ -32,7 +28,7 @@ spec:
           effect: NoExecute
       containers:
         - name: tc-injector
-          image: tc-injector:latest
+          image: quay.io/manabu.ori/tc-injector:v1
           imagePullPolicy: IfNotPresent
           command: ["/tc-injector"]
           args:
@@ -100,9 +96,3 @@ spec:
           hostPath:
             path: /var/run/netns
             type: DirectoryOrCreate
-
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: tc-injector-system
