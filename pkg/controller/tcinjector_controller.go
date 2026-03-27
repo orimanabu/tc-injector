@@ -208,21 +208,28 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 
 	// Update status on the triggering TCInjector if the request was for one.
+	// Retry on conflict: multiple DaemonSet pods (one per node) may update the
+	// same TCInjector status concurrently. On conflict we re-read the latest
+	// resource version and re-merge before retrying.
 	if req.Name != "" {
-		injector := &tcv1alpha1.TCInjector{}
-		if err := r.Get(ctx, req.NamespacedName, injector); err == nil {
-			// Build this node's details.
-			thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
-			for _, state := range r.injected {
-				thisNodeDetails = append(thisNodeDetails, tcv1alpha1.InjectedPodStatus{
-					NodeName:       r.NodeName,
-					Namespace:      state.podNamespace,
-					PodName:        state.podName,
-					Interface:      state.ifaceName,
-					InterfaceIndex: int32(state.ifaceIndex),
-					DelayMs:        state.delayMs,
-					TCCommand:      state.tcCmd,
-				})
+		// Build this node's details once; they do not change between retries.
+		thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
+		for _, state := range r.injected {
+			thisNodeDetails = append(thisNodeDetails, tcv1alpha1.InjectedPodStatus{
+				NodeName:       r.NodeName,
+				Namespace:      state.podNamespace,
+				PodName:        state.podName,
+				Interface:      state.ifaceName,
+				InterfaceIndex: int32(state.ifaceIndex),
+				DelayMs:        state.delayMs,
+				TCCommand:      state.tcCmd,
+			})
+		}
+		for attempt := 0; attempt < 5; attempt++ {
+			injector := &tcv1alpha1.TCInjector{}
+			if err := r.Get(ctx, req.NamespacedName, injector); err != nil {
+				logger.Error(err, "failed to get TCInjector for status update")
+				break
 			}
 			// Preserve entries from other nodes; replace only this node's entries.
 			merged := make([]tcv1alpha1.InjectedPodStatus, 0, len(injector.Status.InjectedPodDetails))
@@ -242,9 +249,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				Message:            fmt.Sprintf("%d pod(s) injected on node %s", injectedCount, r.NodeName),
 				LastTransitionTime: metav1.Now(),
 			})
-			if err := r.Status().Update(ctx, injector); err != nil && !errors.IsConflict(err) {
+			if err := r.Status().Update(ctx, injector); err != nil {
+				if errors.IsConflict(err) {
+					logger.V(1).Info("status update conflict, retrying", "node", r.NodeName, "attempt", attempt+1)
+					continue
+				}
 				logger.Error(err, "failed to update TCInjector status")
 			}
+			break
 		}
 	}
 

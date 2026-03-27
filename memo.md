@@ -4822,3 +4822,107 @@ conditions:
 
 ✻ Churned for 5m 49s
 ```
+
+```
+❯ tcinjectorのカスタムリソースを適用し直すと、下記の結果になりました。conditionsに2台しかいない(実際は8台ノードがいます)のと、injectedPodDetailsにPodが1個しかいない(実際にはPod2個
+マッチします)のが変です。調査お願いします
+
+⏺ 2つの問題の原因は同じです：8ノードが同時に同じ TCInjector の status を更新しようとして conflict し、ほとんどの更新が黙って捨てられている。
+
+  現在のコード：
+  if err := r.Status().Update(ctx, injector); err != nil && !errors.IsConflict(err) {
+      // conflict は無視して終了 → 更新が消える
+  }
+
+  conflict 時に再取得・再マージして再試行する必要があります。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 27 lines, removed 15 lines
+      208    }
+      209
+      210    // Update status on the triggering TCInjector if the request was for one.
+      211 +  // Retry on conflict: multiple DaemonSet pods (one per node) may update the
+      212 +  // same TCInjector status concurrently. On conflict we re-read the latest
+      213 +  // resource version and re-merge before retrying.
+      214    if req.Name != "" {
+      212 -    injector := &tcv1alpha1.TCInjector{}
+      213 -    if err := r.Get(ctx, req.NamespacedName, injector); err == nil {
+      214 -      // Build this node's details.
+      215 -      thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
+      216 -      for _, state := range r.injected {
+      217 -        thisNodeDetails = append(thisNodeDetails, tcv1alpha1.InjectedPodStatus{
+      218 -          NodeName:       r.NodeName,
+      219 -          Namespace:      state.podNamespace,
+      220 -          PodName:        state.podName,
+      221 -          Interface:      state.ifaceName,
+      222 -          InterfaceIndex: int32(state.ifaceIndex),
+      223 -          DelayMs:        state.delayMs,
+      224 -          TCCommand:      state.tcCmd,
+      225 -        })
+      215 +    // Build this node's details once; they do not change between retries.
+      216 +    thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
+      217 +    for _, state := range r.injected {
+      218 +      thisNodeDetails = append(thisNodeDetails, tcv1alpha1.InjectedPodStatus{
+      219 +        NodeName:       r.NodeName,
+      220 +        Namespace:      state.podNamespace,
+      221 +        PodName:        state.podName,
+      222 +        Interface:      state.ifaceName,
+      223 +        InterfaceIndex: int32(state.ifaceIndex),
+      224 +        DelayMs:        state.delayMs,
+      225 +        TCCommand:      state.tcCmd,
+      226 +      })
+      227 +    }
+      228 +    for attempt := 0; attempt < 5; attempt++ {
+      229 +      injector := &tcv1alpha1.TCInjector{}
+      230 +      if err := r.Get(ctx, req.NamespacedName, injector); err != nil {
+      231 +        logger.Error(err, "failed to get TCInjector for status update")
+      232 +        break
+      233        }
+      234        // Preserve entries from other nodes; replace only this node's entries.
+      235        merged := make([]tcv1alpha1.InjectedPodStatus, 0, len(injector.Status.InjectedPodDetails))
+     ...
+      249          Message:            fmt.Sprintf("%d pod(s) injected on node %s", injectedCount, r.NodeName),
+      250          LastTransitionTime: metav1.Now(),
+      251        })
+      245 -      if err := r.Status().Update(ctx, injector); err != nil && !errors.IsConflict(err) {
+      252 +      if err := r.Status().Update(ctx, injector); err != nil {
+      253 +        if errors.IsConflict(err) {
+      254 +          logger.V(1).Info("status update conflict, retrying", "node", r.NodeName, "attempt", attempt+1)
+      255 +          continue
+      256 +        }
+      257          logger.Error(err, "failed to update TCInjector status")
+      258        }
+      259 +      break
+      260      }
+      261    }
+      262
+
+⏺ Bash(go build ./... 2>&1 && go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       0.692s
+     … +2 lines (ctrl+o to expand)
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ 通過しました。git diff で変更を確認します。
+
+⏺ Bash(git diff pkg/controller/tcinjector_controller.go)
+  ⎿  diff --git a/pkg/controller/tcinjector_controller.go b/pkg/controller/tcinjector_controller.go
+     index 3b27d84..3bd7dd4 100644
+     --- a/pkg/controller/tcinjector_controller.go
+     … +43 lines (ctrl+o to expand)
+
+⏺ 変更の要点：
+
+  根本原因： 8ノードが同時に Status().Update() を実行すると、1つだけが成功し残りは conflict エラーになります。以前のコードは conflict
+  を無視して終了していたため、6〜7ノードの更新が消えていました。
+
+  修正内容：
+  - thisNodeDetails（自ノード分のデータ）はループ外で1回だけ構築
+  - conflict 発生時は r.Get() で最新の resourceVersion を取得し直し、マージし直して最大5回リトライ
+  - 8ノードが同時に書いても、最大5ラウンドのリトライで全ノードの情報が揃う
+
+  リビルドしてデプロイしてください。
+
+✻ Baked for 1m 28s
+```
