@@ -1,4 +1,4 @@
-IMAGE ?= tc-injector:latest
+IMAGE ?= quay.io/manabu.ori/tc-injector:v1
 NAMESPACE ?= tc-injector-system
 
 .PHONY: all build test image deploy undeploy install-crd uninstall-crd install-scc uninstall-scc tidy clean
@@ -23,7 +23,7 @@ build: tidy
 
 ## Build the container image.
 image:
-	docker build -t $(IMAGE) .
+	podman build -t $(IMAGE) .
 
 ## Install the CRD into the cluster.
 install-crd:
