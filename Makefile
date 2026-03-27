@@ -48,11 +48,13 @@ uninstall-scc:
 
 ## Deploy RBAC and DaemonSet.
 deploy: install-crd
+	kubectl apply -f config/deploy/namespace.yaml
 	kubectl apply -f config/deploy/rbac.yaml
 	kubectl apply -f config/deploy/daemonset.yaml
 
 ## Deploy RBAC, DaemonSet, and SCC (OpenShift).
 deploy-openshift: install-crd install-scc
+	kubectl apply -f config/deploy/namespace.yaml
 	kubectl apply -f config/deploy/rbac.yaml
 	kubectl apply -f config/deploy/daemonset.yaml
 
@@ -60,15 +62,13 @@ deploy-openshift: install-crd install-scc
 undeploy:
 	kubectl delete -f config/deploy/daemonset.yaml --ignore-not-found
 	kubectl delete -f config/deploy/rbac.yaml --ignore-not-found
+	kubectl delete -f config/deploy/namespace.yaml --ignore-not-found
 
 ## Remove the DaemonSet, RBAC, and SCC (OpenShift).
 undeploy-openshift: uninstall-scc
 	kubectl delete -f config/deploy/daemonset.yaml --ignore-not-found
 	kubectl delete -f config/deploy/rbac.yaml --ignore-not-found
-
-## Apply the example TCInjector resource.
-sample:
-	kubectl apply -f config/samples/tcinjector-example.yaml
+	kubectl delete -f config/deploy/namespace.yaml --ignore-not-found
 
 ## Remove build artifacts.
 clean:
