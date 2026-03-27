@@ -3342,3 +3342,54 @@ make: *** [build] Error 1
 
 ✻ Crunched for 43s
 ```
+
+```
+❯ Dockerfileではalpineを使っていますが、Red Hatのubi10を使うように変えてください。
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ Write(Dockerfile)
+  ⎿  Added 5 lines, removed 6 lines
+      1 -FROM golang:1.22-alpine AS builder
+      1 +FROM registry.access.redhat.com/ubi10/go-toolset AS builder
+      2
+      3 +USER root
+      4  WORKDIR /workspace
+      5  COPY go.mod go.sum ./
+      6  RUN go mod download
+     ...
+      11  RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+      12      go build -ldflags="-s -w" -o /tc-injector ./cmd/
+      13
+      13 -# Runtime image — must include iproute2 for the tc(8) binary.
+      14 -FROM debian:bookworm-slim
+      14 +# Runtime image — must include iproute for the tc(8) binary.
+      15 +FROM registry.access.redhat.com/ubi10/ubi-minimal
+      16
+      16 -RUN apt-get update && apt-get install -y --no-install-recommends \
+      17 -        iproute2 \
+      18 -    && rm -rf /var/lib/apt/lists/*
+      17 +RUN microdnf install -y iproute && microdnf clean all
+      18
+      19  COPY --from=builder /tc-injector /tc-injector
+      20
+
+⏺ 変更点を説明します。
+
+  ┌──────────┬──────────────────────┬──────────────────────────────────────────────┐
+  │ ステージ │        変更前        │                    変更後                    │
+  ├──────────┼──────────────────────┼──────────────────────────────────────────────┤
+  │ builder  │ golang:1.22-alpine   │ registry.access.redhat.com/ubi10/go-toolset  │
+  ├──────────┼──────────────────────┼──────────────────────────────────────────────┤
+  │ runtime  │ debian:bookworm-slim │ registry.access.redhat.com/ubi10/ubi-minimal │
+  └──────────┴──────────────────────┴──────────────────────────────────────────────┘
+
+  補足事項：
+
+  - USER root を builder に追加しています。ubi10/go-toolset はデフォルトで uid 1001 で動作するため、/workspace への書き込みに必要です。
+  - パッケージ名が変わります：Debian では iproute2 でしたが、RHEL/UBI では iproute です（tc コマンドはこちらに含まれます）。
+  - パッケージマネージャが変わります：apt-get → microdnf（UBI Minimal 付属の軽量 DNF）。
+  - バイナリは CGO_ENABLED=0 の静的ビルドなので、builder の OS が変わっても成果物に影響はありません。
+
+✻ Cooked for 1m 11s
+```
