@@ -13,9 +13,11 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	tcv1alpha1 "github.com/tc-injector/tc-injector/pkg/api/v1alpha1"
@@ -39,6 +41,12 @@ type RealTCApplier struct{}
 func (RealTCApplier) Apply(iface string, delayMs int32) error { return tc.Apply(iface, delayMs) }
 func (RealTCApplier) Remove(iface string) error               { return tc.Remove(iface) }
 
+// injectedState records the tc rule currently applied to a pod.
+type injectedState struct {
+	ifaceName string
+	delayMs   int32
+}
+
 // Reconciler reconciles TCInjector objects and manages tc rules on the local node.
 type Reconciler struct {
 	client.Client
@@ -49,8 +57,8 @@ type Reconciler struct {
 
 	// mu guards injected.
 	mu sync.Mutex
-	// injected tracks which pods have tc rules applied: podUID -> ifaceName.
-	injected map[string]string
+	// injected tracks which pods have tc rules applied: podUID -> injectedState.
+	injected map[string]injectedState
 }
 
 // +kubebuilder:rbac:groups=tc-injector.setns.net,resources=tcinjectors,verbs=get;list;watch
@@ -85,12 +93,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		namespaceLabelMap[ns.Name] = labels.Set(ns.Labels)
 	}
 
+	// Reconcile actual vs desired under the lock.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.injected == nil {
+		r.injected = make(map[string]injectedState)
+	}
+
 	// Build the desired state: podUID -> delayMs.
+	// For pods already injected without periodic rotation, the existing delay is
+	// preserved to avoid re-randomizing on every reconcile.
 	desired := make(map[string]int32)
 	for _, injector := range injectorList.Items {
 		if injector.DeletionTimestamp != nil {
 			continue
 		}
+		shouldRotate := injector.Spec.EnablePeriodicDelayRotation
 		for _, rule := range injector.Spec.Rules {
 			podSel, err := metav1.LabelSelectorAsSelector(&rule.Selector)
 			if err != nil {
@@ -113,27 +132,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				if !ok || !nsSel.Matches(nsLabels) {
 					continue
 				}
-				delay := tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+				uid := string(pod.UID)
+				// Preserve the existing delay when the pod is already injected and
+				// periodic rotation is not active. This prevents re-randomizing on
+				// every reconcile triggered by unrelated pod or resource changes.
 				// Last matching rule wins; earlier rules can be overridden.
-				desired[string(pod.UID)] = delay
+				if existing, alreadyInjected := r.injected[uid]; alreadyInjected && !shouldRotate {
+					desired[uid] = existing.delayMs
+				} else {
+					desired[uid] = tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+				}
 			}
 		}
 	}
 
-	// Reconcile actual vs desired.
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.injected == nil {
-		r.injected = make(map[string]string)
-	}
-
 	// Remove tc rules for pods that are no longer desired.
-	for uid, iface := range r.injected {
+	for uid, state := range r.injected {
 		if _, ok := desired[uid]; !ok {
-			logger.Info("removing tc rule", "podUID", uid, "iface", iface)
-			if err := r.TCApplier.Remove(iface); err != nil {
-				logger.Error(err, "failed to remove tc rule", "iface", iface)
+			logger.Info("removing tc rule", "podUID", uid, "iface", state.ifaceName)
+			if err := r.TCApplier.Remove(state.ifaceName); err != nil {
+				logger.Error(err, "failed to remove tc rule", "iface", state.ifaceName)
 			}
 			delete(r.injected, uid)
 		}
@@ -159,6 +177,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			continue
 		}
 
+		// Skip if the same interface and delay are already applied.
+		if existing, ok := r.injected[uid]; ok && existing.ifaceName == iface && existing.delayMs == delayMs {
+			injectedCount++
+			continue
+		}
+
 		tcCmd := fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, delayMs)
 		logger.Info("applying tc delay", "pod", pod.Name, "iface", iface, "delayMs", delayMs, "tcCmd", tcCmd)
 		if err := r.TCApplier.Apply(iface, delayMs); err != nil {
@@ -166,7 +190,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			continue
 		}
 
-		r.injected[uid] = iface
+		r.injected[uid] = injectedState{ifaceName: iface, delayMs: delayMs}
 		injectedCount++
 	}
 
@@ -222,7 +246,10 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&tcv1alpha1.TCInjector{}).
+		// GenerationChangedPredicate prevents reconciles triggered by status
+		// updates, which do not increment metadata.generation. Without this,
+		// each Status().Update() call would re-trigger reconcile indefinitely.
+		For(&tcv1alpha1.TCInjector{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// Also trigger reconcile when pods on this node change.
 		Watches(
 			&corev1.Pod{},

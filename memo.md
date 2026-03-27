@@ -1,3 +1,5 @@
+# Prompts
+
 ```
  ▐▛███▜▌   Claude Code v2.1.76
 ▝▜█████▛▘  Sonnet 4.6 · API Usage Billing
@@ -3975,4 +3977,231 @@ cannot find host veth   {"controller": "tcinjector", "controllerGroup": "tc-inje
   │ cmd/main.go                  │ --metrics-bind-address のデフォルト値 :8080 → :9988 │
   └──────────────────────────────┴─────────────────────────────────────────────────────┘
 
+```
+
+```
+❯ ありがとうございます、うまく動いているかもです。該当ホスト上でip link showを実行すると、qdisc netemになっていました。(tc-injector稼働前はqdisc noqueueでした)
+[core@wk3 ~]$ ip link show | grep ^24:
+24: 379812d0bb0b3c2@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1400 qdisc netem master ovs-system state UP mode DEFAULT group default qlen 1000
+
+⏺ 動作確認できましたね。qdisc netem に変わっているので tc-injector が正しく機能しています。
+
+  実際に遅延が入っているか、Pod の中から ping などで確認しておくとより確実です。
+
+  # 対象 Pod に exec して遅延を計測
+  kubectl exec -it hello-9b6845674-w48n9 -- ping -c 10 <other-pod-ip>
+
+  tc-injector 適用前後で RTT が minDelay〜maxDelay ms 程度増加していれば完全に動作確認できます。
+
+❯ 1点気になるところがあります。tc-injector Podで、ログが大量に出ています。ずっとreconcileし続けているように見えます。改善できますか？
+2026-03-27T06:53:51Z    INFO    applying tc delay       {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector":
+{"name":"example-delay"}, "namespace": "", "name": "example-delay", "reconcileID": "856cfd94-d747-48b7-8fad-15881db4b1eb", "request": {"name":"example-delay"}, "pod":
+"hello-9b6845674-w48n9", "iface": "379812d0bb0b3c2", "delayMs": 498, "tcCmd": "tc qdisc replace dev 379812d0bb0b3c2 root handle 1: netem delay 498ms"}
+2026-03-27T06:53:52Z    INFO    applying tc delay       {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector":
+{"name":"example-delay"}, "namespace": "", "name": "example-delay", "reconcileID": "5573eb32-d319-426e-8496-75a6a3acf756", "request": {"name":"example-delay"}, "pod":
+"hello-9b6845674-w48n9", "iface": "379812d0bb0b3c2", "delayMs": 498, "tcCmd": "tc qdisc replace dev 379812d0bb0b3c2 root handle 1: netem delay 498ms"}
+2026-03-27T06:53:52Z    INFO    applying tc delay       {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector":
+{"name":"example-delay"}, "namespace": "", "name": "example-delay", "reconcileID": "adbcef63-0c22-4480-8d5e-bd43299a94e3", "request": {"name":"example-delay"}, "pod":
+"hello-9b6845674-w48n9", "iface": "379812d0bb0b3c2", "delayMs": 370, "tcCmd": "tc qdisc replace dev 379812d0bb0b3c2 root handle 1: netem delay 370ms"}
+2026-03-27T06:53:52Z    INFO    applying tc delay       {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector":
+{"name":"example-delay"}, "namespace": "", "name": "example-delay", "reconcileID": "9bdb7bef-8854-43c3-9846-e6224cfe9a33", "request": {"name":"example-delay"}, "pod":
+"hello-9b6845674-w48n9", "iface": "379812d0bb0b3c2", "delayMs": 410, "tcCmd": "tc qdisc replace dev 379812d0bb0b3c2 root handle 1: netem delay 410ms"}
+2026-03-27T06:53:52Z    INFO    applying tc delay       {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector":
+{"name":"example-delay"}, "namespace": "", "name": "example-delay", "reconcileID": "9b123e28-fd62-491d-b398-fac51a31d155", "request": {"name":"example-delay"}, "pod":
+"hello-9b6845674-w48n9", "iface": "379812d0bb0b3c2", "delayMs": 445, "tcCmd": "tc qdisc replace dev 379812d0bb0b3c2 root handle 1: netem delay 445ms"}
+2026-03-27T06:53:52Z    INFO    applying tc delay       {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector":
+{"name":"example-delay"}, "namespace": "", "name": "example-delay", "reconcileID": "ea0056e6-16cf-4c82-a267-217a87bb527f", "request": {"name":"example-delay"}, "pod":
+"hello-9b6845674-w48n9", "iface": "379812d0bb0b3c2", "delayMs": 500, "tcCmd": "tc qdisc replace dev 379812d0bb0b3c2 root handle 1: netem delay 500ms"}
+2026-03-27T06:53:52Z    INFO    applying tc delay       {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector":
+{"name":"example-delay"}, "namespace": "", "name": "example-delay", "reconcileID": "983a3a37-8d23-439f-95ca-2204d36961f6", "request": {"name":"example-delay"}, "pod":
+"hello-9b6845674-w48n9", "iface": "379812d0bb0b3c2", "delayMs": 327, "tcCmd": "tc qdisc replace dev 379812d0bb0b3c2 root handle 1: netem delay 327ms"}
+2026-03-27T06:53:52Z    INFO    applying tc delay       {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector":
+{"name":"example-delay"}, "namespace": "", "name": "example-delay", "reconcileID": "f169846e-7b86-438c-a571-90891ee45478", "request": {"name":"example-delay"}, "pod":
+"hello-9b6845674-w48n9", "iface": "379812d0bb0b3c2", "delayMs": 359, "tcCmd": "tc qdisc replace dev 379812d0bb0b3c2 root handle 1: netem delay 359ms"}
+
+⏺ コードを確認します。
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ 原因が2つあります：
+
+  1. 無限ループ: Status().Update() が TCInjector リソースを変更し、For(&TCInjector{}) のウォッチがそれを検知して再 reconcile → また status 更新、の繰り返し
+  2. 再 reconcile のたびに遅延を再ランダム化: tc.RandomDelay() を毎回呼ぶため、既に注入済みの Pod にも毎回異なる遅延で tc apply している
+
+  3つの修正を行います：
+  - GenerationChangedPredicate で status 更新による reconcile トリガーを抑制
+  - injected マップで適用済み遅延も追跡し、変化がなければ tc apply をスキップ
+  - 既注入済み Pod の遅延を保持し、不要な再ランダム化を防ぐ
+
+⏺ Write(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 45 lines, removed 18 lines
+      13    "k8s.io/apimachinery/pkg/labels"
+      14    "k8s.io/apimachinery/pkg/runtime"
+      15    ctrl "sigs.k8s.io/controller-runtime"
+      16 +  "sigs.k8s.io/controller-runtime/pkg/builder"
+      17    "sigs.k8s.io/controller-runtime/pkg/client"
+      18    "sigs.k8s.io/controller-runtime/pkg/handler"
+      19    "sigs.k8s.io/controller-runtime/pkg/log"
+      20 +  "sigs.k8s.io/controller-runtime/pkg/predicate"
+      21    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+      22
+      23    tcv1alpha1 "github.com/tc-injector/tc-injector/pkg/api/v1alpha1"
+     ...
+      41  func (RealTCApplier) Apply(iface string, delayMs int32) error { return tc.Apply(iface, delayMs) }
+      42  func (RealTCApplier) Remove(iface string) error               { return tc.Remove(iface) }
+      43
+      44 +// injectedState records the tc rule currently applied to a pod.
+      45 +type injectedState struct {
+      46 +  ifaceName string
+      47 +  delayMs   int32
+      48 +}
+      49 +
+      50  // Reconciler reconciles TCInjector objects and manages tc rules on the local node.
+      51  type Reconciler struct {
+      52    client.Client
+     ...
+      57
+      58    // mu guards injected.
+      59    mu sync.Mutex
+      52 -  // injected tracks which pods have tc rules applied: podUID -> ifaceName.
+      53 -  injected map[string]string
+      60 +  // injected tracks which pods have tc rules applied: podUID -> injectedState.
+      61 +  injected map[string]injectedState
+      62  }
+      63
+      64  // +kubebuilder:rbac:groups=tc-injector.setns.net,resources=tcinjectors,verbs=get;list;watch
+     ...
+       93      namespaceLabelMap[ns.Name] = labels.Set(ns.Labels)
+       94    }
+       95
+       96 +  // Reconcile actual vs desired under the lock.
+       97 +  r.mu.Lock()
+       98 +  defer r.mu.Unlock()
+       99 +
+      100 +  if r.injected == nil {
+      101 +    r.injected = make(map[string]injectedState)
+      102 +  }
+      103 +
+      104    // Build the desired state: podUID -> delayMs.
+      105 +  // For pods already injected without periodic rotation, the existing delay is
+      106 +  // preserved to avoid re-randomizing on every reconcile.
+      107    desired := make(map[string]int32)
+      108    for _, injector := range injectorList.Items {
+      109      if injector.DeletionTimestamp != nil {
+      110        continue
+      111      }
+      112 +    shouldRotate := injector.Spec.EnablePeriodicDelayRotation
+      113      for _, rule := range injector.Spec.Rules {
+      114        podSel, err := metav1.LabelSelectorAsSelector(&rule.Selector)
+      115        if err != nil {
+     ...
+      132          if !ok || !nsSel.Matches(nsLabels) {
+      133            continue
+      134          }
+      116 -        delay := tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+      135 +        uid := string(pod.UID)
+      136 +        // Preserve the existing delay when the pod is already injected and
+      137 +        // periodic rotation is not active. This prevents re-randomizing on
+      138 +        // every reconcile triggered by unrelated pod or resource changes.
+      139          // Last matching rule wins; earlier rules can be overridden.
+      118 -        desired[string(pod.UID)] = delay
+      140 +        if existing, alreadyInjected := r.injected[uid]; alreadyInjected && !shouldRotate {
+      141 +          desired[uid] = existing.delayMs
+      142 +        } else {
+      143 +          desired[uid] = tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+      144 +        }
+      145        }
+      146      }
+      147    }
+      148
+      123 -  // Reconcile actual vs desired.
+      124 -  r.mu.Lock()
+      125 -  defer r.mu.Unlock()
+      126 -
+      127 -  if r.injected == nil {
+      128 -    r.injected = make(map[string]string)
+      129 -  }
+      130 -
+      149    // Remove tc rules for pods that are no longer desired.
+      132 -  for uid, iface := range r.injected {
+      150 +  for uid, state := range r.injected {
+      151      if _, ok := desired[uid]; !ok {
+      134 -      logger.Info("removing tc rule", "podUID", uid, "iface", iface)
+      135 -      if err := r.TCApplier.Remove(iface); err != nil {
+      136 -        logger.Error(err, "failed to remove tc rule", "iface", iface)
+      152 +      logger.Info("removing tc rule", "podUID", uid, "iface", state.ifaceName)
+      153 +      if err := r.TCApplier.Remove(state.ifaceName); err != nil {
+      154 +        logger.Error(err, "failed to remove tc rule", "iface", state.ifaceName)
+      155        }
+      156        delete(r.injected, uid)
+      157      }
+     ...
+      177        continue
+      178      }
+      179
+      180 +    // Skip if the same interface and delay are already applied.
+      181 +    if existing, ok := r.injected[uid]; ok && existing.ifaceName == iface && existing.delayMs == delayMs {
+      182 +      injectedCount++
+      183 +      continue
+      184 +    }
+      185 +
+      186      tcCmd := fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, delayMs)
+      187      logger.Info("applying tc delay", "pod", pod.Name, "iface", iface, "delayMs", delayMs, "tcCmd", tcCmd)
+      188      if err := r.TCApplier.Apply(iface, delayMs); err != nil {
+     ...
+      190        continue
+      191      }
+      192
+      169 -    r.injected[uid] = iface
+      193 +    r.injected[uid] = injectedState{ifaceName: iface, delayMs: delayMs}
+      194      injectedCount++
+      195    }
+      196
+     ...
+      246    }
+      247
+      248    return ctrl.NewControllerManagedBy(mgr).
+      225 -    For(&tcv1alpha1.TCInjector{}).
+      249 +    // GenerationChangedPredicate prevents reconciles triggered by status
+      250 +    // updates, which do not increment metadata.generation. Without this,
+      251 +    // each Status().Update() call would re-trigger reconcile indefinitely.
+      252 +    For(&tcv1alpha1.TCInjector{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+      253      // Also trigger reconcile when pods on this node change.
+      254      Watches(
+      255        &corev1.Pod{},
+
+⏺ Bash(go build ./... 2>&1 && echo "OK")
+  ⎿  OK
+
+⏺ ビルド OK です。修正内容のまとめです。
+
+  ---
+  修正内容
+
+  原因1：status 更新による無限ループ
+
+  reconcile → Status().Update() → TCInjector 変更イベント → reconcile → ...
+
+  修正: GenerationChangedPredicate を追加。metadata.generation は spec 変更時のみインクリメントされ、status 更新では変わらないため、status 更新が reconcile
+  をトリガーしなくなります。
+
+  原因2：reconcile のたびに遅延を再ランダム化
+
+  修正: injected マップを map[string]string（ifaceName のみ）から map[string]injectedState（ifaceName + delayMs）に変更し、以下の2段階でスキップ判定するようにしました。
+
+  ┌────────────────┬──────────────────────────────────────────────────────┬──────────────────────────────────────┐
+  │   タイミング   │                         判定                         │                 効果                 │
+  ├────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ desired 構築時 │ 既注入済みかつ rotation 無効 → 既存 delayMs を再利用 │ 不要な再ランダム化を防止             │
+  ├────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ tc apply 直前  │ iface も delayMs も同じ → スキップ                   │ 同一状態への冗長な tc コマンドを排除 │
+  └────────────────┴──────────────────────────────────────────────────────┴──────────────────────────────────────┘
+
+  期待される動作
+
+  - 初回 reconcile: ランダムな遅延を決定し tc apply → ログに applying tc delay が出る
+  - 以後の reconcile（Pod 変化など）: 遅延を保持したままスキップ → ログが出ない
+  - enablePeriodicDelayRotation: true の場合: 指定インターバルで再ランダム化 → ログに applying tc delay が出る
+
+✻ Worked for 3m 16s
 ```
