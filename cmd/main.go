@@ -38,8 +38,8 @@ func main() {
 		leaderElect     bool
 	)
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address for the metrics endpoint.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address for health probes.")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9988", "Address for the metrics endpoint.")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":9989", "Address for health probes.")
 	flag.StringVar(&criSocket, "cri-socket", "",
 		"Path to the CRI socket (as mounted from the host). "+
 			"If empty, auto-detects containerd or CRI-O socket.")

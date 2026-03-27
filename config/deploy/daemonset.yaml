@@ -40,8 +40,8 @@ spec:
             # Set explicitly if your runtime socket path is non-standard.
             # - --cri-socket=/run/containerd/containerd.sock  # containerd
             # - --cri-socket=/run/crio/crio.sock              # CRI-O
-            - --metrics-bind-address=:8080
-            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:9988
+            - --health-probe-bind-address=:9989
           env:
             - name: NODE_NAME
               valueFrom:
@@ -59,13 +59,13 @@ spec:
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8081
+              port: 9989
             initialDelaySeconds: 15
             periodSeconds: 20
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 8081
+              port: 9989
             initialDelaySeconds: 5
             periodSeconds: 10
           volumeMounts:

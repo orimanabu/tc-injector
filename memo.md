@@ -3860,3 +3860,119 @@ cannot find host veth   {"controller": "tcinjector", "controllerGroup": "tc-inje
 
 ✻ Brewed for 3m 12s
 ```
+
+```
+❯ `{"error": "error listening on :8081: listen tcp :8081: bind: address already in use"}` になりました。ポート番号を変えたいです。9989にしてください
+
+⏺ Searched for 1 pattern (ctrl+o to expand)
+
+⏺ daemonset.yaml の3箇所と cmd/main.go のデフォルト値を変更します。
+
+⏺ Update(config/deploy/daemonset.yaml)
+  ⎿  Added 1 line, removed 1 line
+      41              # - --cri-socket=/run/containerd/containerd.sock  # containerd
+      42              # - --cri-socket=/run/crio/crio.sock              # CRI-O
+      43              - --metrics-bind-address=:8080
+      44 -            - --health-probe-bind-address=:8081
+      44 +            - --health-probe-bind-address=:9989
+      45            env:
+      46              - name: NODE_NAME
+      47                valueFrom:
+
+⏺ Update(config/deploy/daemonset.yaml)
+  ⎿  Added 2 lines, removed 2 lines
+      59            livenessProbe:
+      60              httpGet:
+      61                path: /healthz
+      62 -              port: 8081
+      62 +              port: 9989
+      63              initialDelaySeconds: 15
+      64              periodSeconds: 20
+      65            readinessProbe:
+      66              httpGet:
+      67                path: /readyz
+      68 -              port: 8081
+      68 +              port: 9989
+      69              initialDelaySeconds: 5
+      70              periodSeconds: 10
+      71            volumeMounts:
+
+⏺ Update(cmd/main.go)
+  ⎿  Error editing file
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ Update(cmd/main.go)
+  ⎿  Added 1 line, removed 1 line
+      39    )
+      40
+      41    flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address for the metrics endpoint.")
+      42 -  flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address for health probes.")
+      42 +  flag.StringVar(&probeAddr, "health-probe-bind-address", ":9989", "Address for health probes.")
+      43    flag.StringVar(&criSocket, "cri-socket", "",
+      44      "Path to the CRI socket (as mounted from the host). "+
+      45        "If empty, auto-detects containerd or CRI-O socket.")
+
+⏺ Bash(go build ./... 2>&1 && echo "OK")
+  ⎿  OK
+
+⏺ 変更箇所は4か所です：
+
+  ┌──────────────────────────────┬──────────────────────────────────────────────────────────┐
+  │           ファイル           │                         変更内容                         │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ config/deploy/daemonset.yaml │ --health-probe-bind-address=:8081 → :9989                │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ config/deploy/daemonset.yaml │ liveness/readiness probe の port: 8081 → 9989（2箇所）   │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ cmd/main.go                  │ --health-probe-bind-address のデフォルト値 :8081 → :9989 │
+  └──────────────────────────────┴──────────────────────────────────────────────────────────┘
+
+  再ビルド・再デプロイしてください：
+
+  make image IMAGE=<your-registry>/tc-injector:latest
+  docker push <your-registry>/tc-injector:latest
+  kubectl rollout restart daemonset/tc-injector -n tc-injector-system
+
+✻ Cogitated for 32s
+
+❯ 8080を使っているところも、9988に変えてください
+
+⏺ Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Update(config/deploy/daemonset.yaml)
+  ⎿  Added 1 line, removed 1 line
+      40              # Set explicitly if your runtime socket path is non-standard.
+      41              # - --cri-socket=/run/containerd/containerd.sock  # containerd
+      42              # - --cri-socket=/run/crio/crio.sock              # CRI-O
+      43 -            - --metrics-bind-address=:8080
+      43 +            - --metrics-bind-address=:9988
+      44              - --health-probe-bind-address=:9989
+      45            env:
+      46              - name: NODE_NAME
+
+⏺ Update(cmd/main.go)
+  ⎿  Added 1 line, removed 1 line
+      38      leaderElect     bool
+      39    )
+      40
+      41 -  flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address for the metrics endpoint.")
+      41 +  flag.StringVar(&metricsAddr, "metrics-bind-address", ":9988", "Address for the metrics endpoint.")
+      42    flag.StringVar(&probeAddr, "health-probe-bind-address", ":9989", "Address for health probes.")
+      43    flag.StringVar(&criSocket, "cri-socket", "",
+      44      "Path to the CRI socket (as mounted from the host). "+
+
+⏺ Bash(go build ./... 2>&1 && echo "OK")
+  ⎿  OK
+
+⏺ 2箇所変更しました：
+
+  ┌──────────────────────────────┬─────────────────────────────────────────────────────┐
+  │           ファイル           │                      変更内容                       │
+  ├──────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ config/deploy/daemonset.yaml │ --metrics-bind-address=:8080 → :9988                │
+  ├──────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ cmd/main.go                  │ --metrics-bind-address のデフォルト値 :8080 → :9988 │
+  └──────────────────────────────┴─────────────────────────────────────────────────────┘
+
+```
