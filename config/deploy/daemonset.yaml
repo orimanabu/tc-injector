@@ -17,7 +17,11 @@ spec:
         app: tc-injector
     spec:
       serviceAccountName: tc-injector
-      hostNetwork: false
+      # hostNetwork is required so that the DaemonSet pod shares the host's
+      # default network namespace. Without this, netlink calls and tc(8) run
+      # in the pod's own netns and cannot see the host-side veth interfaces
+      # (e.g. OVN-Kubernetes ports mastered by ovs-system).
+      hostNetwork: true
       # hostPID is required so that /proc/<pid>/ns/net of target containers
       # is reachable from within the DaemonSet pod.
       hostPID: true

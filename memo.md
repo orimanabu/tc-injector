@@ -3730,3 +3730,133 @@ ip link showの結果は以下のとおりです、これはインターフェ�
 
 ✻ Churned for 6m 38s
 ```
+
+```
+❯ ip link show にindexが指定できません。以下でもよいでしょうか
+[core@wk3 ~]$ ip link show | grep ^24:
+24: 379812d0bb0b3c2@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1400 qdisc noqueue master ovs-system state UP mode DEFAULT group default
+
+⏺ 完璧な情報です。全容が分かりました。
+
+  状況の確認
+
+  24: 379812d0bb0b3c2@if2: ... master ovs-system
+
+  - ifindex 24 はホストデフォルト netns に存在する → netlink.LinkByIndex(24) で取得できる ✓
+  - インターフェース名は 379812d0bb0b3c2（OVN-Kubernetes が付けた15文字の名前）
+  - @if2 ← pod 内の eth0（ifindex 2）がピア、つまり正しい対応関係 ✓
+  - master ovs-system ← OVS に接続されているホスト側 veth ✓
+
+  つまり、すでに行ったコードの修正（PeerName → ParentIndex + LinkByIndex）で正しく動くはずです。
+
+  なぜ link-netns f7f740de-... と表示されたか
+
+  pod netns 内から ip link show すると、ピアがホスト netns にあることを link-netns で表示します。この f7f740de-... は CRI-O が /var/run/netns/f7f740de-... としてホスト netns を
+  bind mount したパスです。ホストデフォルト netns そのものです。
+
+  修正後の処理フロー
+
+  pod netns:
+    eth0 (ifindex 2, type=veth)
+    └─ Attrs().ParentIndex = 24   ← ここを使う（PeerName ではなく）
+
+  host default netns:
+    netlink.LinkByIndex(24) → "379812d0bb0b3c2" (master ovs-system)
+    └─ tc qdisc replace dev 379812d0bb0b3c2 root netem delay Xms  ✓
+
+  対応
+
+  すでにコードは修正済みですので、イメージを再ビルドして再デプロイしてください。
+
+  make image IMAGE=<your-registry>/tc-injector:latest
+  docker push <your-registry>/tc-injector:latest
+  kubectl rollout restart daemonset/tc-injector -n tc-injector-system
+
+  デプロイ後、ログに以下が出れば修正成功です：
+
+  INFO  applying tc delay  pod=hello-9b6845674-w48n9  iface=379812d0bb0b3c2  delayMs=XX
+
+✻ Crunched for 51s
+
+❯ 確認しましたが、やはり以下のエラーになります。調査お願いします
+cannot find host veth   {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector": {"name":"example-delay"},
+"namespace": "", "name": "example-delay", "reconcileID": "d419cc7b-bb5e-404d-b151-9ef66fda467e", "request": {"name":"example-delay"}, "pod": "hello-9b6845674-w48n9",
+"containerID": "cri-o://5e94f6d782a81bec40ea687070356cd388739dbdb563b9c11fed24921ad9050c", "error": "lookup host link by index 24: Link not found"}
+
+⏺ 根本原因が特定できました。
+
+  エラーの本当の原因: hostNetwork: false のため DaemonSet Pod は独自の network namespace を持っています。netns.Get() はホストデフォルト netns ではなく DaemonSet Pod 自身の netns
+  を返しており、ifindex 24（379812d0bb0b3c2）はホストデフォルト netns に存在するため LinkByIndex が失敗しています。同じ理由で exec.Command("tc", ...) も tc のコマンドが DaemonSet
+  Pod 自身の netns で実行されるため動作しません。
+
+  修正方法は hostNetwork: true にすることです。これにより DaemonSet Pod がホストデフォルト netns を共有し、netns.Get() がホスト netns を返すようになります。まず OpenShift の SCC
+  ファイルを確認します。
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ 3ファイルを修正します。
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ Update(config/deploy/daemonset.yaml)
+  ⎿  Added 5 lines, removed 1 line
+      17          app: tc-injector
+      18      spec:
+      19        serviceAccountName: tc-injector
+      20 -      hostNetwork: false
+      20 +      # hostNetwork is required so that the DaemonSet pod shares the host's
+      21 +      # default network namespace. Without this, netlink calls and tc(8) run
+      22 +      # in the pod's own netns and cannot see the host-side veth interfaces
+      23 +      # (e.g. OVN-Kubernetes ports mastered by ovs-system).
+      24 +      hostNetwork: true
+      25        # hostPID is required so that /proc/<pid>/ns/net of target containers
+      26        # is reachable from within the DaemonSet pod.
+      27        hostPID: true
+
+⏺ Update(config/deploy/scc.yaml)
+  ⎿  Added 4 lines, removed 1 line
+       8  allowHostPID: true
+       9  allowHostDirVolumePlugin: true
+      10  allowHostIPC: false
+      11 -allowHostNetwork: false
+      11 +# hostNetwork is required so the DaemonSet pod shares the host's default
+      12 +# network namespace, enabling netlink and tc(8) to reach host-side veth
+      13 +# interfaces (e.g. OVN-Kubernetes ports under ovs-system).
+      14 +allowHostNetwork: true
+      15  allowHostPorts: false
+      16  # NET_ADMIN is required for tc/netem operations.
+      17  # SYS_ADMIN is required for netlink and network namespace (setns) operations.
+
+⏺ hostNetwork: true にすると metrics/healthz のポートがホスト上に直接 bind されるため、--metrics-bind-address のデフォルト :8080 がホストポートを占有します。DaemonSet の全 Pod
+  が同じノード上のポートを使うことはないので問題ありませんが、念のためポートを明示します（現状のままで支障はありませんが）。
+
+  次に、hostNetwork: true になると hostPorts の宣言が必要かどうか確認します。DaemonSet の Pod spec に ports フィールドがないので追加の変更は不要です。
+
+  再デプロイしてください：
+
+  kubectl apply -f config/deploy/scc.yaml
+  kubectl rollout restart daemonset/tc-injector -n tc-injector-system
+  kubectl rollout status daemonset/tc-injector -n tc-injector-system
+
+  ---
+  今回のエラーの全体像まとめ
+
+  ┌─────────────────┬────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │    フェーズ     │                   エラー                   │                                                     原因                                                     │
+  ├─────────────────┼────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ①（前回修正前） │ no veth interface found in pod netns       │ LinkList() ダンプモードが cross-netns veth の PeerName を返さない                                            │
+  ├─────────────────┼────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ②（今回）       │ lookup host link by index 24: Link not     │ hostNetwork: false のため DaemonSet が自分の netns で LinkByIndex を実行しており、ホスト側の ifindex 24      │
+  │                 │ found                                      │ が見えない                                                                                                   │
+  └─────────────────┴────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  hostNetwork: true にすることで DaemonSet がホストデフォルト netns を共有し、①の修正（ParentIndex で ifindex 取得）と合わせて正しく動作します：
+
+  pod netns:  eth0 (ifindex 2)
+                   ↕ veth, Attrs().ParentIndex = 24
+  host netns: 379812d0bb0b3c2 (ifindex 24, master ovs-system)
+                   ↑ LinkByIndex(24) で取得 ✓
+                   ↑ tc qdisc replace dev 379812d0bb0b3c2 ... ✓
+
+✻ Brewed for 3m 12s
+```

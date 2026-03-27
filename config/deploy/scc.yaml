@@ -8,7 +8,10 @@ allowPrivilegedContainer: true
 allowHostPID: true
 allowHostDirVolumePlugin: true
 allowHostIPC: false
-allowHostNetwork: false
+# hostNetwork is required so the DaemonSet pod shares the host's default
+# network namespace, enabling netlink and tc(8) to reach host-side veth
+# interfaces (e.g. OVN-Kubernetes ports under ovs-system).
+allowHostNetwork: true
 allowHostPorts: false
 # NET_ADMIN is required for tc/netem operations.
 # SYS_ADMIN is required for netlink and network namespace (setns) operations.
