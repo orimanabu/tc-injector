@@ -138,7 +138,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			continue
 		}
 
-		logger.Info("applying tc delay", "pod", pod.Name, "iface", iface, "delayMs", delayMs)
+		tcCmd := fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, delayMs)
+		logger.Info("applying tc delay", "pod", pod.Name, "iface", iface, "delayMs", delayMs, "tcCmd", tcCmd)
 		if err := r.TCApplier.Apply(iface, delayMs); err != nil {
 			logger.Error(err, "tc apply failed", "iface", iface)
 			continue

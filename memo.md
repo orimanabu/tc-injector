@@ -2215,3 +2215,41 @@ make: *** [build] Error 1
 
 ✻ Brewed for 6m 50s
 ```
+
+```
+❯ tcで遅延を挿入する際、対象のPodとvethのインターフェース名とtcコマンドをログに出力するようにして
+
+⏺ Read 2 files (ctrl+o to expand)
+
+⏺ ロガーは controller-runtime の log.FromContext(ctx) を使っているので、コントローラーのログにtcコマンドを追加するのが最も整合的です。コントローラーがPod名・iface・遅延値をすべて知
+  っているので、ここでコマンド文字列を構築してログに加えます。
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 2 lines, removed 1 line
+      138        continue
+      139      }
+      140
+      141 -    logger.Info("applying tc delay", "pod", pod.Name, "iface", iface, "delayMs", delayMs)
+      141 +    tcCmd := fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, delayMs)
+      142 +    logger.Info("applying tc delay", "pod", pod.Name, "iface", iface, "delayMs", delayMs, "tcCmd", tcCmd)
+      143      if err := r.TCApplier.Apply(iface, delayMs); err != nil {
+      144        logger.Error(err, "tc apply failed", "iface", iface)
+      145        continue
+
+⏺ Bash(make build 2>&1)
+  ⎿  go mod tidy
+     go build -o bin/tc-injector ./cmd/
+  ⎿  Found 5 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ ビルド成功です（LSPエラーは依存モジュール未解決による既存の誤検知）。
+
+  ログの出力例はこのようになります：
+
+  INFO applying tc delay pod=backend-pod-abc123 iface=veth1a2b3c delayMs=50 tcCmd="tc qdisc replace dev veth1a2b3c root handle 1: netem delay 50ms"
+
+  tcCmd フィールドに実際に実行されるtcコマンドの文字列が含まれます。Pod名・iface名・コマンドがすべて1行のログに出力されます。
+
+✻ Sautéed for 3m 8s
+```
