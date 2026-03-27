@@ -121,6 +121,7 @@ func (in *TCInjectorStatus) DeepCopy() *TCInjectorStatus {
 func (in *DelayRule) DeepCopyInto(out *DelayRule) {
 	*out = *in
 	in.Selector.DeepCopyInto(&out.Selector)
+	in.NamespaceSelector.DeepCopyInto(&out.NamespaceSelector)
 }
 
 // DeepCopy returns a deep copy of this DelayRule.

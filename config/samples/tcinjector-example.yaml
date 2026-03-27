@@ -4,25 +4,33 @@ metadata:
   name: example-delay
 spec:
   rules:
-    # Add 10–50 ms delay to all pods labeled app=backend.
+    # Add 10–50 ms delay to pods labeled app=backend running in namespaces labeled env=production.
     - selector:
         matchLabels:
           app: backend
+      namespaceSelector:
+        matchLabels:
+          env: production
       minDelay: 10
       maxDelay: 50
 
-    # Add 100–200 ms delay to pods with role=slow regardless of app.
+    # Add 100–200 ms delay to pods labeled role=slow in any namespace (empty selector matches all).
     - selector:
         matchLabels:
           role: slow
       minDelay: 100
       maxDelay: 200
 
-    # Use matchExpressions for more complex selectors.
+    # Use matchExpressions for both pod and namespace selectors.
     - selector:
         matchExpressions:
           - key: environment
             operator: In
             values: [staging, canary]
+      namespaceSelector:
+        matchExpressions:
+          - key: team
+            operator: In
+            values: [platform, infra]
       minDelay: 5
       maxDelay: 30

@@ -57,6 +57,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=tc-injector.example.com,resources=tcinjectors/status,verbs=update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 
 // Reconcile is called when a TCInjector or Pod changes.
 func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
@@ -74,6 +75,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, fmt.Errorf("list pods on node %s: %w", r.NodeName, err)
 	}
 
+	// Fetch all namespaces and build a map of name -> labels for selector matching.
+	namespaceList := &corev1.NamespaceList{}
+	if err := r.List(ctx, namespaceList); err != nil {
+		return reconcile.Result{}, fmt.Errorf("list namespaces: %w", err)
+	}
+	namespaceLabelMap := make(map[string]labels.Set, len(namespaceList.Items))
+	for _, ns := range namespaceList.Items {
+		namespaceLabelMap[ns.Name] = labels.Set(ns.Labels)
+	}
+
 	// Build the desired state: podUID -> delayMs.
 	desired := make(map[string]int32)
 	for _, injector := range injectorList.Items {
@@ -81,20 +92,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			continue
 		}
 		for _, rule := range injector.Spec.Rules {
-			sel, err := metav1.LabelSelectorAsSelector(&rule.Selector)
+			podSel, err := metav1.LabelSelectorAsSelector(&rule.Selector)
 			if err != nil {
 				logger.Error(err, "invalid label selector", "injector", injector.Name)
+				continue
+			}
+			nsSel, err := metav1.LabelSelectorAsSelector(&rule.NamespaceSelector)
+			if err != nil {
+				logger.Error(err, "invalid namespace selector", "injector", injector.Name)
 				continue
 			}
 			for _, pod := range podList.Items {
 				if !isPodReady(&pod) {
 					continue
 				}
-				if sel.Matches(labels.Set(pod.Labels)) {
-					delay := tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
-					// Last matching rule wins; earlier rules can be overridden.
-					desired[string(pod.UID)] = delay
+				if !podSel.Matches(labels.Set(pod.Labels)) {
+					continue
 				}
+				nsLabels, ok := namespaceLabelMap[pod.Namespace]
+				if !ok || !nsSel.Matches(nsLabels) {
+					continue
+				}
+				delay := tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+				// Last matching rule wins; earlier rules can be overridden.
+				desired[string(pod.UID)] = delay
 			}
 		}
 	}

@@ -33,10 +33,14 @@ type TCInjectorSpec struct {
 	DelayInterval *metav1.Duration `json:"delayInterval,omitempty"`
 }
 
-// DelayRule pairs a pod label selector with a delay range in milliseconds.
+// DelayRule pairs a pod label selector and a namespace selector with a delay range in milliseconds.
 type DelayRule struct {
 	// Selector selects pods to inject delay into.
 	Selector metav1.LabelSelector `json:"selector"`
+	// NamespaceSelector selects namespaces whose pods are eligible for delay injection.
+	// An empty selector matches all namespaces.
+	// +optional
+	NamespaceSelector metav1.LabelSelector `json:"namespaceSelector,omitempty"`
 	// MinDelay is the minimum delay in milliseconds.
 	// +kubebuilder:validation:Minimum=0
 	MinDelay int32 `json:"minDelay"`

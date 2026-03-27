@@ -66,6 +66,32 @@ spec:
                                   type: array
                                   items:
                                     type: string
+                      namespaceSelector:
+                        type: object
+                        description: >
+                          Label selector to match target namespaces.
+                          Only pods running in matching namespaces are eligible for delay injection.
+                          An empty selector matches all namespaces.
+                        properties:
+                          matchLabels:
+                            type: object
+                            additionalProperties:
+                              type: string
+                          matchExpressions:
+                            type: array
+                            items:
+                              type: object
+                              required: [key, operator]
+                              properties:
+                                key:
+                                  type: string
+                                operator:
+                                  type: string
+                                  enum: [In, NotIn, Exists, DoesNotExist]
+                                values:
+                                  type: array
+                                  items:
+                                    type: string
                       minDelay:
                         type: integer
                         format: int32

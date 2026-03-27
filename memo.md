@@ -2545,3 +2545,262 @@ make: *** [build] Error 1
 
   既存の deploy / undeploy はそのまま残しているので、通常の Kubernetes 環境での利用に影響はありません。
 ```
+
+```
+ ▐▛███▜▌   Claude Code v2.1.76
+▝▜█████▛▘  Sonnet 4.6 · Claude Pro
+  ▘▘ ▝▝    ~/devel/src/github.com/orimanabu/tc-injector
+
+❯ 今はカスタムリソースTCInjectorで、「ラベルセレクタとminDelay,maxDelay」のリストを設定していますが、「ラベルセレクタとNamespaceセレクタとminDelay,maxDelay」のリストに変更してくだ
+さい。NamespaceセレクタにマッチするNamespaceで稼働する、ラベルセレクタにマッチするPodに対してtcを設定したいです
+
+⏺ Explore(Explore TCInjector codebase structure)
+  ⎿  Done (19 tool uses · 46.0k tokens · 39s)
+  (ctrl+o to expand)
+
+⏺ コードを読んで変更を実施します。
+
+⏺ Read 3 files (ctrl+o to expand)
+
+⏺ CRD YAMLファイルも確認します。
+
+⏺ Searched for 1 pattern, read 3 files (ctrl+o to expand)
+
+⏺ 必要な変更点が把握できました。以下のファイルを変更します：
+  1. types.go - DelayRuleにNamespaceSelectorを追加
+  2. zz_generated.deepcopy.go - DeepCopyIntoを更新
+  3. tcinjector_controller.go - Namespace選択ロジックを追加
+  4. config/crd/tcinjector.yaml - CRDスキーマを更新
+  5. config/deploy/rbac.yaml - Namespace読み取り権限を追加
+  6. config/samples/tcinjector-example.yaml - サンプルを更新
+
+⏺ Update(pkg/api/v1alpha1/types.go)
+  ⎿  Added 5 lines, removed 1 line
+      33    DelayInterval *metav1.Duration `json:"delayInterval,omitempty"`
+      34  }
+      35
+      36 -// DelayRule pairs a pod label selector with a delay range in milliseconds.
+      36 +// DelayRule pairs a pod label selector and a namespace selector with a delay range in milliseconds.
+      37  type DelayRule struct {
+      38    // Selector selects pods to inject delay into.
+      39    Selector metav1.LabelSelector `json:"selector"`
+      40 +  // NamespaceSelector selects namespaces whose pods are eligible for delay injection.
+      41 +  // An empty selector matches all namespaces.
+      42 +  // +optional
+      43 +  NamespaceSelector metav1.LabelSelector `json:"namespaceSelector,omitempty"`
+      44    // MinDelay is the minimum delay in milliseconds.
+      45    // +kubebuilder:validation:Minimum=0
+      46    MinDelay int32 `json:"minDelay"`
+
+⏺ Update(pkg/api/v1alpha1/zz_generated.deepcopy.go)
+  ⎿  Added 1 line
+      121  func (in *DelayRule) DeepCopyInto(out *DelayRule) {
+      122    *out = *in
+      123    in.Selector.DeepCopyInto(&out.Selector)
+      124 +  in.NamespaceSelector.DeepCopyInto(&out.NamespaceSelector)
+      125  }
+      126
+      127  // DeepCopy returns a deep copy of this DelayRule.
+
+⏺ 次にコントローラを更新します。Namespace取得とフィルタリングロジックを追加します。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 1 line
+      57  // +kubebuilder:rbac:groups=tc-injector.example.com,resources=tcinjectors/status,verbs=update;patch
+      58  // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+      59  // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+      60 +// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+      61
+      62  // Reconcile is called when a TCInjector or Pod changes.
+      63  func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 25 lines, removed 5 lines
+      75      return reconcile.Result{}, fmt.Errorf("list pods on node %s: %w", r.NodeName, err)
+      76    }
+      77
+      78 +  // Fetch all namespaces and build a map of name -> labels for selector matching.
+      79 +  namespaceList := &corev1.NamespaceList{}
+      80 +  if err := r.List(ctx, namespaceList); err != nil {
+      81 +    return reconcile.Result{}, fmt.Errorf("list namespaces: %w", err)
+      82 +  }
+      83 +  namespaceLabelMap := make(map[string]labels.Set, len(namespaceList.Items))
+      84 +  for _, ns := range namespaceList.Items {
+      85 +    namespaceLabelMap[ns.Name] = labels.Set(ns.Labels)
+      86 +  }
+      87 +
+      88    // Build the desired state: podUID -> delayMs.
+      89    desired := make(map[string]int32)
+      90    for _, injector := range injectorList.Items {
+     ...
+       92        continue
+       93      }
+       94      for _, rule := range injector.Spec.Rules {
+       85 -      sel, err := metav1.LabelSelectorAsSelector(&rule.Selector)
+       95 +      podSel, err := metav1.LabelSelectorAsSelector(&rule.Selector)
+       96        if err != nil {
+       97          logger.Error(err, "invalid label selector", "injector", injector.Name)
+       98          continue
+       99        }
+      100 +      nsSel, err := metav1.LabelSelectorAsSelector(&rule.NamespaceSelector)
+      101 +      if err != nil {
+      102 +        logger.Error(err, "invalid namespace selector", "injector", injector.Name)
+      103 +        continue
+      104 +      }
+      105        for _, pod := range podList.Items {
+      106          if !isPodReady(&pod) {
+      107            continue
+      108          }
+       94 -        if sel.Matches(labels.Set(pod.Labels)) {
+       95 -          delay := tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+       96 -          // Last matching rule wins; earlier rules can be overridden.
+       97 -          desired[string(pod.UID)] = delay
+      109 +        if !podSel.Matches(labels.Set(pod.Labels)) {
+      110 +          continue
+      111          }
+      112 +        nsLabels, ok := namespaceLabelMap[pod.Namespace]
+      113 +        if !ok || !nsSel.Matches(nsLabels) {
+      114 +          continue
+      115 +        }
+      116 +        delay := tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+      117 +        // Last matching rule wins; earlier rules can be overridden.
+      118 +        desired[string(pod.UID)] = delay
+      119        }
+      120      }
+      121    }
+
+⏺ 次にCRD YAMLを更新します。
+
+⏺ Update(config/crd/tcinjector.yaml)
+  ⎿  Added 26 lines
+      66                                    type: array
+      67                                    items:
+      68                                      type: string
+      69 +                      namespaceSelector:
+      70 +                        type: object
+      71 +                        description: >
+      72 +                          Label selector to match target namespaces.
+      73 +                          Only pods running in matching namespaces are eligible for delay injection.
+      74 +                          An empty selector matches all namespaces.
+      75 +                        properties:
+      76 +                          matchLabels:
+      77 +                            type: object
+      78 +                            additionalProperties:
+      79 +                              type: string
+      80 +                          matchExpressions:
+      81 +                            type: array
+      82 +                            items:
+      83 +                              type: object
+      84 +                              required: [key, operator]
+      85 +                              properties:
+      86 +                                key:
+      87 +                                  type: string
+      88 +                                operator:
+      89 +                                  type: string
+      90 +                                  enum: [In, NotIn, Exists, DoesNotExist]
+      91 +                                values:
+      92 +                                  type: array
+      93 +                                  items:
+      94 +                                    type: string
+      95                        minDelay:
+      96                          type: integer
+      97                          format: int32
+
+⏺ RBAC YAMLにNamespace権限を追加します。
+
+⏺ Update(config/deploy/rbac.yaml)
+  ⎿  Added 4 lines
+      27    - apiGroups: [""]
+      28      resources: [nodes]
+      29      verbs: [get, list, watch]
+      30 +  # Read namespaces to evaluate namespace selectors in delay rules.
+      31 +  - apiGroups: [""]
+      32 +    resources: [namespaces]
+      33 +    verbs: [get, list, watch]
+      34
+      35  ---
+      36  apiVersion: rbac.authorization.k8s.io/v1
+
+⏺ サンプルYAMLを更新します。
+
+⏺ Write(config/samples/tcinjector-example.yaml)
+  ⎿  Added 11 lines, removed 3 lines
+       4    name: example-delay
+       5  spec:
+       6    rules:
+       7 -    # Add 10–50 ms delay to all pods labeled app=backend.
+       7 +    # Add 10–50 ms delay to pods labeled app=backend running in namespaces labeled env=production.
+       8      - selector:
+       9          matchLabels:
+      10            app: backend
+      11 +      namespaceSelector:
+      12 +        matchLabels:
+      13 +          env: production
+      14        minDelay: 10
+      15        maxDelay: 50
+      16
+      14 -    # Add 100–200 ms delay to pods with role=slow regardless of app.
+      17 +    # Add 100–200 ms delay to pods labeled role=slow in any namespace (empty selector matches all).
+      18      - selector:
+      19          matchLabels:
+      20            role: slow
+      21        minDelay: 100
+      22        maxDelay: 200
+      23
+      21 -    # Use matchExpressions for more complex selectors.
+      24 +    # Use matchExpressions for both pod and namespace selectors.
+      25      - selector:
+      26          matchExpressions:
+      27            - key: environment
+      28              operator: In
+      29              values: [staging, canary]
+      30 +      namespaceSelector:
+      31 +        matchExpressions:
+      32 +          - key: team
+      33 +            operator: In
+      34 +            values: [platform, infra]
+      35        minDelay: 5
+      36        maxDelay: 30
+
+⏺ ビルドして確認します。
+
+⏺ Bash(go build ./...)
+  ⎿  (No output)
+
+⏺ Bash(go vet ./...)
+  ⎿  (No output)
+
+⏺ ビルドもvetも通りました。変更内容をまとめます。
+
+  ---
+  変更内容
+
+  pkg/api/v1alpha1/types.go
+
+  DelayRule に NamespaceSelector metav1.LabelSelector フィールドを追加。omitempty で省略可能（空の場合は全Namespaceにマッチ）。
+
+  pkg/api/v1alpha1/zz_generated.deepcopy.go
+
+  DelayRule.DeepCopyInto に NamespaceSelector の deepcopy 処理を追加。
+
+  pkg/controller/tcinjector_controller.go
+
+  - Reconcile ループ内で全Namespaceをリストアップし、name -> labels のマップを構築
+  - 各ルールで namespaceSelector をパース（空セレクタは全Namespaceにマッチ）
+  - Pod がラベルセレクタにマッチした後、そのPodのNamespaceがNamespaceセレクタにもマッチするか検証してから desired に追加
+  - RBAC アノテーションに namespaces の get;list;watch を追加
+
+  config/crd/tcinjector.yaml
+
+  rules[].namespaceSelector フィールドのOpenAPIv3スキーマを追加。
+
+  config/deploy/rbac.yaml
+
+  ClusterRole に namespaces リソースの get, list, watch 権限を追加。
+
+  config/samples/tcinjector-example.yaml
+
+  namespaceSelector の使い方を示したサンプルに更新。空セレクタ（省略）で全Namespace対象になる例も含む。
+
+✻ Churned for 2m 51s
+```

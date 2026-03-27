@@ -27,6 +27,10 @@ rules:
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get, list, watch]
+  # Read namespaces to evaluate namespace selectors in delay rules.
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
