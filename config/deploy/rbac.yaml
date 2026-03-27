@@ -12,11 +12,11 @@ metadata:
   name: tc-injector
 rules:
   # Watch and read TCInjector custom resources.
-  - apiGroups: [tc-injector.example.com]
+  - apiGroups: [tc-injector.setns.net]
     resources: [tcinjectors]
     verbs: [get, list, watch]
   # Update TCInjector status subresource.
-  - apiGroups: [tc-injector.example.com]
+  - apiGroups: [tc-injector.setns.net]
     resources: [tcinjectors/status]
     verbs: [update, patch]
   # Read pods to find matching targets on the local node.

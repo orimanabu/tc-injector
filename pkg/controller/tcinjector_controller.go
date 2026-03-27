@@ -53,8 +53,8 @@ type Reconciler struct {
 	injected map[string]string
 }
 
-// +kubebuilder:rbac:groups=tc-injector.example.com,resources=tcinjectors,verbs=get;list;watch
-// +kubebuilder:rbac:groups=tc-injector.example.com,resources=tcinjectors/status,verbs=update;patch
+// +kubebuilder:rbac:groups=tc-injector.setns.net,resources=tcinjectors,verbs=get;list;watch
+// +kubebuilder:rbac:groups=tc-injector.setns.net,resources=tcinjectors/status,verbs=update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch

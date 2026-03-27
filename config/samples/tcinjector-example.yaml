@@ -1,4 +1,4 @@
-apiVersion: tc-injector.example.com/v1alpha1
+apiVersion: tc-injector.setns.net/v1alpha1
 kind: TCInjector
 metadata:
   name: example-delay

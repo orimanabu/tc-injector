@@ -4,7 +4,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// +groupName=tc-injector.example.com
+// +groupName=tc-injector.setns.net
 
 // TCInjector defines network delay injection rules applied to matching pods.
 // +kubebuilder:object:root=true

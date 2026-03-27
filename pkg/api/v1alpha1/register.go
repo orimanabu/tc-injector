@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	Group   = "tc-injector.example.com"
+	Group   = "tc-injector.setns.net"
 	Version = "v1alpha1"
 )
 

@@ -102,7 +102,7 @@ All pods should be in the `Running` state with `1/1` containers ready.
 `TCInjector` is a cluster-scoped resource (`scope: Cluster`).
 
 ```yaml
-apiVersion: tc-injector.example.com/v1alpha1
+apiVersion: tc-injector.setns.net/v1alpha1
 kind: TCInjector
 metadata:
   name: example-delay
@@ -171,7 +171,7 @@ kubectl label namespace my-app env=production
 Then create a `TCInjector`:
 
 ```yaml
-apiVersion: tc-injector.example.com/v1alpha1
+apiVersion: tc-injector.setns.net/v1alpha1
 kind: TCInjector
 metadata:
   name: production-delay
@@ -188,7 +188,7 @@ spec:
 ### Inject delay into a specific service across all namespaces
 
 ```yaml
-apiVersion: tc-injector.example.com/v1alpha1
+apiVersion: tc-injector.setns.net/v1alpha1
 kind: TCInjector
 metadata:
   name: backend-delay
@@ -204,7 +204,7 @@ spec:
 ### Multiple rules (last match wins)
 
 ```yaml
-apiVersion: tc-injector.example.com/v1alpha1
+apiVersion: tc-injector.setns.net/v1alpha1
 kind: TCInjector
 metadata:
   name: multi-rule
@@ -235,7 +235,7 @@ spec:
 ### Periodic delay rotation
 
 ```yaml
-apiVersion: tc-injector.example.com/v1alpha1
+apiVersion: tc-injector.setns.net/v1alpha1
 kind: TCInjector
 metadata:
   name: jitter-test

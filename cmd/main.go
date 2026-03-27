@@ -76,7 +76,7 @@ func main() {
 		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
-		LeaderElectionID:       "tc-injector.example.com",
+		LeaderElectionID:       "tc-injector.setns.net",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create manager")

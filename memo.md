@@ -3289,3 +3289,56 @@ make: *** [build] Error 1
 
 ✻ Cogitated for 2m 23s
 ```
+
+```
+❯ APIグループを `tc-injector.example.com` から `tc-injector.setns.net` に変えてください。他にも example.com と書いている箇所があれば、全て setns.net に変えてください
+
+⏺ Searched for 2 patterns (ctrl+o to expand)
+
+⏺ 9ファイルで一括置換します。
+
+⏺ Searched for 1 pattern (ctrl+o to expand)
+
+⏺ finder_test.go の registry.example.com はコンテナイメージURLのテストデータなので変更しません。それ以外の全箇所を置換します。
+
+⏺ Bash(sed -i '' 's/tc-injector\.example\.com/tc-injector.setns.net/g' \
+        /Users/ori/devel/src/github.com/orimanabu/tc-injector/pkg/api/v1alpha1/register.go \…)
+  ⎿  (No output)
+
+⏺ ビルドで確認します。
+
+⏺ Bash(go build ./... 2>&1 && echo "OK")
+  ⎿  OK
+
+⏺ 念のため残りがないか確認します。
+
+⏺ Searched for 1 pattern (ctrl+o to expand)
+
+⏺ 残りは finder_test.go の registry.example.com/app:latest のみで、これはテストデータのコンテナイメージURLなので変更不要です。
+
+  以下のファイルを全て更新しました：
+
+  ┌─────────────────────────────────────────┬──────────────────────────────────────────────────────┐
+  │                ファイル                 │                       変更箇所                       │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ pkg/api/v1alpha1/types.go               │ // +groupName= アノテーション                        │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ pkg/api/v1alpha1/register.go            │ Group 定数                                           │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ pkg/controller/tcinjector_controller.go │ // +kubebuilder:rbac:groups= アノテーション（2箇所） │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ cmd/main.go                             │ LeaderElectionID                                     │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ config/crd/tcinjector.yaml              │ CRD name・group                                      │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ config/deploy/rbac.yaml                 │ ClusterRole の apiGroups（2箇所）                    │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ config/samples/tcinjector-example.yaml  │ apiVersion                                           │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ README.md                               │ apiVersion の記載（5箇所）                           │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ memo.md                                 │ 各所の記載                                           │
+  └─────────────────────────────────────────┴──────────────────────────────────────────────────────┘
+
+✻ Crunched for 43s
+```
