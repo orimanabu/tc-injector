@@ -3485,3 +3485,248 @@ go/pkg/mod/k8s.io/client-go@v0.29.3/tools/cache/reflector.go:229: failed to list
 
 ✻ Sautéed for 53s
 ```
+
+```
+❯ 以下のエラーになりました。原因を調べてください
+cannot find host veth   {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector": {"name":"example-delay"},
+"namespace": "", "name": "example-delay", "reconcileID": "d11c9274-d989-410e-8ea7-702c0d6c02e0", "request": {"name":"example-delay"}, "pod": "hello-9b6845674-w48n9",
+"containerID": "cri-o://5e94f6d782a81bec40ea687070356cd388739dbdb563b9c11fed24921ad9050c", "error": "find veth peer name in pod netns: no veth interface found in pod netns"}
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ エラーの発生箇所を特定しました。podVethPeerName() の link.Type() != "veth" のフィルタに引っかかり、Pod の netns 内にインターフェースが存在しても veth と認識されないケースです。
+
+  OpenShift の OVN-Kubernetes CNI では、Pod の eth0 が通常の veth ペアではなく OVS (Open vSwitch) の internal ポートとして実装されている場合があり、その場合 link.Type() が "veth"
+  を返しません。
+
+  調査手順
+
+  1. 対象 Pod の netns でインターフェース種別を確認
+
+  tc-injector DaemonSet の Pod に入り、対象 Pod の PID を確認します。
+
+  # 対象ノードの tc-injector Pod に exec
+  kubectl exec -it -n tc-injector-system <tc-injector-pod> -- bash
+
+  # エラーに出ていた containerID でコンテナ情報を取得
+  crictl inspect 5e94f6d782a81bec40ea687070356cd388739dbdb563b9c11fed24921ad9050c | grep '"pid"'
+
+  取得した PID で Pod の netns に入り、インターフェース種別を確認します。
+
+  # Pod の netns に入って ip link を確認
+  nsenter -t <pid> -n ip link show
+
+  # IFLA_INFO_KIND (インターフェース種別) を詳細表示
+  nsenter -t <pid> -n ip -d link show
+
+  以下のどれかが表示されるはずです：
+
+  ┌───────────────────────┬──────────────┬───────────────────────────────────┐
+  │        出力例         │     種別     │               意味                │
+  ├───────────────────────┼──────────────┼───────────────────────────────────┤
+  │ eth0@if5: ... veth    │ veth         │ veth ペア（このコードで対応済み） │
+  ├───────────────────────┼──────────────┼───────────────────────────────────┤
+  │ eth0: ... openvswitch │ OVS internal │ OVN-K8s の典型的なケース          │
+  ├───────────────────────┼──────────────┼───────────────────────────────────┤
+  │ eth0: ... tun         │ tun/tap      │ 別の CNI パターン                 │
+  └───────────────────────┴──────────────┴───────────────────────────────────┘
+
+  2. OVS ポート一覧を確認
+
+  OVS internal ポートの場合、ホスト側のインターフェースは br-int に接続されています。
+
+  # tc-injector pod から実行（hostPID: true なので /proc 経由でホストにアクセス可能）
+  # ※ ovs-vsctl がインストールされていない場合は次の手順へ
+  ovs-vsctl show
+
+  # または OVS のポート一覧
+  ovs-vsctl list-ports br-int
+
+  3. ホスト側の対応インターフェースを特定
+
+  # ホスト netns で veth でないインターフェースも含めて全件確認
+  ip -d link show | grep -A2 "openvswitch\|veth"
+
+  ---
+  現時点での仮説
+
+  OVN-Kubernetes が OVS internal port を Pod netns に配置している場合、以下の経路になります：
+
+  Pod netns: eth0 (type: openvswitch)
+                 ↕  OVS が管理（veth ペアなし）
+  Host:      br-int の OVS ポート (例: pod名や sandbox ID の先頭15文字)
+
+  この場合、link.Type() == "veth" のフィルタが全てのリンクをスキップしてしまいます。
+
+  ---
+  上記の調査結果（ip -d link show の出力）を教えていただければ、どのインターフェース種別に対応すれば良いか特定して修正します。
+
+✻ Cogitated for 1m 59s
+
+❯ crictlによるpidは `26437` (kubectl execしたらcrictlコマンドが入ってなかったので、ノードにsshしてcrictl inspectで確認)
+ip link showの結果は以下のとおりです、これはインターフェース種別はvethということですよね
+---
+[core@wk3 ~]$ sudo nsenter -t 26437 -n ip link show
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: eth0@if24: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1400 qdisc noqueue state UP mode DEFAULT group default
+    link/ether 0a:58:0a:80:07:bc brd ff:ff:ff:ff:ff:ff link-netns f7f740de-121a-4a82-af95-84c47dbc6474
+
+⏺ eth0@if24 はまさしく veth です。つまり インターフェース種別の問題ではありません。
+
+  根本原因
+
+  エラーメッセージ "no veth interface found in pod netns" は誤解を招く表現で、veth は見つかっているが PeerName が空であることが実際の原因です。
+
+  // finder.go:269
+  v, ok := link.(*netlink.Veth)
+  if !ok || v.PeerName == "" {  // ← ここで弾かれている
+      continue
+  }
+
+  netlink.LinkList() は内部で RTM_GETLINK をダンプモード（NLM_F_DUMP）で呼び出しますが、このモードではカーネルが VETH_INFO_PEER（= PeerName の情報源）をピアが別 netns
+  にある場合に返しません。
+
+  ip link show の @if24 はこの IFLA_LINK（ピアの ifindex）から表示しており、PeerName とは別の経路で取得しています。netlink ライブラリの link.Attrs().ParentIndex がこの IFLA_LINK
+  に対応します。
+
+  まず確認してほしいこと
+
+  ノード上（pod netns の外）で以下を実行し、ifindex 24 がホストデフォルト netns にあるか確認してください。
+
+  # ホストの default netns で確認
+  ip link show index 24
+
+  # named netns の一覧
+  ls /var/run/netns/
+
+  # f7f740de-... の中身を確認
+  sudo nsenter --net=/var/run/netns/f7f740de-121a-4a82-af95-84c47dbc6474 ip link show
+
+  結果に応じてケースが分かれます：
+
+  ┌──────────────────────────────┬──────────────────────────────────────────────────────────────────────────┐
+  │ ip link show index 24 の結果 │                                   意味                                   │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ veth が表示される            │ ピアはホストデフォルト netns にある → ParentIndex に変えるだけで修正完了 │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 表示されない                 │ ピアは named netns f7f740de-... の中にある → 追加対応が必要              │
+  └──────────────────────────────┴──────────────────────────────────────────────────────────────────────────┘
+
+  コードの修正（ParentIndex を使う）
+
+  確認結果に関わらず、PeerName を使っている箇所は確実にバグなので修正します。
+
+⏺ Update(pkg/veth/finder.go)
+  ⎿  Added 20 lines, removed 17 lines
+      198    return fmt.Sprintf("%s/%d/ns/net", procMountPath, pid)
+      199  }
+      200
+      201 -// findHostVethFromNetns enters the pod network namespace, reads the veth peer
+      202 -// index of eth0, then maps it back to a host interface name.
+      201 +// findHostVethFromNetns enters the pod network namespace, obtains the peer
+      202 +// ifindex of the veth interface, then maps it back to a host interface name.
+      203  func findHostVethFromNetns(netnsPath string) (string, error) {
+      204    if _, err := os.Stat(netnsPath); err != nil {
+      205      return "", fmt.Errorf("netns path %s not accessible: %w", netnsPath, err)
+     ...
+      226      return "", fmt.Errorf("enter pod netns: %w", err)
+      227    }
+      228
+      229 -  peerName, findErr := podVethPeerName()
+      229 +  peerIdx, findErr := podVethPeerIndex()
+      230
+      231    // Always restore the host namespace, even on error.
+      232    if restoreErr := netns.Set(hostNS); restoreErr != nil {
+     ...
+      235    }
+      236
+      237    if findErr != nil {
+      238 -    return "", fmt.Errorf("find veth peer name in pod netns: %w", findErr)
+      238 +    return "", fmt.Errorf("find veth peer index in pod netns: %w", findErr)
+      239    }
+      240
+      241 -  link, err := netlink.LinkByName(peerName)
+      241 +  // Look up the peer interface by ifindex in the host default netns.
+      242 +  link, err := netlink.LinkByIndex(peerIdx)
+      243    if err != nil {
+      243 -    return "", fmt.Errorf("lookup host link %q: %w", peerName, err)
+      244 +    return "", fmt.Errorf("lookup host link by index %d: %w", peerIdx, err)
+      245    }
+      246
+      247    return link.Attrs().Name, nil
+      248  }
+      249
+      249 -// podVethPeerName returns the host-side peer name of the first non-loopback
+      250 -// veth inside the currently active network namespace.
+      250 +// podVethPeerIndex returns the peer ifindex of the first non-loopback veth
+      251 +// inside the currently active network namespace.
+      252  //
+      252 -// netlink v1.1.0 does not expose PeerIndex on the Veth struct; PeerName is
+      253 -// populated from the VETH_INFO_PEER netlink attribute and is sufficient to
+      254 -// look up the peer in the host network namespace.
+      255 -func podVethPeerName() (string, error) {
+      253 +// We use Attrs().ParentIndex (IFLA_LINK) instead of Veth.PeerName because
+      254 +// netlink.LinkList() issues RTM_GETLINK in dump mode (NLM_F_DUMP), which does
+      255 +// not include VETH_INFO_PEER data when the peer resides in a different network
+      256 +// namespace. IFLA_LINK (the peer ifindex) is always present in dump responses
+      257 +// and corresponds to the "@ifN" suffix shown by "ip link".
+      258 +func podVethPeerIndex() (int, error) {
+      259    links, err := netlink.LinkList()
+      260    if err != nil {
+      258 -    return "", fmt.Errorf("list links in pod netns: %w", err)
+      261 +    return 0, fmt.Errorf("list links in pod netns: %w", err)
+      262    }
+      263
+      264    for _, link := range links {
+     ...
+      268      if link.Attrs().Flags&net.FlagLoopback != 0 {
+      269        continue
+      270      }
+      268 -    v, ok := link.(*netlink.Veth)
+      269 -    if !ok || v.PeerName == "" {
+      271 +    peerIdx := link.Attrs().ParentIndex
+      272 +    if peerIdx == 0 {
+      273        continue
+      274      }
+      272 -    return v.PeerName, nil
+      275 +    return peerIdx, nil
+      276    }
+      274 -  return "", fmt.Errorf("no veth interface found in pod netns")
+      277 +  return 0, fmt.Errorf("no veth interface with a valid peer index found in pod netns")
+      278  }
+      279
+      280  // stripRuntimePrefix removes scheme prefixes like "containerd://", "cri-o://",
+
+⏺ Bash(go build ./... 2>&1 && echo "OK")
+  ⎿  OK
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ ビルドは通りました（警告は既存コードの stripRuntimePrefix で、今回の変更とは無関係です）。
+
+  ---
+  まとめ
+
+  根本原因
+
+  ┌──────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │      │                                                                     内容                                                                      │
+  ├──────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 現象 │ v.PeerName == "" で veth が全スキップされる                                                                                                   │
+  ├──────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 原因 │ netlink.LinkList() は RTM_GETLINK ダンプモードで動作し、ピアが別 netns にある veth の VETH_INFO_PEER（PeerName の取得元）をカーネルが返さない │
+  ├──────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 証拠 │ ip link show の eth0@if24 は IFLA_LINK（ピアの ifindex）を使って表示しており、PeerName とは別経路                                             │
+  └──────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  修正内容
+
+  PeerName → Attrs().ParentIndex（= IFLA_LINK = ピアの ifindex）に変更し、その ifindex で netlink.LinkByIndex() を使ってホスト側インターフェース名を解決するよう修正しました。
+
+  確認が必要な残課題
+
+  ip link show index 24（ノード上、pod netns 外）の結果を教えてください。もし ifindex 24 がホストデフォルト netns にない場合（f7f740de-... の named netns
+  内にある場合）は、/var/run/netns/ 以下を検索してピアを見つける追加対応が必要になります。
+
+✻ Churned for 6m 38s
+```

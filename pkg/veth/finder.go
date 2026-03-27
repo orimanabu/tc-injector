@@ -198,8 +198,8 @@ func procNetnsPath(pid int) string {
 	return fmt.Sprintf("%s/%d/ns/net", procMountPath, pid)
 }
 
-// findHostVethFromNetns enters the pod network namespace, reads the veth peer
-// index of eth0, then maps it back to a host interface name.
+// findHostVethFromNetns enters the pod network namespace, obtains the peer
+// ifindex of the veth interface, then maps it back to a host interface name.
 func findHostVethFromNetns(netnsPath string) (string, error) {
 	if _, err := os.Stat(netnsPath); err != nil {
 		return "", fmt.Errorf("netns path %s not accessible: %w", netnsPath, err)
@@ -226,7 +226,7 @@ func findHostVethFromNetns(netnsPath string) (string, error) {
 		return "", fmt.Errorf("enter pod netns: %w", err)
 	}
 
-	peerName, findErr := podVethPeerName()
+	peerIdx, findErr := podVethPeerIndex()
 
 	// Always restore the host namespace, even on error.
 	if restoreErr := netns.Set(hostNS); restoreErr != nil {
@@ -235,27 +235,30 @@ func findHostVethFromNetns(netnsPath string) (string, error) {
 	}
 
 	if findErr != nil {
-		return "", fmt.Errorf("find veth peer name in pod netns: %w", findErr)
+		return "", fmt.Errorf("find veth peer index in pod netns: %w", findErr)
 	}
 
-	link, err := netlink.LinkByName(peerName)
+	// Look up the peer interface by ifindex in the host default netns.
+	link, err := netlink.LinkByIndex(peerIdx)
 	if err != nil {
-		return "", fmt.Errorf("lookup host link %q: %w", peerName, err)
+		return "", fmt.Errorf("lookup host link by index %d: %w", peerIdx, err)
 	}
 
 	return link.Attrs().Name, nil
 }
 
-// podVethPeerName returns the host-side peer name of the first non-loopback
-// veth inside the currently active network namespace.
+// podVethPeerIndex returns the peer ifindex of the first non-loopback veth
+// inside the currently active network namespace.
 //
-// netlink v1.1.0 does not expose PeerIndex on the Veth struct; PeerName is
-// populated from the VETH_INFO_PEER netlink attribute and is sufficient to
-// look up the peer in the host network namespace.
-func podVethPeerName() (string, error) {
+// We use Attrs().ParentIndex (IFLA_LINK) instead of Veth.PeerName because
+// netlink.LinkList() issues RTM_GETLINK in dump mode (NLM_F_DUMP), which does
+// not include VETH_INFO_PEER data when the peer resides in a different network
+// namespace. IFLA_LINK (the peer ifindex) is always present in dump responses
+// and corresponds to the "@ifN" suffix shown by "ip link".
+func podVethPeerIndex() (int, error) {
 	links, err := netlink.LinkList()
 	if err != nil {
-		return "", fmt.Errorf("list links in pod netns: %w", err)
+		return 0, fmt.Errorf("list links in pod netns: %w", err)
 	}
 
 	for _, link := range links {
@@ -265,13 +268,13 @@ func podVethPeerName() (string, error) {
 		if link.Attrs().Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		v, ok := link.(*netlink.Veth)
-		if !ok || v.PeerName == "" {
+		peerIdx := link.Attrs().ParentIndex
+		if peerIdx == 0 {
 			continue
 		}
-		return v.PeerName, nil
+		return peerIdx, nil
 	}
-	return "", fmt.Errorf("no veth interface found in pod netns")
+	return 0, fmt.Errorf("no veth interface with a valid peer index found in pod netns")
 }
 
 // stripRuntimePrefix removes scheme prefixes like "containerd://", "cri-o://",
