@@ -1,7 +1,7 @@
 IMAGE ?= tc-injector:latest
 NAMESPACE ?= tc-injector-system
 
-.PHONY: all build test image deploy undeploy install-crd uninstall-crd tidy
+.PHONY: all build test image deploy undeploy install-crd uninstall-crd tidy clean
 
 all: build
 
@@ -46,3 +46,7 @@ undeploy:
 ## Apply the example TCInjector resource.
 sample:
 	kubectl apply -f config/samples/tcinjector-example.yaml
+
+## Remove build artifacts.
+clean:
+	rm -rf bin/

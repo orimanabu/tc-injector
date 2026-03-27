@@ -2253,3 +2253,39 @@ make: *** [build] Error 1
 
 ✻ Sautéed for 3m 8s
 ```
+
+```
+❯ Makefileにcleanターゲットを追加して
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ Update(Makefile)
+  ⎿  Added 1 line, removed 1 line
+      1  IMAGE ?= tc-injector:latest
+      2  NAMESPACE ?= tc-injector-system
+      3
+      4 -.PHONY: all build test image deploy undeploy install-crd uninstall-crd tidy
+      4 +.PHONY: all build test image deploy undeploy install-crd uninstall-crd tidy clean
+      5
+      6  all: build
+      7
+
+⏺ Update(Makefile)
+  ⎿  Added 4 lines
+      46  ## Apply the example TCInjector resource.
+      47  sample:
+      48    kubectl apply -f config/samples/tcinjector-example.yaml
+      49 +
+      50 +## Remove build artifacts.
+      51 +clean:
+      52 +  rm -rf bin/
+
+⏺ Bash(make clean && ls bin 2>&1)
+  ⎿  Error: Exit code 2
+     rm -rf bin/
+     gls: cannot access 'bin': No such file or directory
+
+⏺ bin/ が削除されていることを確認できました（ls でNot foundになっているのが正常）。
+
+✻ Sautéed for 38s
+```
