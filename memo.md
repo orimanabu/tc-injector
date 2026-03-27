@@ -4613,4 +4613,212 @@ cannot find host veth   {"controller": "tcinjector", "controllerGroup": "tc-inje
   delayMs, tcCommand).
 
 ✻ Sautéed for 6m 26s
+
+❯ アップデートしましたが、statusの情報は前のままでした。見直してください
+
+⏺ Let me check what the CRD looks like now and verify the full status update logic end-to-end.
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ 原因が分かりました。CRD の YAML に injectedPodDetails のスキーマ定義が入っていなかったのが原因です。
+
+  前のセッションでコントローラのコード側（types.go、tcinjector_controller.go）は変更済みでしたが、config/crd/tcinjector.yaml
+  のスキーマ更新がペンディングのままになっており、今回のセッションの冒頭でようやく追加しました。
+
+  Kubernetes/OpenShift は CRD スキーマに定義されていないフィールドを status サブリソースの更新時に自動的に削除（strip） します。そのため、コントローラが injectedPodDetails
+  を設定して Status().Update() を呼び出しても、API サーバーがその値を捨てていました。
+
+  対処手順：
+
+  # 1. CRD を再適用
+  kubectl apply -f config/crd/tcinjector.yaml
+
+  # 2. イメージをリビルドして再デプロイ
+  # (Makefile がある場合)
+  make docker-build docker-push
+  kubectl rollout restart daemonset/<name> -n <namespace>
+
+  再デプロイ後に status を確認：
+
+  kubectl get tcinjector <name> -o yaml
+
+  status.injectedPodDetails に対象ノード・Pod・インターフェース・遅延・tc コマンドが表示されるはずです。
+
+✻ Baked for 3m 16s
+
+❯ git statusしても変更はありませんが大丈夫ですか？
+
+⏺ Bash(git status && git diff HEAD)
+  ⎿  On branch main
+     Your branch is up to date with 'origin/main'.
+
+     nothing to commit, working tree clean
+
+⏺ Bash(git log --oneline -10)
+  ⎿  3b07df2 Record detailed informatin on TCInjector CR
+     cf523bc Fix not to reconcile again and again
+     b084078 Change port number for metrics: 8080 => 9988, 8081 => 9989
+     … +7 lines (ctrl+o to expand)
+
+⏺ Bash(git show 3b07df2 --stat)
+  ⎿  commit 3b07df26f7d764f97a5f2bdb9d239bbbf591ecfa
+     Author: Manabu Ori <manabu.ori@gmail.com>
+     Date:   Fri Mar 27 16:28:59 2026 +0900
+     … +11 lines (ctrl+o to expand)
+
+⏺ Bash(git show 3b07df2 -- config/crd/tcinjector.yaml | head -60)
+  ⎿  commit 3b07df26f7d764f97a5f2bdb9d239bbbf591ecfa
+     Author: Manabu Ori <manabu.ori@gmail.com>
+     Date:   Fri Mar 27 16:28:59 2026 +0900
+     … +44 lines (ctrl+o to expand)
+
+⏺ 大丈夫です。今セッション中に私が行った修正（テストファイルの修正、CRD YAML の injectedPodDetails 追加、namespace lookup の修正）は、すでにコミット 3b07df2 に含まれています。
+
+  git show 3b07df2 --stat を見ると、今回必要な変更がすべて含まれていることが確認できます：
+  - config/crd/tcinjector.yaml ← injectedPodDetails スキーマ追加済み
+  - pkg/api/v1alpha1/types.go ← InjectedPodStatus 構造体追加済み
+  - pkg/controller/tcinjector_controller.go ← status 書き込みロジック追加済み
+  - pkg/veth/finder.go ← (string, int, error) 返り値に変更済み
+
+  ワーキングツリーが clean なのは、すべての変更が正しくコミット済みだということです。
+
+  あとはクラスター側への反映が必要です：
+
+  # 1. CRD を再適用（injectedPodDetails スキーマを反映）
+  kubectl apply -f config/crd/tcinjector.yaml
+
+  # 2. イメージをリビルド・再デプロイ
+  make docker-build docker-push   # または手動で
+  kubectl rollout restart daemonset/<daemonset名> -n <namespace>
+
+  CRD を再適用しないと、API サーバーが injectedPodDetails フィールドを不明フィールドとして削除し続けるので、CRD の再適用が特に重要です。
+
+✻ Cogitated for 1m 7s
+
+❯ やはりinjectedPodDetailsがありません。以下のとおり、crdは更新済みです
+---
+$ oc get crd tcinjectors.tc-injector.setns.net -oyaml | sed -e '/last-applied/,+1d' | grep -A5 injectedPodDetails
+              injectedPodDetails:
+                description: Details of tc rules currently applied on this node.
+                items:
+                  properties:
+                    delayMs:
+                      description: Injected delay in milliseconds.
+$ oc -n tc-injector-system get tcinjectors.tc-injector.setns.net example-delay -oyaml | yq .status
+conditions:
+  - lastTransitionTime: "2026-03-27T07:49:01Z"
+    message: 0 pod(s) injected on node wk4
+    reason: Reconciled
+    status: "True"
+    type: Ready
+
+⏺ ステータスの conditions メッセージに「0 pod(s) injected」と出ています。つまり injectedPodDetails が空なのは症状ではなく、そもそもPodが1件もマッチしていないのが根本原因です。
+
+  コントローラのログを確認してみましょう。
+
+⏺ Bash(git show 3b07df2 -- pkg/controller/tcinjector_controller.go | grep '^[+-]' | grep -v '^---\|^+++' | head -80)
+  ⎿  -// VethFinder resolves a container ID to the host-side veth interface name.
+     +// VethFinder resolves a container ID to the host-side veth interface name and ifindex.
+     -  FindHostVeth(ctx context.Context, containerID string) (string, error)
+     … +39 lines (ctrl+o to expand)
+
+⏺ 原因が分かりました。DaemonSet（複数ノード）が同じ TCInjector の status を上書き合っているのが問題です。
+
+  現在のコードでは、各ノードの DaemonSet Pod が InjectedPods と InjectedPodDetails を自ノードのデータで丸ごと上書きします。wk4 で 0 件の場合、他ノードの情報も消えてしまいます。
+
+  Fix: 他ノードのエントリを保持しつつ、自ノード分だけ更新する
+
+⏺ Read 1 file (ctrl+o to expand)
+
+❯ マッチするPodはwk3ノードにいて、このPodにはtcが適用できているように見えます。なので、status.conditionsに出てくる情報が不十分だと思います(wk4の情報しかないので)。全ノード分の情報
+をstatus.conditionsに入れてほしいです
+
+⏺ ユーザーのメッセージを確認しました。wk3 に Pod がいて tc は適用できているが、wk4 が status を上書きしてしまっている、全ノード分を conditions に入れてほしいとのことです。
+
+  2つ修正します：
+  1. injectedPodDetails: 自ノード分のみ更新し、他ノードのエントリを保持する
+  2. conditions: ノード名を type として各ノードが個別に upsert する（setCondition の既存ロジックを活用）
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 15 lines, removed 5 lines
+      211    if req.Name != "" {
+      212      injector := &tcv1alpha1.TCInjector{}
+      213      if err := r.Get(ctx, req.NamespacedName, injector); err == nil {
+      214 -      details := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
+      214 +      // Build this node's details.
+      215 +      thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
+      216        for _, state := range r.injected {
+      216 -        details = append(details, tcv1alpha1.InjectedPodStatus{
+      217 +        thisNodeDetails = append(thisNodeDetails, tcv1alpha1.InjectedPodStatus{
+      218            NodeName:       r.NodeName,
+      219            Namespace:      state.podNamespace,
+      220            PodName:        state.podName,
+     ...
+      224            TCCommand:      state.tcCmd,
+      225          })
+      226        }
+      226 -      injector.Status.InjectedPods = injectedCount
+      227 -      injector.Status.InjectedPodDetails = details
+      227 +      // Preserve entries from other nodes; replace only this node's entries.
+      228 +      merged := make([]tcv1alpha1.InjectedPodStatus, 0, len(injector.Status.InjectedPodDetails))
+      229 +      for _, d := range injector.Status.InjectedPodDetails {
+      230 +        if d.NodeName != r.NodeName {
+      231 +          merged = append(merged, d)
+      232 +        }
+      233 +      }
+      234 +      merged = append(merged, thisNodeDetails...)
+      235 +      injector.Status.InjectedPods = int32(len(merged))
+      236 +      injector.Status.InjectedPodDetails = merged
+      237 +      // Use the node name as the condition type so each node upserts its own condition.
+      238        setCondition(injector, metav1.Condition{
+      229 -        Type:               "Ready",
+      239 +        Type:               r.NodeName,
+      240          Status:             metav1.ConditionTrue,
+      241          Reason:             "Reconciled",
+      242          Message:            fmt.Sprintf("%d pod(s) injected on node %s", injectedCount, r.NodeName),
+
+⏺ 次にテストを修正します。setCondition で "Ready" を使っているテストと、injectedCount を直接 InjectedPods に設定しているテストがあれば更新が必要です。
+
+⏺ Bash(go build ./... 2>&1 && go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       0.661s
+     … +2 lines (ctrl+o to expand)
+
+⏺ ビルド・テスト通過しました。変更内容を確認します。
+
+⏺ Bash(git diff)
+  ⎿  diff --git a/pkg/controller/tcinjector_controller.go b/pkg/controller/tcinjector_controller.go
+     index c433f03..3b27d84 100644
+     --- a/pkg/controller/tcinjector_controller.go
+     … +37 lines (ctrl+o to expand)
+
+⏺ この変更をデプロイすると、status は以下のようになります：
+
+  status:
+    injectedPods: 2   # 全ノード合計
+    injectedPodDetails:
+      - nodeName: wk3
+        podName: myapp-xxx
+        namespace: default
+        interface: veth1abc
+        delayMs: 100
+        tcCommand: "tc qdisc replace dev veth1abc root handle 1: netem delay 100ms"
+      # wk4 のエントリは injectedCount=0 なので含まれない
+    conditions:
+      - type: wk3          # ← ノード名が condition type
+        status: "True"
+        message: "2 pod(s) injected on node wk3"
+      - type: wk4
+        status: "True"
+        message: "0 pod(s) injected on node wk4"
+
+  動作の変更点：
+  - injectedPodDetails: 各ノードが自分のエントリのみ更新。他ノードのエントリは保持される。
+  - conditions: type: "Ready" ではなく type: <ノード名> を使用。各ノードが独立して upsert するため、全ノード分が蓄積される。
+  - injectedPods: 全ノードの合計数。
+
+  リビルドしてデプロイしてください。
+
+✻ Churned for 5m 49s
 ```

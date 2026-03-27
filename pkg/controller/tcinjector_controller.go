@@ -211,9 +211,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if req.Name != "" {
 		injector := &tcv1alpha1.TCInjector{}
 		if err := r.Get(ctx, req.NamespacedName, injector); err == nil {
-			details := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
+			// Build this node's details.
+			thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
 			for _, state := range r.injected {
-				details = append(details, tcv1alpha1.InjectedPodStatus{
+				thisNodeDetails = append(thisNodeDetails, tcv1alpha1.InjectedPodStatus{
 					NodeName:       r.NodeName,
 					Namespace:      state.podNamespace,
 					PodName:        state.podName,
@@ -223,10 +224,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 					TCCommand:      state.tcCmd,
 				})
 			}
-			injector.Status.InjectedPods = injectedCount
-			injector.Status.InjectedPodDetails = details
+			// Preserve entries from other nodes; replace only this node's entries.
+			merged := make([]tcv1alpha1.InjectedPodStatus, 0, len(injector.Status.InjectedPodDetails))
+			for _, d := range injector.Status.InjectedPodDetails {
+				if d.NodeName != r.NodeName {
+					merged = append(merged, d)
+				}
+			}
+			merged = append(merged, thisNodeDetails...)
+			injector.Status.InjectedPods = int32(len(merged))
+			injector.Status.InjectedPodDetails = merged
+			// Use the node name as the condition type so each node upserts its own condition.
 			setCondition(injector, metav1.Condition{
-				Type:               "Ready",
+				Type:               r.NodeName,
 				Status:             metav1.ConditionTrue,
 				Reason:             "Reconciled",
 				Message:            fmt.Sprintf("%d pod(s) injected on node %s", injectedCount, r.NodeName),
