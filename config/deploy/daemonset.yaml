@@ -11,6 +11,8 @@ spec:
       app: tc-injector
   updateStrategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 8
   template:
     metadata:
       labels:
