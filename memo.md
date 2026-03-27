@@ -2881,3 +2881,411 @@ make: *** [build] Error 1
   4. tc qdisc show でルールが出ているのに遅延がない → 通信経路が別のインターフェースを通っている可能性（Pod to Pod
   が同一ノード内ルーティングの場合はegress側のvethに適用されているか確認）
 ```
+
+```
+❯ README.mdを英語で書いてください。このプログラムは何でどういう動きをするか、カスタムリソースの設定方法、確認方法を記載してください
+
+⏺ Searched for 2 patterns, read 4 files (ctrl+o to expand)
+
+⏺ Write(README.md)
+  ⎿  Error writing file
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ Write(README.md)
+  ⎿  Added 365 lines, removed 1 line
+        1 -# tc-injector
+        1   No newline at end of file
+        2 +# tc-injector
+        3 +
+        4 +tc-injector is a Kubernetes operator that injects network latency into pods using the Linux `tc` (traffic control) command. It is designed for chaos engineering,
+          +performance testing, and fault injection scenarios where you need to simulate network delays between services.
+        5 +
+        6 +## How It Works
+        7 +
+        8 +tc-injector runs as a **DaemonSet** — one pod per node — and watches for `TCInjector` custom resources. Each `TCInjector` resource defines a list of rules, each p
+          +airing a pod label selector and a namespace selector with a delay range.
+        9 +
+       10 +When a matching pod becomes ready on the node, tc-injector:
+       11 +
+       12 +1. Connects to the node's CRI socket (containerd or CRI-O) to look up the container's PID.
+       13 +2. Enters the container's network namespace via `/proc/<pid>/ns/net`.
+       14 +3. Identifies the host-side `veth` interface that backs the container's `eth0`.
+       15 +4. Applies a `tc netem` qdisc to that veth interface, injecting the specified delay on all outbound traffic from the pod.
+       16 +
+       17 +When the pod is deleted or no longer matches any rule, the qdisc is removed and normal scheduling is restored.
+       18 +
+       19 +```
+       20 +┌─────────────────────────────────────────────────────────┐
+       21 +│  Kubernetes Node                                         │
+       22 +│                                                          │
+       23 +│  ┌──────────────┐     watches      ┌──────────────────┐ │
+       24 +│  │  tc-injector │ ←────────────── │  TCInjector CRD  │ │
+       25 +│  │  (DaemonSet) │                  └──────────────────┘ │
+       26 +│  └──────┬───────┘                                        │
+       27 +│         │  tc qdisc replace dev vethXXXX                 │
+       28 +│         ▼                                                 │
+       29 +│  ┌─────────────────────────────────────────────────────┐ │
+       30 +│  │  host network namespace                              │ │
+       31 +│  │                                                      │ │
+       32 +│  │  vethXXXX ──[netem delay 30ms]──► pod eth0          │ │
+       33 +│  └─────────────────────────────────────────────────────┘ │
+       34 +└─────────────────────────────────────────────────────────┘
+       35 +```
+       36 +
+       37 +### Rule Matching
+       38 +
+       39 +- Rules are evaluated in order; **the last matching rule wins**.
+       40 +- The **pod selector** matches pods by their labels.
+       41 +- The **namespace selector** matches pods by the labels on their namespace. An empty namespace selector matches all namespaces.
+       42 +- Both selectors support `matchLabels` and `matchExpressions`.
+       43 +- Only pods in the `Running` phase with all containers ready are targeted.
+       44 +
+       45 +### Periodic Delay Rotation (optional)
+       46 +
+       47 +When `enablePeriodicDelayRotation: true` is set, the controller periodically re-randomizes the delay for each injected pod within the configured `[minDelay, maxDe
+          +lay]` range. This is useful for simulating realistic jitter.
+       48 +
+       49 +## Prerequisites
+       50 +
+       51 +- Kubernetes 1.26+ or OpenShift 4.12+
+       52 +- CRI: containerd or CRI-O
+       53 +- `tc` and `netem` kernel module available on nodes (`iproute2` package)
+       54 +- Cluster-admin privileges (required to apply CRD and RBAC)
+       55 +
+       56 +## Installation
+       57 +
+       58 +### 1. Build the container image
+       59 +
+       60 +```bash
+       61 +make image IMAGE=<your-registry>/tc-injector:latest
+       62 +docker push <your-registry>/tc-injector:latest
+       63 +```
+       64 +
+       65 +Update the `image:` field in `config/deploy/daemonset.yaml` to point to your registry.
+       66 +
+       67 +### 2. Deploy (Kubernetes)
+       68 +
+       69 +```bash
+       70 +# Install the CRD, RBAC, and DaemonSet in one step
+       71 +make deploy
+       72 +```
+       73 +
+       74 +Or apply each manifest separately:
+       75 +
+       76 +```bash
+       77 +kubectl apply -f config/crd/tcinjector.yaml
+       78 +kubectl apply -f config/deploy/rbac.yaml
+       79 +kubectl apply -f config/deploy/daemonset.yaml
+       80 +```
+       81 +
+       82 +### 3. Deploy (OpenShift)
+       83 +
+       84 +OpenShift requires a SecurityContextConstraints (SCC) resource to grant the DaemonSet the `privileged` context it needs for `tc` and network namespace operations.
+       85 +
+       86 +```bash
+       87 +make deploy-openshift
+       88 +```
+       89 +
+       90 +### 4. Verify the DaemonSet is running
+       91 +
+       92 +```bash
+       93 +kubectl get daemonset -n tc-injector-system
+       94 +kubectl get pods -n tc-injector-system
+       95 +```
+       96 +
+       97 +All pods should be in the `Running` state with `1/1` containers ready.
+       98 +
+       99 +## Custom Resource Reference
+      100 +
+      101 +### TCInjector
+      102 +
+      103 +`TCInjector` is a cluster-scoped resource (`scope: Cluster`).
+      104 +
+      105 +```yaml
+      106 +apiVersion: tc-injector.example.com/v1alpha1
+      107 +kind: TCInjector
+      108 +metadata:
+      109 +  name: example-delay
+      110 +spec:
+      111 +  # rules is a list of delay injection rules.
+      112 +  # The last rule whose selectors match a pod wins.
+      113 +  rules:
+      114 +    - selector:              # (required) Pod label selector
+      115 +        matchLabels:
+      116 +          app: backend
+      117 +      namespaceSelector:     # (optional) Namespace label selector; empty = all namespaces
+      118 +        matchLabels:
+      119 +          env: production
+      120 +      minDelay: 10           # (required) Minimum delay in milliseconds (>= 0)
+      121 +      maxDelay: 50           # (required) Maximum delay in milliseconds (>= minDelay)
+      122 +
+      123 +  # enablePeriodicDelayRotation re-randomizes delays within [minDelay, maxDelay]
+      124 +  # at the interval specified by delayInterval.
+      125 +  # Default: false
+      126 +  enablePeriodicDelayRotation: false
+      127 +
+      128 +  # delayInterval is the interval between delay re-randomizations.
+      129 +  # Only takes effect when enablePeriodicDelayRotation is true.
+      130 +  # Accepts Go duration strings: "30s", "1m", "2m30s". Default: "30s"
+      131 +  delayInterval: "30s"
+      132 +```
+      133 +
+      134 +### Field Reference
+      135 +
+      136 +| Field | Type | Required | Description |
+      137 +|---|---|---|---|
+      138 +| `spec.rules` | `[]DelayRule` | Yes | List of delay rules |
+      139 +| `spec.rules[].selector` | `LabelSelector` | Yes | Matches pods by label |
+      140 +| `spec.rules[].namespaceSelector` | `LabelSelector` | No | Matches pods by their namespace's labels. Empty matches all namespaces. |
+      141 +| `spec.rules[].minDelay` | `int32` (ms) | Yes | Minimum delay (>= 0) |
+      142 +| `spec.rules[].maxDelay` | `int32` (ms) | Yes | Maximum delay (>= minDelay) |
+      143 +| `spec.enablePeriodicDelayRotation` | `bool` | No | Periodically re-randomize delays. Default: `false` |
+      144 +| `spec.delayInterval` | `Duration` | No | Re-randomization interval. Default: `30s` |
+      145 +
+      146 +### LabelSelector
+      147 +
+      148 +Both `selector` and `namespaceSelector` accept the standard Kubernetes `LabelSelector` format:
+      149 +
+      150 +```yaml
+      151 +# Simple key=value matching
+      152 +matchLabels:
+      153 +  key: value
+      154 +
+      155 +# Expression-based matching
+      156 +matchExpressions:
+      157 +  - key: environment
+      158 +    operator: In          # In, NotIn, Exists, DoesNotExist
+      159 +    values: [staging, canary]
+      160 +```
+      161 +
+      162 +## Examples
+      163 +
+      164 +### Inject delay into all pods in a specific namespace
+      165 +
+      166 +Label the target namespace first:
+      167 +
+      168 +```bash
+      169 +kubectl label namespace my-app env=production
+      170 +```
+      171 +
+      172 +Then create a `TCInjector`:
+      173 +
+      174 +```yaml
+      175 +apiVersion: tc-injector.example.com/v1alpha1
+      176 +kind: TCInjector
+      177 +metadata:
+      178 +  name: production-delay
+      179 +spec:
+      180 +  rules:
+      181 +    - selector: {}           # matches all pods
+      182 +      namespaceSelector:
+      183 +        matchLabels:
+      184 +          env: production
+      185 +      minDelay: 20
+      186 +      maxDelay: 80
+      187 +```
+      188 +
+      189 +### Inject delay into a specific service across all namespaces
+      190 +
+      191 +```yaml
+      192 +apiVersion: tc-injector.example.com/v1alpha1
+      193 +kind: TCInjector
+      194 +metadata:
+      195 +  name: backend-delay
+      196 +spec:
+      197 +  rules:
+      198 +    - selector:
+      199 +        matchLabels:
+      200 +          app: backend
+      201 +      minDelay: 50
+      202 +      maxDelay: 150
+      203 +```
+      204 +
+      205 +### Multiple rules (last match wins)
+      206 +
+      207 +```yaml
+      208 +apiVersion: tc-injector.example.com/v1alpha1
+      209 +kind: TCInjector
+      210 +metadata:
+      211 +  name: multi-rule
+      212 +spec:
+      213 +  rules:
+      214 +    # Apply 10-50 ms to all backend pods in production namespaces
+      215 +    - selector:
+      216 +        matchLabels:
+      217 +          app: backend
+      218 +      namespaceSelector:
+      219 +        matchLabels:
+      220 +          env: production
+      221 +      minDelay: 10
+      222 +      maxDelay: 50
+      223 +
+      224 +    # Override: apply 200-500 ms to slow-test pods specifically
+      225 +    - selector:
+      226 +        matchLabels:
+      227 +          app: backend
+      228 +          test: slow
+      229 +      namespaceSelector:
+      230 +        matchLabels:
+      231 +          env: production
+      232 +      minDelay: 200
+      233 +      maxDelay: 500
+      234 +```
+      235 +
+      236 +### Periodic delay rotation
+      237 +
+      238 +```yaml
+      239 +apiVersion: tc-injector.example.com/v1alpha1
+      240 +kind: TCInjector
+      241 +metadata:
+      242 +  name: jitter-test
+      243 +spec:
+      244 +  enablePeriodicDelayRotation: true
+      245 +  delayInterval: "10s"
+      246 +  rules:
+      247 +    - selector:
+      248 +        matchLabels:
+      249 +          app: frontend
+      250 +      minDelay: 10
+      251 +      maxDelay: 200
+      252 +```
+      253 +
+      254 +## Verifying That tc Rules Are Applied
+      255 +
+      256 +### 1. Check the TCInjector status
+      257 +
+      258 +```bash
+      259 +kubectl get tcinjector <name> -o yaml
+      260 +```
+      261 +
+      262 +Look for `status.injectedPods` (number of pods currently receiving delay on each node) and `status.conditions`:
+      263 +
+      264 +```yaml
+      265 +status:
+      266 +  injectedPods: 3
+      267 +  conditions:
+      268 +    - type: Ready
+      269 +      status: "True"
+      270 +      message: "3 pod(s) injected on node worker-1"
+      271 +```
+      272 +
+      273 +### 2. Check the controller logs
+      274 +
+      275 +```bash
+      276 +kubectl logs -n tc-injector-system -l app=tc-injector -f
+      277 +```
+      278 +
+      279 +A successful injection looks like:
+      280 +
+      281 +```
+      282 +INFO  applying tc delay  pod=backend-xxx  iface=veth1a2b3c  delayMs=37
+      283 +```
+      284 +
+      285 +### 3. Inspect the tc qdisc directly on the node
+      286 +
+      287 +Exec into the tc-injector DaemonSet pod on the target node and run `tc qdisc show`:
+      288 +
+      289 +```bash
+      290 +# Find the tc-injector pod on the target node
+      291 +kubectl get pods -n tc-injector-system -o wide
+      292 +
+      293 +# Exec into it
+      294 +kubectl exec -it -n tc-injector-system <tc-injector-pod> -- bash
+      295 +
+      296 +# List veth interfaces on the host
+      297 +ip link show | grep veth
+      298 +
+      299 +# Check the qdisc on a specific interface
+      300 +tc qdisc show dev <veth-iface>
+      301 +```
+      302 +
+      303 +A successfully applied rule shows:
+      304 +
+      305 +```
+      306 +qdisc netem 1: root refcnt 2 limit 1000 delay 37ms
+      307 +```
+      308 +
+      309 +If there is no qdisc or the output is `qdisc noqueue ...`, the rule has not been applied.
+      310 +
+      311 +### 4. Measure actual latency from inside the pod
+      312 +
+      313 +```bash
+      314 +kubectl exec -it <target-pod> -- bash
+      315 +
+      316 +# Ping another pod or service to measure RTT
+      317 +ping -c 10 <other-pod-ip>
+      318 +
+      319 +# Or measure HTTP response time with curl
+      320 +curl -o /dev/null -s -w "time_total: %{time_total}s\n" http://<service>/
+      321 +```
+      322 +
+      323 +The measured RTT increase should correspond to the injected delay (`minDelay`-`maxDelay` ms).
+      324 +
+      325 +### 5. Troubleshooting checklist
+      326 +
+      327 +| Symptom | Likely cause | Action |
+      328 +|---|---|---|
+      329 +| `injectedPods: 0` | Selector mismatch | Check pod and namespace labels match the rule's selectors |
+      330 +| No `applying tc delay` in logs | Pod not ready | Ensure pod is `Running` with all containers ready |
+      331 +| Log shows injection but no measured delay | tc applied to wrong interface | Verify with `tc qdisc show dev <iface>` inside the DaemonSet pod |
+      332 +| Pod is not targeted despite matching labels | Namespace labels missing | Run `kubectl get namespace <ns> --show-labels` and add required labels |
+      333 +
+      334 +```bash
+      335 +# Debug selector matching
+      336 +kubectl get pod <target-pod> -o jsonpath='{.metadata.labels}'
+      337 +kubectl get namespace <target-namespace> --show-labels
+      338 +kubectl get tcinjector <name> -o jsonpath='{.spec.rules}'
+      339 +```
+      340 +
+      341 +## Uninstallation
+      342 +
+      343 +```bash
+      344 +# Remove DaemonSet and RBAC (keeps CRD and any TCInjector resources)
+      345 +make undeploy
+      346 +
+      347 +# Remove the CRD (also deletes all TCInjector resources)
+      348 +make uninstall-crd
+      349 +
+      350 +# OpenShift: also remove the SCC
+      351 +make undeploy-openshift
+      352 +make uninstall-scc
+      353 +```
+      354 +
+      355 +## Development
+      356 +
+      357 +```bash
+      358 +# Run unit tests
+      359 +make test
+      360 +
+      361 +# Run tests with race detector
+      362 +make test-race
+      363 +
+      364 +# Build binary locally
+      365 +make build
+      366 +```
+
+⏺ README.md を作成しました。以下のセクションを含めています：
+
+  ┌──────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │          セクション          │                                                            内容                                                            │
+  ├──────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ How It Works                 │ DaemonSet としての動作、CRI 経由でのコンテナ PID 取得、veth インターフェースへの tc netem 適用の流れ。アーキテクチャ図付き │
+  ├──────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Rule Matching                │ セレクタの評価順序（last match wins）、pod/namespace セレクタの動作                                                        │
+  ├──────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Prerequisites                │ 必要な Kubernetes バージョン、CRI、iproute2 など                                                                           │
+  ├──────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Installation                 │ Kubernetes / OpenShift 向けの手順（make deploy / make deploy-openshift）                                                   │
+  ├──────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Custom Resource Reference    │ フィールド一覧表、LabelSelector の書き方                                                                                   │
+  ├──────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Examples                     │ 4種類のユースケース（特定 Namespace への適用、全 Namespace 横断、複数ルール、periodic rotation）                           │
+  ├──────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Verifying                    │ ステータス確認、ログ確認、tc qdisc show での直接確認、pod 内からの ping/curl による遅延計測、トラブルシューティング表      │
+  ├──────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Uninstallation / Development │ make ターゲットの一覧                                                                                                      │
+  └──────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+✻ Cogitated for 2m 23s
+```
