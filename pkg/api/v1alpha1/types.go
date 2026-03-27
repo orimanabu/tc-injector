@@ -49,10 +49,30 @@ type DelayRule struct {
 	MaxDelay int32 `json:"maxDelay"`
 }
 
+// InjectedPodStatus describes the tc rule currently applied to a single pod.
+type InjectedPodStatus struct {
+	// NodeName is the node where this rule is applied.
+	NodeName string `json:"nodeName"`
+	// Namespace is the namespace of the target pod.
+	Namespace string `json:"namespace"`
+	// PodName is the name of the target pod.
+	PodName string `json:"podName"`
+	// Interface is the host-side network interface name.
+	Interface string `json:"interface"`
+	// InterfaceIndex is the ifindex of the host-side interface.
+	InterfaceIndex int32 `json:"interfaceIndex"`
+	// DelayMs is the injected delay in milliseconds.
+	DelayMs int32 `json:"delayMs"`
+	// TCCommand is the tc command line that was applied.
+	TCCommand string `json:"tcCommand"`
+}
+
 // TCInjectorStatus reports current injection state.
 type TCInjectorStatus struct {
 	// InjectedPods is the number of pods currently receiving delay injection on this node.
 	InjectedPods int32 `json:"injectedPods,omitempty"`
+	// InjectedPodDetails lists the tc rule details for each injected pod on this node.
+	InjectedPodDetails []InjectedPodStatus `json:"injectedPodDetails,omitempty"`
 	// Conditions describes the current state of the TCInjector.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }

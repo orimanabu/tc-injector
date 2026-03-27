@@ -24,9 +24,9 @@ import (
 	"github.com/tc-injector/tc-injector/pkg/tc"
 )
 
-// VethFinder resolves a container ID to the host-side veth interface name.
+// VethFinder resolves a container ID to the host-side veth interface name and ifindex.
 type VethFinder interface {
-	FindHostVeth(ctx context.Context, containerID string) (string, error)
+	FindHostVeth(ctx context.Context, containerID string) (ifaceName string, ifaceIndex int, err error)
 }
 
 // TCApplier applies and removes tc netem delay rules on network interfaces.
@@ -43,8 +43,12 @@ func (RealTCApplier) Remove(iface string) error               { return tc.Remove
 
 // injectedState records the tc rule currently applied to a pod.
 type injectedState struct {
-	ifaceName string
-	delayMs   int32
+	ifaceName    string
+	ifaceIndex   int
+	podName      string
+	podNamespace string
+	delayMs      int32
+	tcCmd        string
 }
 
 // Reconciler reconciles TCInjector objects and manages tc rules on the local node.
@@ -128,8 +132,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				if !podSel.Matches(labels.Set(pod.Labels)) {
 					continue
 				}
-				nsLabels, ok := namespaceLabelMap[pod.Namespace]
-				if !ok || !nsSel.Matches(nsLabels) {
+				// Use empty labels if namespace is not found (e.g., recently deleted).
+				// An empty NamespaceSelector matches all namespaces including this case.
+				nsLabels := namespaceLabelMap[pod.Namespace]
+				if !nsSel.Matches(nsLabels) {
 					continue
 				}
 				uid := string(pod.UID)
@@ -171,7 +177,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			continue
 		}
 
-		iface, err := r.Finder.FindHostVeth(ctx, containerID)
+		iface, ifaceIdx, err := r.Finder.FindHostVeth(ctx, containerID)
 		if err != nil {
 			logger.Error(err, "cannot find host veth", "pod", pod.Name, "containerID", containerID)
 			continue
@@ -190,7 +196,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			continue
 		}
 
-		r.injected[uid] = injectedState{ifaceName: iface, delayMs: delayMs}
+		r.injected[uid] = injectedState{
+			ifaceName:    iface,
+			ifaceIndex:   ifaceIdx,
+			podName:      pod.Name,
+			podNamespace: pod.Namespace,
+			delayMs:      delayMs,
+			tcCmd:        tcCmd,
+		}
 		injectedCount++
 	}
 
@@ -198,7 +211,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if req.Name != "" {
 		injector := &tcv1alpha1.TCInjector{}
 		if err := r.Get(ctx, req.NamespacedName, injector); err == nil {
+			details := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
+			for _, state := range r.injected {
+				details = append(details, tcv1alpha1.InjectedPodStatus{
+					NodeName:       r.NodeName,
+					Namespace:      state.podNamespace,
+					PodName:        state.podName,
+					Interface:      state.ifaceName,
+					InterfaceIndex: int32(state.ifaceIndex),
+					DelayMs:        state.delayMs,
+					TCCommand:      state.tcCmd,
+				})
+			}
 			injector.Status.InjectedPods = injectedCount
+			injector.Status.InjectedPodDetails = details
 			setCondition(injector, metav1.Condition{
 				Type:               "Ready",
 				Status:             metav1.ConditionTrue,

@@ -95,8 +95,29 @@ func (in *TCInjectorSpec) DeepCopy() *TCInjectorSpec {
 
 // DeepCopyInto copies all properties of this object into another object of the
 // same type that is provided as a pointer.
+func (in *InjectedPodStatus) DeepCopyInto(out *InjectedPodStatus) {
+	*out = *in
+}
+
+// DeepCopy returns a deep copy of this InjectedPodStatus.
+func (in *InjectedPodStatus) DeepCopy() *InjectedPodStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(InjectedPodStatus)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto copies all properties of this object into another object of the
+// same type that is provided as a pointer.
 func (in *TCInjectorStatus) DeepCopyInto(out *TCInjectorStatus) {
 	*out = *in
+	if in.InjectedPodDetails != nil {
+		in, out := &in.InjectedPodDetails, &out.InjectedPodDetails
+		*out = make([]InjectedPodStatus, len(*in))
+		copy(*out, *in)
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

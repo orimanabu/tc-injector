@@ -80,18 +80,18 @@ func (f *Finder) Close() error {
 	return f.conn.Close()
 }
 
-// FindHostVeth returns the host-side veth interface name for the pod container.
-// containerID should be in the form "containerd://<id>" or "cri-o://<id>" as
-// stored in pod status.
-func (f *Finder) FindHostVeth(ctx context.Context, containerID string) (string, error) {
+// FindHostVeth returns the host-side veth interface name and ifindex for the
+// pod container. containerID should be in the form "containerd://<id>" or
+// "cri-o://<id>" as stored in pod status.
+func (f *Finder) FindHostVeth(ctx context.Context, containerID string) (string, int, error) {
 	id := stripRuntimePrefix(containerID)
 	if id == "" {
-		return "", fmt.Errorf("empty container ID after stripping runtime prefix: %q", containerID)
+		return "", 0, fmt.Errorf("empty container ID after stripping runtime prefix: %q", containerID)
 	}
 
 	netnsPath, err := f.resolveNetnsPath(ctx, id)
 	if err != nil {
-		return "", fmt.Errorf("get netns for container %s: %w", id, err)
+		return "", 0, fmt.Errorf("get netns for container %s: %w", id, err)
 	}
 
 	return findHostVethFromNetns(netnsPath)
@@ -199,21 +199,22 @@ func procNetnsPath(pid int) string {
 }
 
 // findHostVethFromNetns enters the pod network namespace, obtains the peer
-// ifindex of the veth interface, then maps it back to a host interface name.
-func findHostVethFromNetns(netnsPath string) (string, error) {
+// ifindex of the veth interface, then maps it back to a host interface name
+// and ifindex.
+func findHostVethFromNetns(netnsPath string) (string, int, error) {
 	if _, err := os.Stat(netnsPath); err != nil {
-		return "", fmt.Errorf("netns path %s not accessible: %w", netnsPath, err)
+		return "", 0, fmt.Errorf("netns path %s not accessible: %w", netnsPath, err)
 	}
 
 	hostNS, err := netns.Get()
 	if err != nil {
-		return "", fmt.Errorf("get host netns: %w", err)
+		return "", 0, fmt.Errorf("get host netns: %w", err)
 	}
 	defer hostNS.Close()
 
 	podNS, err := netns.GetFromPath(netnsPath)
 	if err != nil {
-		return "", fmt.Errorf("open pod netns %s: %w", netnsPath, err)
+		return "", 0, fmt.Errorf("open pod netns %s: %w", netnsPath, err)
 	}
 	defer podNS.Close()
 
@@ -223,7 +224,7 @@ func findHostVethFromNetns(netnsPath string) (string, error) {
 	defer runtime.UnlockOSThread()
 
 	if err := netns.Set(podNS); err != nil {
-		return "", fmt.Errorf("enter pod netns: %w", err)
+		return "", 0, fmt.Errorf("enter pod netns: %w", err)
 	}
 
 	peerIdx, findErr := podVethPeerIndex()
@@ -235,16 +236,16 @@ func findHostVethFromNetns(netnsPath string) (string, error) {
 	}
 
 	if findErr != nil {
-		return "", fmt.Errorf("find veth peer index in pod netns: %w", findErr)
+		return "", 0, fmt.Errorf("find veth peer index in pod netns: %w", findErr)
 	}
 
 	// Look up the peer interface by ifindex in the host default netns.
 	link, err := netlink.LinkByIndex(peerIdx)
 	if err != nil {
-		return "", fmt.Errorf("lookup host link by index %d: %w", peerIdx, err)
+		return "", 0, fmt.Errorf("lookup host link by index %d: %w", peerIdx, err)
 	}
 
-	return link.Attrs().Name, nil
+	return link.Attrs().Name, link.Attrs().Index, nil
 }
 
 // podVethPeerIndex returns the peer ifindex of the first non-loopback veth

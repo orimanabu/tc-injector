@@ -108,6 +108,36 @@ spec:
                 injectedPods:
                   type: integer
                   format: int32
+                injectedPodDetails:
+                  type: array
+                  description: Details of tc rules currently applied on this node.
+                  items:
+                    type: object
+                    required: [nodeName, namespace, podName, interface, interfaceIndex, delayMs, tcCommand]
+                    properties:
+                      nodeName:
+                        type: string
+                        description: Node where the rule is applied.
+                      namespace:
+                        type: string
+                        description: Namespace of the target pod.
+                      podName:
+                        type: string
+                        description: Name of the target pod.
+                      interface:
+                        type: string
+                        description: Host-side network interface name.
+                      interfaceIndex:
+                        type: integer
+                        format: int32
+                        description: ifindex of the host-side interface.
+                      delayMs:
+                        type: integer
+                        format: int32
+                        description: Injected delay in milliseconds.
+                      tcCommand:
+                        type: string
+                        description: The tc command line that was applied.
                 conditions:
                   type: array
                   items:

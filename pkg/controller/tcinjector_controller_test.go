@@ -31,13 +31,13 @@ func newFakeVethFinder(m map[string]string) *fakeVethFinder {
 	return &fakeVethFinder{mapping: m}
 }
 
-func (f *fakeVethFinder) FindHostVeth(_ context.Context, containerID string) (string, error) {
+func (f *fakeVethFinder) FindHostVeth(_ context.Context, containerID string) (string, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if iface, ok := f.mapping[containerID]; ok {
-		return iface, nil
+		return iface, 0, nil
 	}
-	return "", fmt.Errorf("no veth mapping for container %q", containerID)
+	return "", 0, fmt.Errorf("no veth mapping for container %q", containerID)
 }
 
 // fakeTCApplier records Apply and Remove calls.
