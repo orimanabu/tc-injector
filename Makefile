@@ -1,7 +1,7 @@
 IMAGE ?= tc-injector:latest
 NAMESPACE ?= tc-injector-system
 
-.PHONY: all build test image deploy undeploy install-crd uninstall-crd tidy clean
+.PHONY: all build test image deploy undeploy install-crd uninstall-crd install-scc uninstall-scc tidy clean
 
 all: build
 
@@ -33,13 +33,33 @@ install-crd:
 uninstall-crd:
 	kubectl delete -f config/crd/tcinjector.yaml --ignore-not-found
 
+## Install the SCC and its ServiceAccount binding (OpenShift only).
+install-scc:
+	kubectl apply -f config/deploy/scc.yaml
+	kubectl apply -f config/deploy/scc-binding.yaml
+
+## Remove the SCC and its binding (OpenShift only).
+uninstall-scc:
+	kubectl delete -f config/deploy/scc-binding.yaml --ignore-not-found
+	kubectl delete -f config/deploy/scc.yaml --ignore-not-found
+
 ## Deploy RBAC and DaemonSet.
 deploy: install-crd
 	kubectl apply -f config/deploy/rbac.yaml
 	kubectl apply -f config/deploy/daemonset.yaml
 
+## Deploy RBAC, DaemonSet, and SCC (OpenShift).
+deploy-openshift: install-crd install-scc
+	kubectl apply -f config/deploy/rbac.yaml
+	kubectl apply -f config/deploy/daemonset.yaml
+
 ## Remove the DaemonSet and RBAC.
 undeploy:
+	kubectl delete -f config/deploy/daemonset.yaml --ignore-not-found
+	kubectl delete -f config/deploy/rbac.yaml --ignore-not-found
+
+## Remove the DaemonSet, RBAC, and SCC (OpenShift).
+undeploy-openshift: uninstall-scc
 	kubectl delete -f config/deploy/daemonset.yaml --ignore-not-found
 	kubectl delete -f config/deploy/rbac.yaml --ignore-not-found
 

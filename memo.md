@@ -2289,3 +2289,259 @@ make: *** [build] Error 1
 
 ✻ Sautéed for 38s
 ```
+
+```
+❯ OpenShift上で動かす場合、SCCはどう設定すればよいですか
+
+⏺ Read 2 files (ctrl+o to expand)
+
+⏺ コードベースから必要な権限を整理すると：
+
+  ┌───────────────────────────────────┬───────────────────────────────────────────────────┐
+  │               要件                │                       理由                        │
+  ├───────────────────────────────────┼───────────────────────────────────────────────────┤
+  │ privileged: true                  │ tcコマンドとnetns操作                             │
+  ├───────────────────────────────────┼───────────────────────────────────────────────────┤
+  │ hostPID: true                     │ /proc/<pid>/ns/net へのアクセス                   │
+  ├───────────────────────────────────┼───────────────────────────────────────────────────┤
+  │ hostPath ボリューム               │ /proc, /run/crio, /run/containerd, /var/run/netns │
+  ├───────────────────────────────────┼───────────────────────────────────────────────────┤
+  │ mountPropagation: HostToContainer │ CRI-O の netns ファイル可視化                     │
+  └───────────────────────────────────┴───────────────────────────────────────────────────┘
+
+  ---
+  方針
+
+  デフォルトの privileged SCC を直接使うのが最も簡単ですが、最小権限の観点からは カスタム SCC を作成する方法を推奨します。
+
+  ---
+  カスタム SCC（推奨）
+
+  config/deploy/ に追加するYAMLです：
+
+  # config/deploy/scc.yaml
+  apiVersion: security.openshift.io/v1
+  kind: SecurityContextConstraints
+  metadata:
+    name: tc-injector
+  # tc(8) と setns(2) のために特権コンテナが必要
+  allowPrivilegedContainer: true
+  # /proc/<pid>/ns/net にアクセスするためにホスト PID 名前空間が必要
+  allowHostPID: true
+  allowHostDirVolumePlugin: true
+  allowHostIPC: false
+  allowHostNetwork: false
+  allowHostPorts: false
+  # tc/netem および netlink 操作に必要
+  allowedCapabilities:
+    - NET_ADMIN
+    - SYS_ADMIN
+  defaultAddCapabilities: []
+  requiredDropCapabilities: []
+  # root として動作する必要がある（setns は UID 0 または CAP_SYS_ADMIN が必要）
+  runAsUser:
+    type: RunAsAny
+  seLinuxContext:
+    type: RunAsAny
+  fsGroup:
+    type: RunAsAny
+  supplementalGroups:
+    type: RunAsAny
+  volumes:
+    - hostPath
+    - secret
+    - configMap
+    - emptyDir
+    - projected
+    - downwardAPI
+  users: []
+  groups: []
+
+  ServiceAccount を SCC にバインドする ClusterRole／ClusterRoleBinding を追加します：
+
+  # config/deploy/scc-binding.yaml
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRole
+  metadata:
+    name: tc-injector-scc
+  rules:
+    - apiGroups: [security.openshift.io]
+      resources: [securitycontextconstraints]
+      resourceNames: [tc-injector]
+      verbs: [use]
+  ---
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: tc-injector-scc
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: tc-injector-scc
+  subjects:
+    - kind: ServiceAccount
+      name: tc-injector
+      namespace: tc-injector-system
+
+  ---
+  適用手順
+
+  # SCC を作成（cluster-admin 権限が必要）
+  oc apply -f config/deploy/scc.yaml
+  oc apply -f config/deploy/scc-binding.yaml
+
+  # 確認
+  oc describe scc tc-injector
+  oc adm policy who-can use scc tc-injector
+
+  ---
+  代替案：組み込みの privileged SCC を使う（簡易）
+
+  カスタム SCC を作りたくない場合は、組み込みの privileged SCC を使えます。ただし過剰な権限になります。
+
+  oc adm policy add-scc-to-user privileged \
+    -z tc-injector \
+    -n tc-injector-system
+
+  または RBAC で：
+
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: tc-injector-privileged-scc
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:openshift:scc:privileged
+  subjects:
+    - kind: ServiceAccount
+      name: tc-injector
+      namespace: tc-injector-system
+
+  ---
+  備考
+
+  - OpenShift 4.11 以降は restricted-v2 がデフォルト SCC のため、何もバインドしないとDaemonSetが起動しません
+  - SELinux ラベルは seLinuxContext: RunAsAny で spc_t（super privileged container）相当が付与されます。これは privileged: true と組み合わせた場合に自動的に適用されます
+  - hostPID: true はセキュリティ上のリスクが高いため、ノードの全プロセスが見える点を運用チームに周知してください
+
+✻ Crunched for 55s
+
+❯ 上のSCCをconfigの下に作成しておいて
+
+⏺ Write(config/deploy/scc.yaml)
+  ⎿  Wrote 37 lines to config/deploy/scc.yaml
+       1 apiVersion: security.openshift.io/v1
+       2 kind: SecurityContextConstraints
+       3 metadata:
+       4   name: tc-injector
+       5 # tc(8) and setns(2) require a privileged container.
+       6 allowPrivilegedContainer: true
+       7 # hostPID is required to access /proc/<pid>/ns/net of target containers.
+       8 allowHostPID: true
+       9 allowHostDirVolumePlugin: true
+      10 allowHostIPC: false
+     … +27 lines (ctrl+o to expand)
+
+⏺ Write(config/deploy/scc-binding.yaml)
+  ⎿  Wrote 22 lines to config/deploy/scc-binding.yaml
+       1 apiVersion: rbac.authorization.k8s.io/v1
+       2 kind: ClusterRole
+       3 metadata:
+       4   name: tc-injector-scc
+       5 rules:
+       6   - apiGroups: [security.openshift.io]
+       7     resources: [securitycontextconstraints]
+       8     resourceNames: [tc-injector]
+       9     verbs: [use]
+      10 ---
+     … +12 lines (ctrl+o to expand)
+
+⏺ config/deploy/ に2ファイルを作成しました。
+
+  config/deploy/
+  ├── scc.yaml          # SecurityContextConstraints 本体
+  ├── scc-binding.yaml  # ClusterRole + ClusterRoleBinding（SA へのバインド）
+  ├── daemonset.yaml
+  └── rbac.yaml
+
+  Makefileの deploy / undeploy ターゲットにSCCの適用も含めますか?
+
+❯ お願いします
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ Update(Makefile)
+  ⎿  Added 1 line, removed 1 line
+      1  IMAGE ?= tc-injector:latest
+      2  NAMESPACE ?= tc-injector-system
+      3
+      4 -.PHONY: all build test image deploy undeploy install-crd uninstall-crd tidy clean
+      4 +.PHONY: all build test image deploy undeploy install-crd uninstall-crd install-scc uninstall-scc tidy clean
+      5
+      6  all: build
+      7
+
+⏺ Update(Makefile)
+  ⎿  Added 20 lines
+      33  uninstall-crd:
+      34    kubectl delete -f config/crd/tcinjector.yaml --ignore-not-found
+      35
+      36 +## Install the SCC and its ServiceAccount binding (OpenShift only).
+      37 +install-scc:
+      38 +  kubectl apply -f config/deploy/scc.yaml
+      39 +  kubectl apply -f config/deploy/scc-binding.yaml
+      40 +
+      41 +## Remove the SCC and its binding (OpenShift only).
+      42 +uninstall-scc:
+      43 +  kubectl delete -f config/deploy/scc-binding.yaml --ignore-not-found
+      44 +  kubectl delete -f config/deploy/scc.yaml --ignore-not-found
+      45 +
+      46  ## Deploy RBAC and DaemonSet.
+      47  deploy: install-crd
+      48    kubectl apply -f config/deploy/rbac.yaml
+      49    kubectl apply -f config/deploy/daemonset.yaml
+      50
+      51 +## Deploy RBAC, DaemonSet, and SCC (OpenShift).
+      52 +deploy-openshift: install-crd install-scc
+      53 +  kubectl apply -f config/deploy/rbac.yaml
+      54 +  kubectl apply -f config/deploy/daemonset.yaml
+      55 +
+      56  ## Remove the DaemonSet and RBAC.
+      57  undeploy:
+      58    kubectl delete -f config/deploy/daemonset.yaml --ignore-not-found
+      59    kubectl delete -f config/deploy/rbac.yaml --ignore-not-found
+      60
+      61 +## Remove the DaemonSet, RBAC, and SCC (OpenShift).
+      62 +undeploy-openshift: uninstall-scc
+      63 +  kubectl delete -f config/deploy/daemonset.yaml --ignore-not-found
+      64 +  kubectl delete -f config/deploy/rbac.yaml --ignore-not-found
+      65 +
+      66  ## Apply the example TCInjector resource.
+      67  sample:
+      68    kubectl apply -f config/samples/tcinjector-example.yaml
+
+⏺ 確認します。
+
+⏺ Bash(make --dry-run deploy-openshift 2>&1 && echo "---" && make --dry-run undeploy-openshift 2>&1)
+  ⎿  kubectl apply -f config/crd/tcinjector.yaml
+     kubectl apply -f config/deploy/scc.yaml
+     kubectl apply -f config/deploy/scc-binding.yaml
+     … +7 lines (ctrl+o to expand)
+
+⏺ 追加したターゲットの一覧です。
+
+  ┌────────────────────┬─────────────────────────────────────────┐
+  │     ターゲット     │                  内容                   │
+  ├────────────────────┼─────────────────────────────────────────┤
+  │ install-scc        │ SCC + SCC binding を適用                │
+  ├────────────────────┼─────────────────────────────────────────┤
+  │ uninstall-scc      │ SCC + SCC binding を削除                │
+  ├────────────────────┼─────────────────────────────────────────┤
+  │ deploy-openshift   │ CRD + SCC + RBAC + DaemonSet を一括適用 │
+  ├────────────────────┼─────────────────────────────────────────┤
+  │ undeploy-openshift │ SCC + RBAC + DaemonSet を一括削除       │
+  └────────────────────┴─────────────────────────────────────────┘
+
+  既存の deploy / undeploy はそのまま残しているので、通常の Kubernetes 環境での利用に影響はありません。
+```

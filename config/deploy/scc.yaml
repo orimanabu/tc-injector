@@ -1,0 +1,37 @@
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: tc-injector
+# tc(8) and setns(2) require a privileged container.
+allowPrivilegedContainer: true
+# hostPID is required to access /proc/<pid>/ns/net of target containers.
+allowHostPID: true
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPorts: false
+# NET_ADMIN is required for tc/netem operations.
+# SYS_ADMIN is required for netlink and network namespace (setns) operations.
+allowedCapabilities:
+  - NET_ADMIN
+  - SYS_ADMIN
+defaultAddCapabilities: []
+requiredDropCapabilities: []
+# Must run as root: setns(2) requires UID 0 or CAP_SYS_ADMIN.
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+volumes:
+  - hostPath
+  - secret
+  - configMap
+  - emptyDir
+  - projected
+  - downwardAPI
+users: []
+groups: []
