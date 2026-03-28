@@ -5088,3 +5088,16 @@ permission denied"}
 
 ✻ Brewed for 1m 2s
 ```
+
+```
+❯ うまくできましたありがとうございます
+
+⏺ よかったです！
+
+  最終的な権限構成をまとめると:
+
+  - privileged: true (全capability) → NET_ADMIN + SYS_ADMIN + SYS_PTRACE の3つに絞ることができました
+  - hostNetwork / hostPID は機能上必要なため維持
+
+  何かあればお気軽にどうぞ。
+```
