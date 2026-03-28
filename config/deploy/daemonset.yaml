@@ -46,7 +46,12 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
           securityContext:
-            privileged: true          # Required for tc(8) and netns operations.
+            privileged: false
+            capabilities:
+              add:
+                - NET_ADMIN   # Required for tc(8)/netem and netlink operations.
+                - SYS_ADMIN   # Required for setns(2) to enter pod network namespaces.
+            runAsUser: 0      # Root is required to open /proc/<pid>/ns/net for arbitrary PIDs.
           resources:
             requests:
               cpu: 50m

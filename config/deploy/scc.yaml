@@ -2,8 +2,8 @@ apiVersion: security.openshift.io/v1
 kind: SecurityContextConstraints
 metadata:
   name: tc-injector
-# tc(8) and setns(2) require a privileged container.
-allowPrivilegedContainer: true
+# NET_ADMIN and SYS_ADMIN are sufficient; a fully privileged container is not required.
+allowPrivilegedContainer: false
 # hostPID is required to access /proc/<pid>/ns/net of target containers.
 allowHostPID: true
 allowHostDirVolumePlugin: true

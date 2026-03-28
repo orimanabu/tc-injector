@@ -4926,3 +4926,94 @@ conditions:
 
 ✻ Baked for 1m 28s
 ```
+
+```
+ ▐▛███▜▌   Claude Code v2.1.76
+▝▜█████▛▘  Sonnet 4.6 · Claude Pro
+  ▘▘ ▝▝    ~/devel/src/github.com/orimanabu/tc-injector
+
+❯ 今はPrivileged権限で動いていますが、もっと制限した権限で動くようにできますか
+
+⏺ まずコードベースを確認します。
+
+⏺ Searched for 3 patterns, read 3 files (ctrl+o to expand)
+
+⏺ コードも確認します。
+
+⏺ Read 2 files (ctrl+o to expand)
+
+⏺ 現在の状況を分析しました。
+
+  現状の問題点:
+  - daemonset.yaml の securityContext.privileged: true は全 Linux capability を付与するため、セキュリティ的に過剰
+  - scc.yaml も allowPrivilegedContainer: true になっている
+
+  必要な権限の分析:
+
+  ┌─────────────────────────────┬──────────────┐
+  │            操作             │  必要な権限  │
+  ├─────────────────────────────┼──────────────┤
+  │ tc qdisc (netem)            │ NET_ADMIN    │
+  ├─────────────────────────────┼──────────────┤
+  │ setns(2) でpodのnetnsに入る │ SYS_ADMIN    │
+  ├─────────────────────────────┼──────────────┤
+  │ netlinkでveth検索           │ NET_ADMIN    │
+  ├─────────────────────────────┼──────────────┤
+  │ /proc/<pid>/ns/net アクセス │ root (UID 0) │
+  └─────────────────────────────┴──────────────┘
+
+  privileged: true を削除し、NET_ADMIN + SYS_ADMIN の2つの capability のみに絞ることが可能です。hostNetwork: true と hostPID: true は機能上必要なため残す必要があります。
+
+  変更を加えますか？
+
+  変更内容:
+  1. daemonset.yaml: privileged: true → privileged: false + capabilities.add: [NET_ADMIN, SYS_ADMIN]
+  2. scc.yaml: allowPrivilegedContainer: true → false
+
+✻ Brewed for 52s
+
+❯ お願いします
+
+⏺ Update(config/deploy/daemonset.yaml)
+  ⎿  Added 6 lines, removed 1 line
+      46                  fieldRef:
+      47                    fieldPath: spec.nodeName
+      48            securityContext:
+      49 -            privileged: true          # Required for tc(8) and netns operations.
+      49 +            privileged: false
+      50 +            capabilities:
+      51 +              add:
+      52 +                - NET_ADMIN   # Required for tc(8)/netem and netlink operations.
+      53 +                - SYS_ADMIN   # Required for setns(2) to enter pod network namespaces.
+      54 +            runAsUser: 0      # Root is required to open /proc/<pid>/ns/net for arbitrary PIDs.
+      55            resources:
+      56              requests:
+      57                cpu: 50m
+
+⏺ Update(config/deploy/scc.yaml)
+  ⎿  Added 2 lines, removed 2 lines
+      2  kind: SecurityContextConstraints
+      3  metadata:
+      4    name: tc-injector
+      5 -# tc(8) and setns(2) require a privileged container.
+      6 -allowPrivilegedContainer: true
+      5 +# NET_ADMIN and SYS_ADMIN are sufficient; a fully privileged container is not required.
+      6 +allowPrivilegedContainer: false
+      7  # hostPID is required to access /proc/<pid>/ns/net of target containers.
+      8  allowHostPID: true
+      9  allowHostDirVolumePlugin: true
+
+⏺ 確認します。
+
+⏺ Read 2 files (ctrl+o to expand)
+
+⏺ 変更完了しました。
+
+  変更内容:
+
+  - daemonset.yaml: privileged: true → privileged: false + NET_ADMIN / SYS_ADMIN capability + runAsUser: 0
+  - scc.yaml: allowPrivilegedContainer: true → false
+
+  privileged: true はすべての Linux capability を付与するのに対し、今回の変更で必要最小限の2つに絞られます。hostNetwork と hostPID は host veth の操作や /proc/<pid>/ns/net
+  へのアクセスに引き続き必要なため、そのままにしています。
+```
