@@ -5017,3 +5017,74 @@ conditions:
   privileged: true はすべての Linux capability を付与するのに対し、今回の変更で必要最小限の2つに絞られます。hostNetwork と hostPID は host veth の操作や /proc/<pid>/ns/net
   へのアクセスに引き続き必要なため、そのままにしています。
 ```
+
+```
+❯ 以下のエラーになりました。調査お願いします
+cannot find host veth   {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector": {"name":"example-delay"},
+"namespace": "", "name": "example-delay", "reconcileID": "9a54d795-063e-4962-90e1-3ee00ce3aefa", "request": {"name":"example-delay"}, "pod": "hello-9b6845674-w48n9",
+"containerID": "cri-o://5e94f6d782a81bec40ea687070356cd388739dbdb563b9c11fed24921ad9050c", "error": "netns path /proc/26437/ns/net not accessible: stat /proc/26437/ns/net:
+permission denied"}
+
+⏺ エラーを分析します。stat /proc/26437/ns/net: permission denied — privileged: true が持っていた CAP_SYS_PTRACE が落ちているのが原因です。
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ 原因: /proc/<pid>/ns/net へのアクセスは、カーネルの ptrace_may_access() チェックを通過する必要があります。privileged: true は CAP_SYS_PTRACE を含む全 capability
+  を付与していましたが、今回の変更で落ちました。CAP_SYS_PTRACE がないと、root でも他ユーザーの PID の /proc/<pid>/ 以下のファイルに stat できません。
+
+  SYS_PTRACE を追加します。
+
+⏺ Update(config/deploy/daemonset.yaml)
+  ⎿  Added 3 lines, removed 2 lines
+      49              privileged: false
+      50              capabilities:
+      51                add:
+      52 -                - NET_ADMIN   # Required for tc(8)/netem and netlink operations.
+      53 -                - SYS_ADMIN   # Required for setns(2) to enter pod network namespaces.
+      52 +                - NET_ADMIN    # Required for tc(8)/netem and netlink operations.
+      53 +                - SYS_ADMIN    # Required for setns(2) to enter pod network namespaces.
+      54 +                - SYS_PTRACE   # Required to access /proc/<pid>/ns/net for arbitrary PIDs (ptrace_may_access check).
+      55              runAsUser: 0      # Root is required to open /proc/<pid>/ns/net for arbitrary PIDs.
+      56            resources:
+      57              requests:
+
+⏺ Update(config/deploy/scc.yaml)
+  ⎿  Added 3 lines
+      15  allowHostPorts: false
+      16  # NET_ADMIN is required for tc/netem operations.
+      17  # SYS_ADMIN is required for netlink and network namespace (setns) operations.
+      18 +# SYS_PTRACE is required to pass the kernel's ptrace_may_access() check when
+      19 +# opening /proc/<pid>/ns/net for containers running as a different UID.
+      20  allowedCapabilities:
+      21    - NET_ADMIN
+      22    - SYS_ADMIN
+      23 +  - SYS_PTRACE
+      24  defaultAddCapabilities: []
+      25  requiredDropCapabilities: []
+      26  # Must run as root: setns(2) requires UID 0 or CAP_SYS_ADMIN.
+
+⏺ 修正内容:
+
+  両ファイルに SYS_PTRACE を追加しました。
+
+  なぜ必要か:
+
+  Linux カーネルは /proc/<pid>/ 以下のファイル（ns/net を含む）へのアクセス時に ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS) を呼び出します。UID が異なるプロセスの場合、root
+  であっても CAP_SYS_PTRACE がなければこのチェックで弾かれます。
+
+  最終的な capability 構成:
+
+  ┌────────────┬─────────────────────────────────┐
+  │ Capability │              用途               │
+  ├────────────┼─────────────────────────────────┤
+  │ NET_ADMIN  │ tc/netem 操作、netlink          │
+  ├────────────┼─────────────────────────────────┤
+  │ SYS_ADMIN  │ setns(2) でpod netnsに入る      │
+  ├────────────┼─────────────────────────────────┤
+  │ SYS_PTRACE │ /proc/<pid>/ns/net へのアクセス │
+  └────────────┴─────────────────────────────────┘
+
+  privileged: true（全capability）と比べ、引き続き大幅に制限された権限になっています。
+
+✻ Brewed for 1m 2s
+```

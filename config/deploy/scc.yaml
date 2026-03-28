@@ -15,9 +15,12 @@ allowHostNetwork: true
 allowHostPorts: false
 # NET_ADMIN is required for tc/netem operations.
 # SYS_ADMIN is required for netlink and network namespace (setns) operations.
+# SYS_PTRACE is required to pass the kernel's ptrace_may_access() check when
+# opening /proc/<pid>/ns/net for containers running as a different UID.
 allowedCapabilities:
   - NET_ADMIN
   - SYS_ADMIN
+  - SYS_PTRACE
 defaultAddCapabilities: []
 requiredDropCapabilities: []
 # Must run as root: setns(2) requires UID 0 or CAP_SYS_ADMIN.
