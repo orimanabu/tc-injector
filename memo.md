@@ -5184,3 +5184,29 @@ directory
 
 ✻ Worked for 1m 8s
 ```
+
+```
+❯ Reconcile()の中で、statusアップデート時のconflict回避のため5回ループを回しています。このループを回す際、attemptごとに100msほどウェイトを入れることはできますか
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+⏺ time パッケージのインポート状況を確認します。
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ time は既にインポートされています。ウェイトを追加します。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 3 lines
+      226        })
+      227      }
+      228      for attempt := 0; attempt < 5; attempt++ {
+      229 +      if attempt > 0 {
+      230 +        time.Sleep(100 * time.Millisecond)
+      231 +      }
+      232        injector := &tcv1alpha1.TCInjector{}
+      233        if err := r.Get(ctx, req.NamespacedName, injector); err != nil {
+      234          logger.Error(err, "failed to get TCInjector for status update")
+
+⏺ 初回は即時実行し、2回目以降のリトライ前に100msスリープするようにしました。time パッケージは既にインポート済みのため追加変更は不要です。
+```

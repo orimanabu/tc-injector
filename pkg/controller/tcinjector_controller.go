@@ -226,6 +226,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			})
 		}
 		for attempt := 0; attempt < 5; attempt++ {
+			if attempt > 0 {
+				time.Sleep(100 * time.Millisecond)
+			}
 			injector := &tcv1alpha1.TCInjector{}
 			if err := r.Get(ctx, req.NamespacedName, injector); err != nil {
 				logger.Error(err, "failed to get TCInjector for status update")
