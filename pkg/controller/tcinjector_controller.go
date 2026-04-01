@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -197,9 +198,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				} else {
 					delayMs = tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
 				}
+				multusIfaces := resolveMultusInterfaces(logger, &pod, rule.MultusNetworks)
+				if len(rule.MultusNetworks) > 0 && len(multusIfaces) == 0 {
+					logger.Info("no multus interfaces resolved for pod; check annotation and NAD names",
+						"pod", pod.Name, "namespace", pod.Namespace,
+						"multusNetworks", rule.MultusNetworks)
+				}
 				desired[uid] = desiredPodState{
 					delayMs:          delayMs,
-					multusInterfaces: resolveMultusInterfaces(&pod, rule.MultusNetworks),
+					multusInterfaces: multusIfaces,
 				}
 			}
 		}
@@ -480,17 +487,28 @@ func (r *Reconciler) podToTCInjector(ctx context.Context, obj client.Object) []r
 
 // resolveMultusInterfaces parses the Multus networks-status annotation on the pod and
 // returns the interfaces that match any of the requested NAD names.
-func resolveMultusInterfaces(pod *corev1.Pod, nadNames []string) []multusDesiredIface {
+// It logs the reason when no interfaces are resolved so operators can diagnose mismatches.
+func resolveMultusInterfaces(logger logr.Logger, pod *corev1.Pod, nadNames []string) []multusDesiredIface {
 	if len(nadNames) == 0 {
 		return nil
 	}
 	raw := pod.Annotations[multusNetworkStatusAnnotation]
 	if raw == "" {
+		logger.Info("multus networks-status annotation absent on pod; cannot resolve multus interfaces",
+			"pod", pod.Name, "namespace", pod.Namespace,
+			"annotation", multusNetworkStatusAnnotation)
 		return nil
 	}
 	var statuses []multusNetworkStatus
 	if err := json.Unmarshal([]byte(raw), &statuses); err != nil {
+		logger.Error(err, "failed to parse multus networks-status annotation",
+			"pod", pod.Name, "namespace", pod.Namespace)
 		return nil
+	}
+	// Collect the NAD names present in the annotation for diagnostic logging.
+	annotationNames := make([]string, 0, len(statuses))
+	for _, s := range statuses {
+		annotationNames = append(annotationNames, s.Name)
 	}
 	var result []multusDesiredIface
 	for _, s := range statuses {
@@ -499,6 +517,8 @@ func resolveMultusInterfaces(pod *corev1.Pod, nadNames []string) []multusDesired
 		}
 		for _, nadName := range nadNames {
 			if nadMatches(s.Name, nadName) {
+				logger.V(1).Info("multus interface resolved",
+					"pod", pod.Name, "nad", s.Name, "iface", s.Interface)
 				result = append(result, multusDesiredIface{
 					nadName:   s.Name,
 					ifaceName: s.Interface,
@@ -506,6 +526,11 @@ func resolveMultusInterfaces(pod *corev1.Pod, nadNames []string) []multusDesired
 				break
 			}
 		}
+	}
+	if len(result) == 0 {
+		logger.Info("no multus annotation entries matched the requested NAD names",
+			"pod", pod.Name, "namespace", pod.Namespace,
+			"requested", nadNames, "annotationNames", annotationNames)
 	}
 	return result
 }

@@ -6422,3 +6422,222 @@ directory
 
 ✻ Churned for 52s
 ```
+
+```
+❯ multusネットワークでマッチしているのに、Podデフォルトネットワーク側のインターフェースにtc delayが挿入されてしまいました。原因を調査してください。
+- TCInjectorの設定
+```
+    - selector:
+        matchLabels:
+          app: multus-ipvlan
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: tmp
+      minDelay: 600
+      maxDelay: 700
+      multusNetworks:
+        - tmp/nad-ipvlan-1
+```
+- TCInjectorのStatus (multusネットワークでマッチしているのにPodデフォルトネットワーク側のインターフェースに対してtcを実行している)
+```
+  - delayMs: 659
+    interface: 6af924439fdb769
+    interfaceIndex: 3645
+    namespace: tmp
+    nodeName: wk3
+    podName: ipvlan-1
+    tcCommand: 'tc qdisc replace dev 6af924439fdb769 root handle 1: netem delay 659ms'
+```
+
+⏺ コードをトレースして原因を特定します。
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ 根本原因を特定しました。
+
+  原因
+
+  resolveMultusInterfaces 関数が nil を返す 3つの失敗パスでログが一切出力されない設計になっています。
+
+  func resolveMultusInterfaces(pod *corev1.Pod, nadNames []string) []multusDesiredIface {
+      raw := pod.Annotations[multusNetworkStatusAnnotation]
+      if raw == "" {
+          return nil          // ← ログなし
+      }
+      if err := json.Unmarshal([]byte(raw), &statuses); err != nil {
+          return nil          // ← ログなし
+      }
+      // ... NADがマッチしなくても return result (空)でログなし
+  }
+
+  この関数が空を返したとき、呼び出し側では des.multusInterfaces が空になります。すると multusIfaceSetsEqual(nil, nil, ...) が true を返し、以降の reconcile では Multus
+  インターフェース処理ループに入らず、ログも出ないまま Primary インターフェースだけが inject されます。
+
+  ユーザーが観察した症状「エラーなくプライマリだけ適用される」と一致しています。
+
+  失敗しうる原因として以下の3つが考えられます：
+
+  1. アノテーションが存在しない — Pod がまだ Multus の k8s.v1.cni.cncf.io/networks-status アノテーションを持っていない
+  2. JSON パース失敗 — アノテーションの形式が想定外
+  3. NAD 名のフォーマット不一致 — アノテーションの name フィールドが tmp/nad-ipvlan-1 でなく nad-ipvlan-1（名前空間なし）になっている可能性がある
+
+  3番目が最も疑わしいです。Multus のバージョンや NAD の参照方法によって、アノテーションの name フィールドは namespace/name 形式になる場合と name
+  のみになる場合があります。ユーザーが tmp/nad-ipvlan-1 を指定したとき、アノテーション側が nad-ipvlan-1 だと nadMatches が false
+  を返します（逆方向の部分一致は実装されていません）。
+
+  修正
+
+  各失敗パスに明示的なログを追加し、原因を特定可能にします。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 1 line
+       9    "sync"
+      10    "time"
+      11
+      12 +  "github.com/go-logr/logr"
+      13    corev1 "k8s.io/api/core/v1"
+      14    "k8s.io/apimachinery/pkg/api/errors"
+      15    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+⏺ 次に resolveMultusInterfaces の呼び出し側と関数本体を更新します。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 7 lines, removed 1 line
+      198          } else {
+      199            delayMs = tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+      200          }
+      201 +        multusIfaces := resolveMultusInterfaces(logger, &pod, rule.MultusNetworks)
+      202 +        if len(rule.MultusNetworks) > 0 && len(multusIfaces) == 0 {
+      203 +          logger.Info("no multus interfaces resolved for pod; check annotation and NAD names",
+      204 +            "pod", pod.Name, "namespace", pod.Namespace,
+      205 +            "multusNetworks", rule.MultusNetworks)
+      206 +        }
+      207          desired[uid] = desiredPodState{
+      208            delayMs:          delayMs,
+      203 -          multusInterfaces: resolveMultusInterfaces(&pod, rule.MultusNetworks),
+      209 +          multusInterfaces: multusIfaces,
+      210          }
+      211        }
+      212      }
+  ⎿  Found 2 new diagnostic issues in 2 files (ctrl+o to expand)
+
+⏺ resolveMultusInterfaces にロガーを渡して各失敗パスにログを追加します。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 19 lines, removed 1 line
+      487
+      488  // resolveMultusInterfaces parses the Multus networks-status annotation on the pod and
+      489  // returns the interfaces that match any of the requested NAD names.
+      490 -func resolveMultusInterfaces(pod *corev1.Pod, nadNames []string) []multusDesiredIface {
+      490 +// It logs the reason when no interfaces are resolved so operators can diagnose mismatches.
+      491 +func resolveMultusInterfaces(logger logr.Logger, pod *corev1.Pod, nadNames []string) []multusDesiredIface {
+      492    if len(nadNames) == 0 {
+      493      return nil
+      494    }
+      495    raw := pod.Annotations[multusNetworkStatusAnnotation]
+      496    if raw == "" {
+      497 +    logger.Info("multus networks-status annotation absent on pod; cannot resolve multus interfaces",
+      498 +      "pod", pod.Name, "namespace", pod.Namespace,
+      499 +      "annotation", multusNetworkStatusAnnotation)
+      500      return nil
+      501    }
+      502    var statuses []multusNetworkStatus
+      503    if err := json.Unmarshal([]byte(raw), &statuses); err != nil {
+      504 +    logger.Error(err, "failed to parse multus networks-status annotation",
+      505 +      "pod", pod.Name, "namespace", pod.Namespace)
+      506      return nil
+      507    }
+      508 +  // Collect the NAD names present in the annotation for diagnostic logging.
+      509 +  annotationNames := make([]string, 0, len(statuses))
+      510 +  for _, s := range statuses {
+      511 +    annotationNames = append(annotationNames, s.Name)
+      512 +  }
+      513    var result []multusDesiredIface
+      514    for _, s := range statuses {
+      515      if s.Interface == "" {
+     ...
+      517      }
+      518      for _, nadName := range nadNames {
+      519        if nadMatches(s.Name, nadName) {
+      520 +        logger.V(1).Info("multus interface resolved",
+      521 +          "pod", pod.Name, "nad", s.Name, "iface", s.Interface)
+      522          result = append(result, multusDesiredIface{
+      523            nadName:   s.Name,
+      524            ifaceName: s.Interface,
+     ...
+      527        }
+      528      }
+      529    }
+      530 +  if len(result) == 0 {
+      531 +    logger.Info("no multus annotation entries matched the requested NAD names",
+      532 +      "pod", pod.Name, "namespace", pod.Namespace,
+      533 +      "requested", nadNames, "annotationNames", annotationNames)
+      534 +  }
+      535    return result
+      536  }
+      537
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ Bash(go build ./... 2>&1)
+  ⎿  (No output)
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ Bash(go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       0.662s
+     … +2 lines (ctrl+o to expand)
+
+⏺ ビルド・テスト通りました。go.mod の direct 依存指定も整理します。
+
+⏺ Bash(go mod tidy 2>&1)
+  ⎿  (No output)
+
+⏺ ---
+  調査結果まとめ
+
+  根本原因
+
+  resolveMultusInterfaces 関数が 3つの失敗パスで一切ログを出さずに nil を返す設計になっていました。
+
+  multusNetworks が指定されている
+          ↓
+  resolveMultusInterfaces() が nil を返す  ← ここで silent failure
+          ↓
+  des.multusInterfaces が空
+          ↓
+  Multus インターフェース処理ループに一度も入らない
+          ↓
+  Primary インターフェースだけが inject される（ログもエラーもなし）
+
+  3つの silent failure パス：
+
+  ┌──────┬───────────────────────────────────────────────────────────────┬───────────────────────────────────────────────────────────────────┐
+  │ パス │                             条件                              │                           修正後のログ                            │
+  ├──────┼───────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
+  │ 1    │ k8s.v1.cni.cncf.io/networks-status アノテーションが存在しない │ INFO multus networks-status annotation absent on pod              │
+  ├──────┼───────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
+  │ 2    │ アノテーションの JSON パースに失敗                            │ ERROR failed to parse multus networks-status annotation           │
+  ├──────┼───────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
+  │ 3    │ アノテーションは存在するが NAD 名がマッチしない               │ INFO no multus annotation entries matched the requested NAD names │
+  └──────┴───────────────────────────────────────────────────────────────┴───────────────────────────────────────────────────────────────────┘
+
+  最も疑わしい直接原因 (パス 3)
+
+  Multus のバージョンや NAD の参照方法によって、アノテーションの name フィールドは namespace/name 形式（例: tmp/nad-ipvlan-1）になる場合と name のみ（例:
+  nad-ipvlan-1）になる場合があります。
+
+  ユーザーが tmp/nad-ipvlan-1 を指定した場合、アノテーション側が nad-ipvlan-1 だと nadMatches が false を返します（ユーザー指定に /
+  が含まれる場合、部分一致ロジックが動作しないため）。
+
+  修正後のログで原因特定する方法
+
+  デプロイ後、tc-injector の Pod ログで以下を確認してください：
+
+  kubectl logs -n tc-injector-system -l app=tc-injector | grep "multus"
+
+  - "multus networks-status annotation absent" → Pod にアノテーション自体がない（Multus が未起動など）
+  - "no multus annotation entries matched" → アノテーションはあるが NAD 名が不一致。出力される annotationNames の値と multusNetworks の指定を比較してください
+
+✻ Cogitated for 5m 43s
+```
