@@ -73,12 +73,12 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           volumeMounts:
-            # containerd socket (present on containerd nodes).
-            - name: containerd-socket
-              mountPath: /run/containerd/containerd.sock
-            # CRI-O socket (present on CRI-O nodes).
-            - name: crio-socket
-              mountPath: /run/crio/crio.sock
+            # containerd socket directory (present on containerd nodes).
+            - name: containerd-socket-dir
+              mountPath: /run/containerd
+            # CRI-O socket directory (present on CRI-O nodes).
+            - name: crio-socket-dir
+              mountPath: /run/crio
             # Host /proc lets us open /proc/<pid>/ns/net for any container.
             - name: host-proc
               mountPath: /proc
@@ -89,14 +89,14 @@ spec:
               mountPath: /var/run/netns
               mountPropagation: HostToContainer
       volumes:
-        - name: containerd-socket
+        - name: containerd-socket-dir
           hostPath:
-            path: /run/containerd/containerd.sock
-            type: FileOrCreate   # Non-existent on CRI-O nodes; harmless empty file.
-        - name: crio-socket
+            path: /run/containerd
+            type: DirectoryOrCreate   # Created as empty dir on CRI-O nodes where containerd is absent.
+        - name: crio-socket-dir
           hostPath:
-            path: /run/crio/crio.sock
-            type: FileOrCreate   # Non-existent on containerd nodes; harmless empty file.
+            path: /run/crio
+            type: DirectoryOrCreate   # Created as empty dir on containerd nodes where CRI-O is absent.
         - name: host-proc
           hostPath:
             path: /proc

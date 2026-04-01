@@ -5101,3 +5101,86 @@ permission denied"}
 
   何かあればお気軽にどうぞ。
 ```
+
+```
+❯ OpenShift環境にdaemonset.yamlをoc applyすると、下記のエラーになりました。修正できますか
+  Warning  FailedMount  1s (x7 over 33s)  kubelet            MountVolume.SetUp failed for volume "containerd-socket" : open /run/containerd/containerd.sock: no such file or
+directory
+  Warning  FailedMount  1s (x7 over 33s)  kubelet            MountVolume.SetUp failed for volume "crio-socket" : hostPath type check failed: /run/crio/crio.sock is not a file
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ エラーの原因は2つです:
+
+  1. containerd-socket: OpenShiftはCRI-Oを使うため /run/containerd/ ディレクトリ自体が存在せず、FileOrCreate がファイルを作成できない
+  2. crio-socket: /run/crio/crio.sock はUnixソケットであり通常ファイルではないため、FileOrCreate の型チェックが失敗する
+
+  ソケットファイルではなく親ディレクトリをマウントするように変更します。これにより、存在しないディレクトリは DirectoryOrCreate
+  で空ディレクトリとして作成され、存在するディレクトリ（CRI-Oなら /run/crio/）はソケットごとマウントされます。
+
+⏺ Update(config/deploy/daemonset.yaml)
+  ⎿  Added 12 lines, removed 12 lines
+      73              initialDelaySeconds: 5
+      74              periodSeconds: 10
+      75            volumeMounts:
+      76 -            # containerd socket (present on containerd nodes).
+      77 -            - name: containerd-socket
+      78 -              mountPath: /run/containerd/containerd.sock
+      79 -            # CRI-O socket (present on CRI-O nodes).
+      80 -            - name: crio-socket
+      81 -              mountPath: /run/crio/crio.sock
+      76 +            # containerd socket directory (present on containerd nodes).
+      77 +            - name: containerd-socket-dir
+      78 +              mountPath: /run/containerd
+      79 +            # CRI-O socket directory (present on CRI-O nodes).
+      80 +            - name: crio-socket-dir
+      81 +              mountPath: /run/crio
+      82              # Host /proc lets us open /proc/<pid>/ns/net for any container.
+      83              - name: host-proc
+      84                mountPath: /proc
+     ...
+       89                mountPath: /var/run/netns
+       90                mountPropagation: HostToContainer
+       91        volumes:
+       92 -        - name: containerd-socket
+       92 +        - name: containerd-socket-dir
+       93            hostPath:
+       94 -            path: /run/containerd/containerd.sock
+       95 -            type: FileOrCreate   # Non-existent on CRI-O nodes; harmless empty file.
+       96 -        - name: crio-socket
+       94 +            path: /run/containerd
+       95 +            type: DirectoryOrCreate   # Created as empty dir on CRI-O nodes where containerd is absent.
+       96 +        - name: crio-socket-dir
+       97            hostPath:
+       98 -            path: /run/crio/crio.sock
+       99 -            type: FileOrCreate   # Non-existent on containerd nodes; harmless empty file.
+       98 +            path: /run/crio
+       99 +            type: DirectoryOrCreate   # Created as empty dir on containerd nodes where CRI-O is absent.
+      100          - name: host-proc
+      101            hostPath:
+      102              path: /proc
+
+⏺ 変更内容を確認します。
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ 修正内容のまとめ:
+
+  ┌─────────────────────────────────────────────────────────────┬─────────────────────────────────────────┐
+  │                           変更前                            │                 変更後                  │
+  ├─────────────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ ソケットファイル /run/containerd/containerd.sock をマウント │ ディレクトリ /run/containerd をマウント │
+  ├─────────────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ ソケットファイル /run/crio/crio.sock をマウント             │ ディレクトリ /run/crio をマウント       │
+  ├─────────────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ type: FileOrCreate                                          │ type: DirectoryOrCreate                 │
+  └─────────────────────────────────────────────────────────────┴─────────────────────────────────────────┘
+
+  なぜこれで直るか:
+
+  - FileOrCreate はUnixソケットを通常ファイルと見なさず型チェックで失敗し、親ディレクトリが存在しない場合はファイル作成も失敗する
+  - DirectoryOrCreate はディレクトリが存在すればそのまま使い、存在しなければ空ディレクトリを作成するため、どちらのランタイムが使われていても失敗しない
+  - コンテナ内からは引き続き /run/crio/crio.sock や /run/containerd/containerd.sock として同じパスでアクセスできるため、アプリケーションの変更は不要
+
+✻ Worked for 1m 8s
+```
