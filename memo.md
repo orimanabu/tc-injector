@@ -6373,3 +6373,52 @@ directory
 
 ✻ Cogitated for 1m 52s
 ```
+
+```
+❯ logおよびtcinjectorのstatusにおいて、multusインターフェースに対してnsenterを使ってtcを設定していることがわかるように記録してください
+
+⏺ 現在のコードを確認します。
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ ログで tcCmd フィールドが漏れています。プライマリインターフェースのログ (line 270) では "tcCmd", newTCCmd を記録しているのに、Multus (line 324) では省略されています。Status の
+  TCCommand フィールドには既に nsenter コマンドが入っているので、ログのみ修正します。
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 2 lines, removed 1 line
+      322          continue
+      323        }
+      324        logger.Info("applying multus tc delay", "pod", pod.Name,
+      325 -        "nad", dmi.nadName, "iface", dmi.ifaceName, "delayMs", des.delayMs)
+      325 +        "nad", dmi.nadName, "iface", dmi.ifaceName, "delayMs", des.delayMs,
+      326 +        "tcCmd", miCmd)
+      327        newMultus = append(newMultus, multusInjectedState{
+      328          nadName:   dmi.nadName,
+      329          ifaceName: dmi.ifaceName,
+
+⏺ Bash(go build ./... && go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       0.710s
+     … +2 lines (ctrl+o to expand)
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ 変更後の動作を整理します。
+
+  ログ — 適用時に nsenter コマンドが明示されます:
+  INFO  applying multus tc delay  pod=worker-abc  nad=default/mynetwork  iface=net1  delayMs=37  tcCmd="nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev net1 root handle 1:
+  netem delay 37ms"
+
+  Status — status.injectedPodDetails[].multusInterfaces[].tcCommand には既に nsenter コマンド全文が入っていたので変更なしです:
+  multusInterfaces:
+    - nadName: default/mynetwork
+      interface: net1
+      delayMs: 37
+      tcCommand: "nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 37ms"
+
+  これでログ・Status の両方から、Multus インターフェースへの tc 設定が nsenter 経由であることが確認できます。
+
+✻ Churned for 52s
+```

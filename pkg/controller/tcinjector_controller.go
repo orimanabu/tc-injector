@@ -322,7 +322,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				continue
 			}
 			logger.Info("applying multus tc delay", "pod", pod.Name,
-				"nad", dmi.nadName, "iface", dmi.ifaceName, "delayMs", des.delayMs)
+				"nad", dmi.nadName, "iface", dmi.ifaceName, "delayMs", des.delayMs,
+				"tcCmd", miCmd)
 			newMultus = append(newMultus, multusInjectedState{
 				nadName:   dmi.nadName,
 				ifaceName: dmi.ifaceName,
