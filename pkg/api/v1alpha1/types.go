@@ -50,10 +50,16 @@ type DelayRule struct {
 	// MultusNetworks is an optional list of NetworkAttachmentDefinition names whose
 	// pod-side interfaces should also receive delay injection.
 	// Each entry may be "name" (matches any namespace) or "namespace/name" (exact match).
-	// Interfaces are resolved via the k8s.v1.cni.cncf.io/networks-status pod annotation.
+	// Interfaces are resolved via the k8s.v1.cni.cncf.io/network-status pod annotation.
 	// If empty, only the primary interface is targeted.
 	// +optional
 	MultusNetworks []string `json:"multusNetworks,omitempty"`
+	// InjectPrimaryInterface controls whether delay is injected on the pod's primary
+	// interface (eth0). Defaults to true for backward compatibility.
+	// Set to false when delay should be applied only to interfaces listed in MultusNetworks.
+	// +optional
+	// +kubebuilder:default=true
+	InjectPrimaryInterface *bool `json:"injectPrimaryInterface,omitempty"`
 }
 
 // InjectedInterfaceStatus describes a tc rule applied to a Multus-managed interface.

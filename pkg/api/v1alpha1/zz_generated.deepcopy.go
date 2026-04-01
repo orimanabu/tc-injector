@@ -171,6 +171,11 @@ func (in *DelayRule) DeepCopyInto(out *DelayRule) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.InjectPrimaryInterface != nil {
+		in, out := &in.InjectPrimaryInterface, &out.InjectPrimaryInterface
+		*out = new(bool)
+		**out = **in
+	}
 }
 
 // DeepCopy returns a deep copy of this DelayRule.

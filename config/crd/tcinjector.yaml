@@ -108,10 +108,17 @@ spec:
                           Optional list of NetworkAttachmentDefinition names whose pod-side
                           interfaces also receive delay injection. Each entry may be "name"
                           (matches any namespace) or "namespace/name" (exact match).
-                          Interfaces are resolved via the k8s.v1.cni.cncf.io/networks-status
+                          Interfaces are resolved via the k8s.v1.cni.cncf.io/network-status
                           pod annotation. If omitted, only the primary interface is targeted.
                         items:
                           type: string
+                      injectPrimaryInterface:
+                        type: boolean
+                        default: true
+                        description: >
+                          When false, skip tc delay injection on the pod's primary interface
+                          (eth0/veth). Use this to inject delay only on interfaces listed in
+                          multusNetworks. Defaults to true for backward compatibility.
             status:
               type: object
               properties:
