@@ -80,6 +80,17 @@ func (f *Finder) Close() error {
 	return f.conn.Close()
 }
 
+// FindNetnsPath returns the /proc/<pid>/ns/net path for the given container.
+// The path can be passed to nsenter(1) to run commands inside the pod's network namespace.
+// containerID should be in the form "containerd://<id>" or "cri-o://<id>".
+func (f *Finder) FindNetnsPath(ctx context.Context, containerID string) (string, error) {
+	id := stripRuntimePrefix(containerID)
+	if id == "" {
+		return "", fmt.Errorf("empty container ID after stripping runtime prefix: %q", containerID)
+	}
+	return f.resolveNetnsPath(ctx, id)
+}
+
 // FindHostVeth returns the host-side veth interface name and ifindex for the
 // pod container. containerID should be in the form "containerd://<id>" or
 // "cri-o://<id>" as stored in pod status.

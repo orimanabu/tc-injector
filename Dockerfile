@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 # Runtime image — must include iproute for the tc(8) binary.
 FROM quay.io/centos/centos:stream10-minimal
 
-RUN microdnf install -y iproute iproute-tc && microdnf clean all
+RUN microdnf install -y iproute iproute-tc util-linux && microdnf clean all
 
 COPY --from=builder /tc-injector /tc-injector
 

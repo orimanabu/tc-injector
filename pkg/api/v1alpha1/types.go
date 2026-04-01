@@ -47,6 +47,26 @@ type DelayRule struct {
 	// MaxDelay is the maximum delay in milliseconds. Must be >= MinDelay.
 	// +kubebuilder:validation:Minimum=0
 	MaxDelay int32 `json:"maxDelay"`
+	// MultusNetworks is an optional list of NetworkAttachmentDefinition names whose
+	// pod-side interfaces should also receive delay injection.
+	// Each entry may be "name" (matches any namespace) or "namespace/name" (exact match).
+	// Interfaces are resolved via the k8s.v1.cni.cncf.io/networks-status pod annotation.
+	// If empty, only the primary interface is targeted.
+	// +optional
+	MultusNetworks []string `json:"multusNetworks,omitempty"`
+}
+
+// InjectedInterfaceStatus describes a tc rule applied to a Multus-managed interface.
+type InjectedInterfaceStatus struct {
+	// NADName is the NetworkAttachmentDefinition identifier (namespace/name) as reported
+	// by the Multus annotation.
+	NADName string `json:"nadName"`
+	// Interface is the name of the interface inside the pod (e.g. net1).
+	Interface string `json:"interface"`
+	// DelayMs is the injected delay in milliseconds.
+	DelayMs int32 `json:"delayMs"`
+	// TCCommand is the tc command line that was applied.
+	TCCommand string `json:"tcCommand"`
 }
 
 // InjectedPodStatus describes the tc rule currently applied to a single pod.
@@ -65,6 +85,9 @@ type InjectedPodStatus struct {
 	DelayMs int32 `json:"delayMs"`
 	// TCCommand is the tc command line that was applied.
 	TCCommand string `json:"tcCommand"`
+	// MultusInterfaces lists tc rules applied to Multus-managed interfaces of this pod.
+	// +optional
+	MultusInterfaces []InjectedInterfaceStatus `json:"multusInterfaces,omitempty"`
 }
 
 // TCInjectorStatus reports current injection state.

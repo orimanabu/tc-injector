@@ -73,6 +73,62 @@ func Remove(iface string) error {
 	return nil
 }
 
+// ApplyInNetns installs or replaces a netem delay qdisc on iface inside the
+// network namespace identified by netnsPath (a /proc/<pid>/ns/net path).
+// It runs tc(8) via nsenter(1) and returns the command string that was executed.
+// Calling ApplyInNetns on an interface that already has a rule replaces it atomically.
+func ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error) {
+	if err := validateIface(iface); err != nil {
+		return "", err
+	}
+	delay := fmt.Sprintf("%dms", delayMs)
+	replaceArgs := []string{
+		"--net=" + netnsPath, "--",
+		"tc", "qdisc", "replace", "dev", iface,
+		"root", "handle", "1:", "netem", "delay", delay,
+	}
+	tcCmd := fmt.Sprintf("nsenter --net=%s -- tc qdisc replace dev %s root handle 1: netem delay %s",
+		netnsPath, iface, delay)
+	if out, err := runCmd("nsenter", replaceArgs...); err != nil {
+		// replace fails on a pristine interface; fall back to add.
+		addArgs := []string{
+			"--net=" + netnsPath, "--",
+			"tc", "qdisc", "add", "dev", iface,
+			"root", "handle", "1:", "netem", "delay", delay,
+		}
+		tcCmd = fmt.Sprintf("nsenter --net=%s -- tc qdisc add dev %s root handle 1: netem delay %s",
+			netnsPath, iface, delay)
+		if out2, err2 := runCmd("nsenter", addArgs...); err2 != nil {
+			return "", fmt.Errorf("tc qdisc add/replace on %s in netns %s: %w (replace output: %s, add output: %s)",
+				iface, netnsPath, err2, out, out2)
+		}
+	}
+	return tcCmd, nil
+}
+
+// RemoveInNetns deletes the root qdisc from iface inside the given network namespace.
+// It tolerates errors when the namespace or interface no longer exists (e.g. the pod
+// has been deleted), making it safe to call during pod cleanup.
+func RemoveInNetns(netnsPath, iface string) error {
+	if err := validateIface(iface); err != nil {
+		return err
+	}
+	args := []string{
+		"--net=" + netnsPath, "--",
+		"tc", "qdisc", "del", "dev", iface, "root",
+	}
+	if out, err := runCmd("nsenter", args...); err != nil {
+		// Tolerate: qdisc absent, netns already gone (pod deleted), or interface missing.
+		if strings.Contains(out, "RTNETLINK") ||
+			strings.Contains(out, "No such") ||
+			strings.Contains(out, "Cannot open network namespace") {
+			return nil
+		}
+		return fmt.Errorf("tc qdisc del on %s in netns %s: %w (output: %s)", iface, netnsPath, err, out)
+	}
+	return nil
+}
+
 // Show returns the current tc qdisc configuration for an interface.
 func Show(iface string) (string, error) {
 	if err := validateIface(iface); err != nil {

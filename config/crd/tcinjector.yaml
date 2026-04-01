@@ -102,6 +102,16 @@ spec:
                         format: int32
                         minimum: 0
                         description: Maximum delay in milliseconds. Must be >= minDelay.
+                      multusNetworks:
+                        type: array
+                        description: >
+                          Optional list of NetworkAttachmentDefinition names whose pod-side
+                          interfaces also receive delay injection. Each entry may be "name"
+                          (matches any namespace) or "namespace/name" (exact match).
+                          Interfaces are resolved via the k8s.v1.cni.cncf.io/networks-status
+                          pod annotation. If omitted, only the primary interface is targeted.
+                        items:
+                          type: string
             status:
               type: object
               properties:
@@ -138,6 +148,26 @@ spec:
                       tcCommand:
                         type: string
                         description: The tc command line that was applied.
+                      multusInterfaces:
+                        type: array
+                        description: tc rules applied to Multus-managed interfaces of this pod.
+                        items:
+                          type: object
+                          required: [nadName, interface, delayMs, tcCommand]
+                          properties:
+                            nadName:
+                              type: string
+                              description: NetworkAttachmentDefinition identifier (namespace/name) from the Multus annotation.
+                            interface:
+                              type: string
+                              description: Interface name inside the pod (e.g. net1).
+                            delayMs:
+                              type: integer
+                              format: int32
+                              description: Injected delay in milliseconds.
+                            tcCommand:
+                              type: string
+                              description: The tc command line that was applied.
                 conditions:
                   type: array
                   items:

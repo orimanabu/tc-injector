@@ -95,8 +95,29 @@ func (in *TCInjectorSpec) DeepCopy() *TCInjectorSpec {
 
 // DeepCopyInto copies all properties of this object into another object of the
 // same type that is provided as a pointer.
+func (in *InjectedInterfaceStatus) DeepCopyInto(out *InjectedInterfaceStatus) {
+	*out = *in
+}
+
+// DeepCopy returns a deep copy of this InjectedInterfaceStatus.
+func (in *InjectedInterfaceStatus) DeepCopy() *InjectedInterfaceStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(InjectedInterfaceStatus)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto copies all properties of this object into another object of the
+// same type that is provided as a pointer.
 func (in *InjectedPodStatus) DeepCopyInto(out *InjectedPodStatus) {
 	*out = *in
+	if in.MultusInterfaces != nil {
+		in, out := &in.MultusInterfaces, &out.MultusInterfaces
+		*out = make([]InjectedInterfaceStatus, len(*in))
+		copy(*out, *in)
+	}
 }
 
 // DeepCopy returns a deep copy of this InjectedPodStatus.
@@ -116,7 +137,9 @@ func (in *TCInjectorStatus) DeepCopyInto(out *TCInjectorStatus) {
 	if in.InjectedPodDetails != nil {
 		in, out := &in.InjectedPodDetails, &out.InjectedPodDetails
 		*out = make([]InjectedPodStatus, len(*in))
-		copy(*out, *in)
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
 	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
@@ -143,6 +166,11 @@ func (in *DelayRule) DeepCopyInto(out *DelayRule) {
 	*out = *in
 	in.Selector.DeepCopyInto(&out.Selector)
 	in.NamespaceSelector.DeepCopyInto(&out.NamespaceSelector)
+	if in.MultusNetworks != nil {
+		in, out := &in.MultusNetworks, &out.MultusNetworks
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 }
 
 // DeepCopy returns a deep copy of this DelayRule.

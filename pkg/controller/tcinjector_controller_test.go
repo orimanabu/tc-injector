@@ -21,10 +21,12 @@ import (
 
 // ---- fakes ----
 
-// fakeVethFinder maps containerID -> interface name. Returns an error for unknown IDs.
+// fakeVethFinder maps containerID -> interface name and containerID -> netns path.
+// Returns an error for unknown IDs.
 type fakeVethFinder struct {
-	mu      sync.Mutex
-	mapping map[string]string
+	mu           sync.Mutex
+	mapping      map[string]string // containerID -> host-side veth iface name
+	netnsMapping map[string]string // containerID -> netns path
 }
 
 func newFakeVethFinder(m map[string]string) *fakeVethFinder {
@@ -40,17 +42,31 @@ func (f *fakeVethFinder) FindHostVeth(_ context.Context, containerID string) (st
 	return "", 0, fmt.Errorf("no veth mapping for container %q", containerID)
 }
 
-// fakeTCApplier records Apply and Remove calls.
+func (f *fakeVethFinder) FindNetnsPath(_ context.Context, containerID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if path, ok := f.netnsMapping[containerID]; ok {
+		return path, nil
+	}
+	return "", fmt.Errorf("no netns mapping for container %q", containerID)
+}
+
+// fakeTCApplier records Apply, Remove, ApplyInNetns, and RemoveInNetns calls.
 type fakeTCApplier struct {
-	mu      sync.Mutex
-	applied map[string]int32  // iface -> last applied delayMs
-	removed []string
-	applyErr error
-	removeErr error
+	mu           sync.Mutex
+	applied      map[string]int32 // iface -> last applied delayMs (host iface)
+	appliedNetns map[string]int32 // "netnsPath:iface" -> last applied delayMs
+	removed      []string
+	removedNetns []string // "netnsPath:iface"
+	applyErr     error
+	removeErr    error
 }
 
 func newFakeTCApplier() *fakeTCApplier {
-	return &fakeTCApplier{applied: make(map[string]int32)}
+	return &fakeTCApplier{
+		applied:      make(map[string]int32),
+		appliedNetns: make(map[string]int32),
+	}
 }
 
 func (f *fakeTCApplier) Apply(iface string, delayMs int32) error {
@@ -74,10 +90,41 @@ func (f *fakeTCApplier) Remove(iface string) error {
 	return nil
 }
 
+func (f *fakeTCApplier) ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.applyErr != nil {
+		return "", f.applyErr
+	}
+	key := netnsPath + ":" + iface
+	f.appliedNetns[key] = delayMs
+	return fmt.Sprintf("nsenter --net=%s -- tc qdisc replace dev %s root handle 1: netem delay %dms",
+		netnsPath, iface, delayMs), nil
+}
+
+func (f *fakeTCApplier) RemoveInNetns(netnsPath, iface string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.removeErr != nil {
+		return f.removeErr
+	}
+	key := netnsPath + ":" + iface
+	delete(f.appliedNetns, key)
+	f.removedNetns = append(f.removedNetns, key)
+	return nil
+}
+
 func (f *fakeTCApplier) isApplied(iface string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	_, ok := f.applied[iface]
+	return ok
+}
+
+func (f *fakeTCApplier) isAppliedInNetns(netnsPath, iface string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.appliedNetns[netnsPath+":"+iface]
 	return ok
 }
 

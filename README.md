@@ -33,6 +33,20 @@ When the pod is deleted or no longer matches any rule, the qdisc is removed and 
 └─────────────────────────────────────────────────────────┘
 ```
 
+### Multus Interface Support
+
+When a rule specifies `multusNetworks`, tc-injector also injects delay into interfaces added by [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) (e.g. ipvlan secondary interfaces). Because Multus-managed interfaces (such as ipvlan slaves) exist only inside the pod's network namespace — unlike primary `veth` interfaces which have a host-side peer — the `tc` rule must be applied **inside** the pod's network namespace using `nsenter`.
+
+```
+# Primary interface (veth) — tc applied on host side (existing behavior)
+pod eth0  ←──peer──►  host vethXXXX  ←─[netem delay]
+
+# Multus interface (e.g. ipvlan) — tc applied inside pod netns
+pod net1 (ipvlan slave) ←─[netem delay, via nsenter]
+```
+
+Multus writes the list of attached interfaces and their NetworkAttachmentDefinition (NAD) names into the `k8s.v1.cni.cncf.io/networks-status` pod annotation. tc-injector reads this annotation to resolve which interface name inside the pod corresponds to each requested NAD.
+
 ### Rule Matching
 
 - Rules are evaluated in order; **the last matching rule wins**.
@@ -51,6 +65,7 @@ When `enablePeriodicDelayRotation: true` is set, the controller periodically re-
 - CRI: containerd or CRI-O
 - `tc` and `netem` kernel module available on nodes (`iproute2` package)
 - Cluster-admin privileges (required to apply CRD and RBAC)
+- (Optional) [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) for secondary interface injection
 
 ## Installation
 
@@ -118,6 +133,8 @@ spec:
           env: production
       minDelay: 10           # (required) Minimum delay in milliseconds (>= 0)
       maxDelay: 50           # (required) Maximum delay in milliseconds (>= minDelay)
+      multusNetworks:        # (optional) Multus NAD names to also inject delay into
+        - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
 
   # enablePeriodicDelayRotation re-randomizes delays within [minDelay, maxDelay]
   # at the interval specified by delayInterval.
@@ -139,6 +156,7 @@ spec:
 | `spec.rules[].namespaceSelector` | `LabelSelector` | No | Matches pods by their namespace's labels. Empty matches all namespaces. |
 | `spec.rules[].minDelay` | `int32` (ms) | Yes | Minimum delay (>= 0) |
 | `spec.rules[].maxDelay` | `int32` (ms) | Yes | Maximum delay (>= minDelay) |
+| `spec.rules[].multusNetworks` | `[]string` | No | Multus NAD names to inject delay into in addition to the primary interface. See [Multus interface targeting](#multus-interface-targeting). |
 | `spec.enablePeriodicDelayRotation` | `bool` | No | Periodically re-randomize delays. Default: `false` |
 | `spec.delayInterval` | `Duration` | No | Re-randomization interval. Default: `30s` |
 
@@ -250,6 +268,51 @@ spec:
       maxDelay: 200
 ```
 
+### Multus interface targeting
+
+Inject delay on both the primary interface (`eth0`) and a secondary interface attached by Multus (e.g. an ipvlan interface backed by the `mynetwork` NetworkAttachmentDefinition in the `default` namespace):
+
+```yaml
+apiVersion: tc-injector.setns.net/v1alpha1
+kind: TCInjector
+metadata:
+  name: multus-delay
+spec:
+  rules:
+    - selector:
+        matchLabels:
+          app: worker
+      minDelay: 20
+      maxDelay: 80
+      multusNetworks:
+        - default/mynetwork   # exact match: namespace/name
+        # - mynetwork         # name-only: matches "mynetwork" in any namespace
+```
+
+**How NAD names are matched** against the `k8s.v1.cni.cncf.io/networks-status` annotation:
+
+| Entry in `multusNetworks` | Matches annotation name |
+|---|---|
+| `default/mynetwork` | `default/mynetwork` (exact) |
+| `mynetwork` | `default/mynetwork`, `kube-system/mynetwork`, `mynetwork`, etc. |
+
+**Checking the applied rule** inside the pod network namespace:
+
+```bash
+# Find the target pod's PID on the node
+kubectl exec -n tc-injector-system <tc-injector-pod> -- \
+  cat /proc/$(pgrep -n -f <target-process>)/ns/net
+
+# Or inspect via nsenter directly on the node
+nsenter --net=/proc/<pid>/ns/net -- tc qdisc show dev net1
+```
+
+A successfully applied rule shows:
+
+```
+qdisc netem 1: root refcnt 2 limit 1000 delay 45ms
+```
+
 ## Verifying That tc Rules Are Applied
 
 ### 1. Check the TCInjector status
@@ -258,15 +321,28 @@ spec:
 kubectl get tcinjector <name> -o yaml
 ```
 
-Look for `status.injectedPods` (number of pods currently receiving delay on each node) and `status.conditions`:
+Look for `status.injectedPods` (number of pods currently receiving delay on each node) and `status.injectedPodDetails`:
 
 ```yaml
 status:
-  injectedPods: 3
+  injectedPods: 2
+  injectedPodDetails:
+    - nodeName: worker-1
+      namespace: default
+      podName: worker-abc
+      interface: veth1a2b3c       # host-side veth for eth0
+      interfaceIndex: 42
+      delayMs: 37
+      tcCommand: "tc qdisc replace dev veth1a2b3c root handle 1: netem delay 37ms"
+      multusInterfaces:           # present when multusNetworks is specified
+        - nadName: default/mynetwork
+          interface: net1         # interface name inside the pod
+          delayMs: 37
+          tcCommand: "nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 37ms"
   conditions:
-    - type: Ready
+    - type: worker-1
       status: "True"
-      message: "3 pod(s) injected on node worker-1"
+      message: "2 pod(s) injected on node worker-1"
 ```
 
 ### 2. Check the controller logs
@@ -329,13 +405,20 @@ The measured RTT increase should correspond to the injected delay (`minDelay`-`m
 | No `applying tc delay` in logs | Pod not ready | Ensure pod is `Running` with all containers ready |
 | Log shows injection but no measured delay | tc applied to wrong interface | Verify with `tc qdisc show dev <iface>` inside the DaemonSet pod |
 | Pod is not targeted despite matching labels | Namespace labels missing | Run `kubectl get namespace <ns> --show-labels` and add required labels |
+| Multus interface not injected (`multusInterfaces` empty in status) | Annotation missing or NAD name mismatch | Check the pod annotation and NAD name format (see below) |
+| Log shows `skipping multus interface: netns path unavailable` | CRI lookup failed | Check DaemonSet logs for the preceding error from `FindNetnsPath` |
 
 ```bash
 # Debug selector matching
 kubectl get pod <target-pod> -o jsonpath='{.metadata.labels}'
 kubectl get namespace <target-namespace> --show-labels
 kubectl get tcinjector <name> -o jsonpath='{.spec.rules}'
+
+# Debug Multus interface resolution
+kubectl get pod <target-pod> -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/networks-status}' | jq .
 ```
+
+The `networks-status` annotation lists all attached interfaces. Confirm the `name` field matches the entry in `multusNetworks`. For example, if the annotation shows `"name": "default/mynetwork"`, the rule should specify `multusNetworks: [default/mynetwork]` or `multusNetworks: [mynetwork]`.
 
 ## Uninstallation
 

@@ -34,3 +34,15 @@ spec:
             values: [platform, infra]
       minDelay: 5
       maxDelay: 30
+
+    # Add 20–80 ms delay on both the primary interface and a Multus-attached interface
+    # (NetworkAttachmentDefinition "mynetwork" in the "default" namespace).
+    # The NAD name may be specified as "default/mynetwork" (exact) or just "mynetwork"
+    # (matches that name in any namespace).
+    - selector:
+        matchLabels:
+          app: worker
+      minDelay: 20
+      maxDelay: 80
+      multusNetworks:
+        - default/mynetwork

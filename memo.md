@@ -5210,3 +5210,1166 @@ directory
 
 ⏺ 初回は即時実行し、2回目以降のリトライ前に100msスリープするようにしました。time パッケージは既にインポート済みのため追加変更は不要です。
 ```
+
+```
+❯ 今の実装はPodのプライマリインターフェース(eth0)が対象になっていますが、Multusで追加したインターフェースも対象に追加したいです。実装できそうか検討してください。MultusのCNIプラグ
+インは、もし想定が必要ならまずはipvlanを仮定してください
+
+⏺ Explore(Explore codebase structure)
+  ⎿  Done (16 tool uses · 48.9k tokens · 58s)
+  (ctrl+o to expand)
+
+⏺ コードベースを詳しく把握しました。現在の実装と Multus 対応の実現可能性を分析します。
+
+  現在の実装の仕組み
+
+  Pod (eth0) ←→ host-side veth (e.g. veth1a2b3c)
+                        ↑
+                tc qdisc をここに適用
+
+  1. CRI ソケット経由でコンテナの PID を取得
+  2. /proc/<pid>/ns/net で Pod のネットワーク名前空間に入る
+  3. Pod 内の veth の ParentIndex を辿って host-side veth の名前を取得
+  4. ホスト側の veth に tc qdisc netem を適用
+
+  Multus (ipvlan) との違い
+
+  # veth の場合
+  Pod netns: [eth0] ←peer→ [veth1a2b3c] :host netns
+                                  ↑ ここに tc を適用 (現状)
+
+  # ipvlan の場合
+  Pod netns: [net1 (ipvlan slave)] ←master→ [eth0/ens3] :host netns
+                  ↑ ここに tc を適用する必要がある          ↑ ここは全Pod共有なので使えない
+
+  ipvlan は slave が pod netns 側にあり、master は host netns 側で全 Pod 共有 のため、host 側の master に tc を当てると全 pod に影響してしまいます。そのため Pod の netns 内の
+  ipvlan slave に直接 tc を適用 する必要があります。
+
+  実現可能性と実装方針
+
+  技術的には実現可能です。 主な変更点は以下:
+
+  1. Multus インターフェースの特定方法
+
+  Pod に付与される Multus のアノテーションを読む:
+
+  k8s.v1.cni.cncf.io/networks-status: |
+    [
+      {"name":"cbr0","interface":"eth0","ips":["10.244.0.5"],...},
+      {"name":"mynet","interface":"net1","ips":["192.168.100.5"],...}  ← これ
+    ]
+
+  または Pod netns 内でリンク一覧を取得し LinkType() == "ipvlan" のものを拾う。
+
+  2. tc の適用方法
+
+  Pod netns 内で tc を実行する必要があります。nsenter を使う方法が最もシンプル:
+
+  nsenter --net=/proc/<pid>/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 50ms
+
+  3. 必要な実装変更
+
+  ┌───────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │         変更箇所          │                                                   内容                                                   │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ pkg/veth/finder.go        │ FindMultusInterfaces() を追加。Pod netns 内の ipvlan インターフェース一覧と netns パスを返す             │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ pkg/tc/tc.go              │ ApplyInNetns(netnsPath, iface, delayMs) を追加。nsenter 経由で pod netns 内に tc を適用                  │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ pkg/api/v1alpha1/types.go │ DelayRule に対象インターフェース種別を指定するフィールドを追加 (例: targetInterfaces: [primary, multus]) │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ pkg/controller/           │ reconcile ループを拡張して Multus インターフェースへの適用・状態管理を追加                               │
+  └───────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  4. 課題・考慮点
+
+  - tc バイナリ: 現在 DaemonSet イメージに iproute2 が入っているので nsenter も追加すれば OK
+  - netns の永続性: nsenter --net=/proc/<pid>/ns/net で PID ベースのアクセスは Pod 実行中は有効
+  - 状態管理: injectedState を拡張して netns ベースのルールを追跡する必要がある
+  - 削除処理: Pod 削除時に netns も消えるので Remove は no-op になるが、エラーを無視する処理が必要
+
+  ---
+  実装を進めてよいですか？ まず pkg/veth/finder.go と pkg/tc/tc.go の拡張から始めるのがよいと思います。また、CRD の DelayRule に targetInterfaces フィールドを追加するか、Multus
+  アノテーションを自動検出して全 ipvlan インターフェースを対象にするかのどちらが望ましいでしょうか？
+
+✻ Churned for 1m 59s
+
+❯ CRDのDelayRuleには、もし可能ならターゲットとなるNAD(NetworkAttachmentDefinition)を指定したいです。実装お願いします
+
+⏺ まずすべての関連ファイルを読み込みます。
+
+  Searched for 1 pattern, read 13 files (ctrl+o to expand)
+
+⏺ 全ファイルを把握しました。実装を始めます。
+
+⏺ Agent(Create task list for implementation)
+  ⎿  Done (10 tool uses · 11.1k tokens · 23s)
+  (ctrl+o to expand)
+
+⏺ Task 1: pkg/api/v1alpha1/types.go
+
+⏺ Update(pkg/api/v1alpha1/types.go)
+  ⎿  Added 20 lines
+      47    // MaxDelay is the maximum delay in milliseconds. Must be >= MinDelay.
+      48    // +kubebuilder:validation:Minimum=0
+      49    MaxDelay int32 `json:"maxDelay"`
+      50 +  // MultusNetworks is an optional list of NetworkAttachmentDefinition names whose
+      51 +  // pod-side interfaces should also receive delay injection.
+      52 +  // Each entry may be "name" (matches any namespace) or "namespace/name" (exact match).
+      53 +  // Interfaces are resolved via the k8s.v1.cni.cncf.io/networks-status pod annotation.
+      54 +  // If empty, only the primary interface is targeted.
+      55 +  // +optional
+      56 +  MultusNetworks []string `json:"multusNetworks,omitempty"`
+      57  }
+      58
+      59 +// InjectedInterfaceStatus describes a tc rule applied to a Multus-managed interface.
+      60 +type InjectedInterfaceStatus struct {
+      61 +  // NADName is the NetworkAttachmentDefinition identifier (namespace/name) as reported
+      62 +  // by the Multus annotation.
+      63 +  NADName string `json:"nadName"`
+      64 +  // Interface is the name of the interface inside the pod (e.g. net1).
+      65 +  Interface string `json:"interface"`
+      66 +  // DelayMs is the injected delay in milliseconds.
+      67 +  DelayMs int32 `json:"delayMs"`
+      68 +  // TCCommand is the tc command line that was applied.
+      69 +  TCCommand string `json:"tcCommand"`
+      70 +}
+      71 +
+      72  // InjectedPodStatus describes the tc rule currently applied to a single pod.
+      73  type InjectedPodStatus struct {
+      74    // NodeName is the node where this rule is applied.
+
+⏺ Update(pkg/api/v1alpha1/types.go)
+  ⎿  Added 3 lines
+      85    DelayMs int32 `json:"delayMs"`
+      86    // TCCommand is the tc command line that was applied.
+      87    TCCommand string `json:"tcCommand"`
+      88 +  // MultusInterfaces lists tc rules applied to Multus-managed interfaces of this pod.
+      89 +  // +optional
+      90 +  MultusInterfaces []InjectedInterfaceStatus `json:"multusInterfaces,omitempty"`
+      91  }
+      92
+      93  // TCInjectorStatus reports current injection state.
+
+⏺ Task 2: zz_generated.deepcopy.go
+
+⏺ Update(pkg/api/v1alpha1/zz_generated.deepcopy.go)
+  ⎿  Added 21 lines
+       95
+       96  // DeepCopyInto copies all properties of this object into another object of the
+       97  // same type that is provided as a pointer.
+       98 +func (in *InjectedInterfaceStatus) DeepCopyInto(out *InjectedInterfaceStatus) {
+       99 +  *out = *in
+      100 +}
+      101 +
+      102 +// DeepCopy returns a deep copy of this InjectedInterfaceStatus.
+      103 +func (in *InjectedInterfaceStatus) DeepCopy() *InjectedInterfaceStatus {
+      104 +  if in == nil {
+      105 +    return nil
+      106 +  }
+      107 +  out := new(InjectedInterfaceStatus)
+      108 +  in.DeepCopyInto(out)
+      109 +  return out
+      110 +}
+      111 +
+      112 +// DeepCopyInto copies all properties of this object into another object of the
+      113 +// same type that is provided as a pointer.
+      114  func (in *InjectedPodStatus) DeepCopyInto(out *InjectedPodStatus) {
+      115    *out = *in
+      116 +  if in.MultusInterfaces != nil {
+      117 +    in, out := &in.MultusInterfaces, &out.MultusInterfaces
+      118 +    *out = make([]InjectedInterfaceStatus, len(*in))
+      119 +    copy(*out, *in)
+      120 +  }
+      121  }
+      122
+      123  // DeepCopy returns a deep copy of this InjectedPodStatus.
+
+⏺ InjectedPodStatus にスライスが追加されたので TCInjectorStatus.DeepCopyInto の copy も DeepCopyInto に変更します。
+
+⏺ Update(pkg/api/v1alpha1/zz_generated.deepcopy.go)
+  ⎿  Added 3 lines, removed 1 line
+      137    if in.InjectedPodDetails != nil {
+      138      in, out := &in.InjectedPodDetails, &out.InjectedPodDetails
+      139      *out = make([]InjectedPodStatus, len(*in))
+      140 -    copy(*out, *in)
+      140 +    for i := range *in {
+      141 +      (*in)[i].DeepCopyInto(&(*out)[i])
+      142 +    }
+      143    }
+      144    if in.Conditions != nil {
+      145      in, out := &in.Conditions, &out.Conditions
+
+⏺ DelayRule.DeepCopyInto に MultusNetworks スライスのコピーを追加します。
+
+⏺ Update(pkg/api/v1alpha1/zz_generated.deepcopy.go)
+  ⎿  Added 5 lines
+      166    *out = *in
+      167    in.Selector.DeepCopyInto(&out.Selector)
+      168    in.NamespaceSelector.DeepCopyInto(&out.NamespaceSelector)
+      169 +  if in.MultusNetworks != nil {
+      170 +    in, out := &in.MultusNetworks, &out.MultusNetworks
+      171 +    *out = make([]string, len(*in))
+      172 +    copy(*out, *in)
+      173 +  }
+      174  }
+      175
+      176  // DeepCopy returns a deep copy of this DelayRule.
+
+⏺ Task 3: pkg/tc/tc.go
+
+⏺ Update(pkg/tc/tc.go)
+  ⎿  Added 56 lines
+       73    return nil
+       74  }
+       75
+       76 +// ApplyInNetns installs or replaces a netem delay qdisc on iface inside the
+       77 +// network namespace identified by netnsPath (a /proc/<pid>/ns/net path).
+       78 +// It runs tc(8) via nsenter(1) and returns the command string that was executed.
+       79 +// Calling ApplyInNetns on an interface that already has a rule replaces it atomically.
+       80 +func ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error) {
+       81 +  if err := validateIface(iface); err != nil {
+       82 +    return "", err
+       83 +  }
+       84 +  delay := fmt.Sprintf("%dms", delayMs)
+       85 +  replaceArgs := []string{
+       86 +    "--net=" + netnsPath, "--",
+       87 +    "tc", "qdisc", "replace", "dev", iface,
+       88 +    "root", "handle", "1:", "netem", "delay", delay,
+       89 +  }
+       90 +  tcCmd := fmt.Sprintf("nsenter --net=%s -- tc qdisc replace dev %s root handle 1: netem delay %s",
+       91 +    netnsPath, iface, delay)
+       92 +  if out, err := runCmd("nsenter", replaceArgs...); err != nil {
+       93 +    // replace fails on a pristine interface; fall back to add.
+       94 +    addArgs := []string{
+       95 +      "--net=" + netnsPath, "--",
+       96 +      "tc", "qdisc", "add", "dev", iface,
+       97 +      "root", "handle", "1:", "netem", "delay", delay,
+       98 +    }
+       99 +    tcCmd = fmt.Sprintf("nsenter --net=%s -- tc qdisc add dev %s root handle 1: netem delay %s",
+      100 +      netnsPath, iface, delay)
+      101 +    if out2, err2 := runCmd("nsenter", addArgs...); err2 != nil {
+      102 +      return "", fmt.Errorf("tc qdisc add/replace on %s in netns %s: %w (replace output: %s, add output: %s)",
+      103 +        iface, netnsPath, err2, out, out2)
+      104 +    }
+      105 +  }
+      106 +  return tcCmd, nil
+      107 +}
+      108 +
+      109 +// RemoveInNetns deletes the root qdisc from iface inside the given network namespace.
+      110 +// It tolerates errors when the namespace or interface no longer exists (e.g. the pod
+      111 +// has been deleted), making it safe to call during pod cleanup.
+      112 +func RemoveInNetns(netnsPath, iface string) error {
+      113 +  if err := validateIface(iface); err != nil {
+      114 +    return err
+      115 +  }
+      116 +  args := []string{
+      117 +    "--net=" + netnsPath, "--",
+      118 +    "tc", "qdisc", "del", "dev", iface, "root",
+      119 +  }
+      120 +  if out, err := runCmd("nsenter", args...); err != nil {
+      121 +    // Tolerate: qdisc absent, netns already gone (pod deleted), or interface missing.
+      122 +    if strings.Contains(out, "RTNETLINK") ||
+      123 +      strings.Contains(out, "No such") ||
+      124 +      strings.Contains(out, "Cannot open network namespace") {
+      125 +      return nil
+      126 +    }
+      127 +    return fmt.Errorf("tc qdisc del on %s in netns %s: %w (output: %s)", iface, netnsPath, err, out)
+      128 +  }
+      129 +  return nil
+      130 +}
+      131 +
+      132  // Show returns the current tc qdisc configuration for an interface.
+      133  func Show(iface string) (string, error) {
+      134    if err := validateIface(iface); err != nil {
+
+⏺ Task 4: pkg/veth/finder.go
+
+⏺ Update(pkg/veth/finder.go)
+  ⎿  Added 11 lines
+      80    return f.conn.Close()
+      81  }
+      82
+      83 +// FindNetnsPath returns the /proc/<pid>/ns/net path for the given container.
+      84 +// The path can be passed to nsenter(1) to run commands inside the pod's network namespace.
+      85 +// containerID should be in the form "containerd://<id>" or "cri-o://<id>".
+      86 +func (f *Finder) FindNetnsPath(ctx context.Context, containerID string) (string, error) {
+      87 +  id := stripRuntimePrefix(containerID)
+      88 +  if id == "" {
+      89 +    return "", fmt.Errorf("empty container ID after stripping runtime prefix: %q", containerID)
+      90 +  }
+      91 +  return f.resolveNetnsPath(ctx, id)
+      92 +}
+      93 +
+      94  // FindHostVeth returns the host-side veth interface name and ifindex for the
+      95  // pod container. containerID should be in the form "containerd://<id>" or
+      96  // "cri-o://<id>" as stored in pod status.
+
+⏺ Task 5: pkg/controller/tcinjector_controller.go (大規模変更)
+
+⏺ Write(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 245 lines, removed 30 lines
+       3
+       4  import (
+       5    "context"
+       6 +  "encoding/json"
+       7    "fmt"
+       8 +  "strings"
+       9    "sync"
+      10    "time"
+      11
+     ...
+      26    "github.com/tc-injector/tc-injector/pkg/tc"
+      27  )
+      28
+      27 -// VethFinder resolves a container ID to the host-side veth interface name and ifindex.
+      29 +// multusNetworkStatusAnnotation is the pod annotation written by Multus that lists
+      30 +// all attached network interfaces and their NetworkAttachmentDefinition names.
+      31 +const multusNetworkStatusAnnotation = "k8s.v1.cni.cncf.io/networks-status"
+      32 +
+      33 +// VethFinder resolves a container ID to the host-side veth interface name/ifindex
+      34 +// and to the pod's network namespace path.
+      35  type VethFinder interface {
+      36    FindHostVeth(ctx context.Context, containerID string) (ifaceName string, ifaceIndex int, err error)
+      37 +  FindNetnsPath(ctx context.Context, containerID string) (string, error)
+      38  }
+      39
+      40  // TCApplier applies and removes tc netem delay rules on network interfaces.
+      41  type TCApplier interface {
+      42    Apply(iface string, delayMs int32) error
+      43    Remove(iface string) error
+      44 +  // ApplyInNetns installs or replaces a netem qdisc on iface inside the network
+      45 +  // namespace at netnsPath. Returns the tc command string that was executed.
+      46 +  ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error)
+      47 +  // RemoveInNetns removes the root qdisc from iface inside the given network
+      48 +  // namespace. It is a no-op when the namespace or interface no longer exists.
+      49 +  RemoveInNetns(netnsPath, iface string) error
+      50  }
+      51
+      52  // RealTCApplier delegates to the tc package and is used in production.
+     ...
+       54
+       55  func (RealTCApplier) Apply(iface string, delayMs int32) error { return tc.Apply(iface, delayMs) }
+       56  func (RealTCApplier) Remove(iface string) error               { return tc.Remove(iface) }
+       57 +func (RealTCApplier) ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error) {
+       58 +  return tc.ApplyInNetns(netnsPath, iface, delayMs)
+       59 +}
+       60 +func (RealTCApplier) RemoveInNetns(netnsPath, iface string) error {
+       61 +  return tc.RemoveInNetns(netnsPath, iface)
+       62 +}
+       63
+       44 -// injectedState records the tc rule currently applied to a pod.
+       64 +// multusInjectedState records the tc rule applied to a single Multus-managed interface.
+       65 +type multusInjectedState struct {
+       66 +  nadName   string // NetworkAttachmentDefinition identifier from the annotation
+       67 +  ifaceName string // interface name inside the pod (e.g. net1)
+       68 +  netnsPath string // /proc/<pid>/ns/net used to enter the pod network namespace
+       69 +  delayMs   int32
+       70 +  tcCmd     string
+       71 +}
+       72 +
+       73 +// injectedState records all tc rules currently applied to a pod.
+       74  type injectedState struct {
+       46 -  ifaceName    string
+       47 -  ifaceIndex   int
+       48 -  podName      string
+       49 -  podNamespace string
+       50 -  delayMs      int32
+       51 -  tcCmd        string
+       75 +  ifaceName        string // host-side veth interface name
+       76 +  ifaceIndex       int
+       77 +  podName          string
+       78 +  podNamespace     string
+       79 +  delayMs          int32
+       80 +  tcCmd            string
+       81 +  multusInterfaces []multusInjectedState
+       82  }
+       83
+       84 +// desiredPodState holds the computed tc configuration that should be applied to a pod.
+       85 +type desiredPodState struct {
+       86 +  delayMs          int32
+       87 +  multusInterfaces []multusDesiredIface
+       88 +}
+       89 +
+       90 +// multusDesiredIface identifies a Multus-managed interface to inject delay into.
+       91 +type multusDesiredIface struct {
+       92 +  nadName   string // as it appears in the annotation (e.g. "default/mynetwork")
+       93 +  ifaceName string // interface name inside the pod (e.g. net1)
+       94 +}
+       95 +
+       96 +// multusNetworkStatus corresponds to one entry in the Multus networks-status annotation.
+       97 +type multusNetworkStatus struct {
+       98 +  Name      string `json:"name"`
+       99 +  Interface string `json:"interface"`
+      100 +}
+      101 +
+      102  // Reconciler reconciles TCInjector objects and manages tc rules on the local node.
+      103  type Reconciler struct {
+      104    client.Client
+     ...
+      153      r.injected = make(map[string]injectedState)
+      154    }
+      155
+      108 -  // Build the desired state: podUID -> delayMs.
+      156 +  // Build the desired state: podUID -> desiredPodState.
+      157    // For pods already injected without periodic rotation, the existing delay is
+      158    // preserved to avoid re-randomizing on every reconcile.
+      111 -  desired := make(map[string]int32)
+      159 +  desired := make(map[string]desiredPodState)
+      160    for _, injector := range injectorList.Items {
+      161      if injector.DeletionTimestamp != nil {
+      162        continue
+     ...
+      191          // periodic rotation is not active. This prevents re-randomizing on
+      192          // every reconcile triggered by unrelated pod or resource changes.
+      193          // Last matching rule wins; earlier rules can be overridden.
+      194 +        var delayMs int32
+      195          if existing, alreadyInjected := r.injected[uid]; alreadyInjected && !shouldRotate {
+      147 -          desired[uid] = existing.delayMs
+      196 +          delayMs = existing.delayMs
+      197          } else {
+      149 -          desired[uid] = tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+      198 +          delayMs = tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+      199          }
+      200 +        desired[uid] = desiredPodState{
+      201 +          delayMs:          delayMs,
+      202 +          multusInterfaces: resolveMultusInterfaces(&pod, rule.MultusNetworks),
+      203 +        }
+      204        }
+      205      }
+      206    }
+      207
+      155 -  // Remove tc rules for pods that are no longer desired.
+      208 +  // Remove tc rules for pods that are no longer in the desired set.
+      209    for uid, state := range r.injected {
+      210      if _, ok := desired[uid]; !ok {
+      158 -      logger.Info("removing tc rule", "podUID", uid, "iface", state.ifaceName)
+      211 +      logger.Info("removing tc rules", "podUID", uid, "iface", state.ifaceName)
+      212        if err := r.TCApplier.Remove(state.ifaceName); err != nil {
+      213          logger.Error(err, "failed to remove tc rule", "iface", state.ifaceName)
+      214        }
+      215 +      for _, mi := range state.multusInterfaces {
+      216 +        if err := r.TCApplier.RemoveInNetns(mi.netnsPath, mi.ifaceName); err != nil {
+      217 +          logger.Error(err, "failed to remove multus tc rule",
+      218 +            "iface", mi.ifaceName, "nad", mi.nadName)
+      219 +        }
+      220 +      }
+      221        delete(r.injected, uid)
+      222      }
+      223    }
+      224
+      225    // Apply tc rules for pods in the desired set.
+      226    var injectedCount int32
+      168 -  for uid, delayMs := range desired {
+      227 +  for uid, des := range desired {
+      228      pod := findPodByUID(podList.Items, uid)
+      229      if pod == nil {
+      230        continue
+     ...
+      242        continue
+      243      }
+      244
+      186 -    // Skip if the same interface and delay are already applied.
+      187 -    if existing, ok := r.injected[uid]; ok && existing.ifaceName == iface && existing.delayMs == delayMs {
+      245 +    // Resolve netns path only when Multus interfaces are requested.
+      246 +    var netnsPath string
+      247 +    if len(des.multusInterfaces) > 0 {
+      248 +      netnsPath, err = r.Finder.FindNetnsPath(ctx, containerID)
+      249 +      if err != nil {
+      250 +        logger.Error(err, "cannot find netns path for multus injection", "pod", pod.Name)
+      251 +        // Continue: the primary interface can still be processed.
+      252 +      }
+      253 +    }
+      254 +
+      255 +    existing := r.injected[uid]
+      256 +
+      257 +    // Check whether primary interface or Multus interfaces changed.
+      258 +    primaryUnchanged := existing.ifaceName == iface && existing.delayMs == des.delayMs
+      259 +    multusUnchanged := multusIfaceSetsEqual(existing.multusInterfaces, des.multusInterfaces, des.delayMs)
+      260 +    if primaryUnchanged && multusUnchanged {
+      261        injectedCount++
+      262        continue
+      263      }
+      264
+      192 -    tcCmd := fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, delayMs)
+      193 -    logger.Info("applying tc delay", "pod", pod.Name, "iface", iface, "delayMs", delayMs, "tcCmd", tcCmd)
+      194 -    if err := r.TCApplier.Apply(iface, delayMs); err != nil {
+      195 -      logger.Error(err, "tc apply failed", "iface", iface)
+      196 -      continue
+      265 +    // Apply primary interface if changed.
+      266 +    var newTCCmd string
+      267 +    if !primaryUnchanged {
+      268 +      newTCCmd = fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, des.delayMs)
+      269 +      logger.Info("applying tc delay", "pod", pod.Name, "iface", iface,
+      270 +        "delayMs", des.delayMs, "tcCmd", newTCCmd)
+      271 +      if err := r.TCApplier.Apply(iface, des.delayMs); err != nil {
+      272 +        logger.Error(err, "tc apply failed", "iface", iface)
+      273 +        continue
+      274 +      }
+      275 +    } else {
+      276 +      newTCCmd = existing.tcCmd
+      277      }
+      278
+      279 +    // Build a map of existing Multus state for efficient lookup.
+      280 +    existingMultusMap := make(map[string]multusInjectedState, len(existing.multusInterfaces))
+      281 +    for _, mi := range existing.multusInterfaces {
+      282 +      existingMultusMap[mi.nadName] = mi
+      283 +    }
+      284 +
+      285 +    // Remove Multus interfaces that are no longer desired (NAD removed from rule).
+      286 +    desiredNADs := make(map[string]bool, len(des.multusInterfaces))
+      287 +    for _, dmi := range des.multusInterfaces {
+      288 +      desiredNADs[dmi.nadName] = true
+      289 +    }
+      290 +    for _, mi := range existing.multusInterfaces {
+      291 +      if !desiredNADs[mi.nadName] {
+      292 +        if err := r.TCApplier.RemoveInNetns(mi.netnsPath, mi.ifaceName); err != nil {
+      293 +          logger.Error(err, "failed to remove multus tc rule",
+      294 +            "iface", mi.ifaceName, "nad", mi.nadName)
+      295 +        }
+      296 +      }
+      297 +    }
+      298 +
+      299 +    // Apply desired Multus interfaces (add new or update changed ones).
+      300 +    newMultus := make([]multusInjectedState, 0, len(des.multusInterfaces))
+      301 +    for _, dmi := range des.multusInterfaces {
+      302 +      emi, wasInjected := existingMultusMap[dmi.nadName]
+      303 +      miUnchanged := wasInjected &&
+      304 +        emi.ifaceName == dmi.ifaceName &&
+      305 +        emi.delayMs == des.delayMs
+      306 +
+      307 +      if miUnchanged {
+      308 +        newMultus = append(newMultus, emi)
+      309 +        continue
+      310 +      }
+      311 +
+      312 +      if netnsPath == "" {
+      313 +        logger.Info("skipping multus interface: netns path unavailable",
+      314 +          "pod", pod.Name, "nad", dmi.nadName)
+      315 +        continue
+      316 +      }
+      317 +
+      318 +      miCmd, err := r.TCApplier.ApplyInNetns(netnsPath, dmi.ifaceName, des.delayMs)
+      319 +      if err != nil {
+      320 +        logger.Error(err, "multus tc apply failed",
+      321 +          "pod", pod.Name, "iface", dmi.ifaceName, "nad", dmi.nadName)
+      322 +        continue
+      323 +      }
+      324 +      logger.Info("applying multus tc delay", "pod", pod.Name,
+      325 +        "nad", dmi.nadName, "iface", dmi.ifaceName, "delayMs", des.delayMs)
+      326 +      newMultus = append(newMultus, multusInjectedState{
+      327 +        nadName:   dmi.nadName,
+      328 +        ifaceName: dmi.ifaceName,
+      329 +        netnsPath: netnsPath,
+      330 +        delayMs:   des.delayMs,
+      331 +        tcCmd:     miCmd,
+      332 +      })
+      333 +    }
+      334 +
+      335      r.injected[uid] = injectedState{
+      200 -      ifaceName:    iface,
+      201 -      ifaceIndex:   ifaceIdx,
+      202 -      podName:      pod.Name,
+      203 -      podNamespace: pod.Namespace,
+      204 -      delayMs:      delayMs,
+      205 -      tcCmd:        tcCmd,
+      336 +      ifaceName:        iface,
+      337 +      ifaceIndex:       ifaceIdx,
+      338 +      podName:          pod.Name,
+      339 +      podNamespace:     pod.Namespace,
+      340 +      delayMs:          des.delayMs,
+      341 +      tcCmd:            newTCCmd,
+      342 +      multusInterfaces: newMultus,
+      343      }
+      344      injectedCount++
+      345    }
+     ...
+      352      // Build this node's details once; they do not change between retries.
+      353      thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
+      354      for _, state := range r.injected {
+      218 -      thisNodeDetails = append(thisNodeDetails, tcv1alpha1.InjectedPodStatus{
+      355 +      podStatus := tcv1alpha1.InjectedPodStatus{
+      356          NodeName:       r.NodeName,
+      357          Namespace:      state.podNamespace,
+      358          PodName:        state.podName,
+     ...
+      360          InterfaceIndex: int32(state.ifaceIndex),
+      361          DelayMs:        state.delayMs,
+      362          TCCommand:      state.tcCmd,
+      226 -      })
+      363 +      }
+      364 +      for _, mi := range state.multusInterfaces {
+      365 +        podStatus.MultusInterfaces = append(podStatus.MultusInterfaces,
+      366 +          tcv1alpha1.InjectedInterfaceStatus{
+      367 +            NADName:   mi.nadName,
+      368 +            Interface: mi.ifaceName,
+      369 +            DelayMs:   mi.delayMs,
+      370 +            TCCommand: mi.tcCmd,
+      371 +          })
+      372 +      }
+      373 +      thisNodeDetails = append(thisNodeDetails, podStatus)
+      374      }
+      375      for attempt := 0; attempt < 5; attempt++ {
+      376        if attempt > 0 {
+     ...
+      477    return requests
+      478  }
+      479
+      480 +// resolveMultusInterfaces parses the Multus networks-status annotation on the pod and
+      481 +// returns the interfaces that match any of the requested NAD names.
+      482 +func resolveMultusInterfaces(pod *corev1.Pod, nadNames []string) []multusDesiredIface {
+      483 +  if len(nadNames) == 0 {
+      484 +    return nil
+      485 +  }
+      486 +  raw := pod.Annotations[multusNetworkStatusAnnotation]
+      487 +  if raw == "" {
+      488 +    return nil
+      489 +  }
+      490 +  var statuses []multusNetworkStatus
+      491 +  if err := json.Unmarshal([]byte(raw), &statuses); err != nil {
+      492 +    return nil
+      493 +  }
+      494 +  var result []multusDesiredIface
+      495 +  for _, s := range statuses {
+      496 +    if s.Interface == "" {
+      497 +      continue
+      498 +    }
+      499 +    for _, nadName := range nadNames {
+      500 +      if nadMatches(s.Name, nadName) {
+      501 +        result = append(result, multusDesiredIface{
+      502 +          nadName:   s.Name,
+      503 +          ifaceName: s.Interface,
+      504 +        })
+      505 +        break
+      506 +      }
+      507 +    }
+      508 +  }
+      509 +  return result
+      510 +}
+      511 +
+      512 +// nadMatches returns true if annotationName (from the Multus annotation, e.g.
+      513 +// "default/mynetwork") matches the user-specified nadName.
+      514 +// Supports "namespace/name" (exact) and "name" (match any namespace) forms.
+      515 +func nadMatches(annotationName, nadName string) bool {
+      516 +  if annotationName == nadName {
+      517 +    return true
+      518 +  }
+      519 +  // If the user-specified name contains no slash, match the name part only.
+      520 +  if !strings.Contains(nadName, "/") {
+      521 +    if _, name, found := strings.Cut(annotationName, "/"); found {
+      522 +      return name == nadName
+      523 +    }
+      524 +  }
+      525 +  return false
+      526 +}
+      527 +
+      528 +// multusIfaceSetsEqual returns true if the existing Multus injected state exactly
+      529 +// matches the desired Multus interfaces (same set of NADs, same interface names,
+      530 +// and the same delayMs).
+      531 +func multusIfaceSetsEqual(existing []multusInjectedState, desired []multusDesiredIface, delayMs int32) bool {
+      532 +  if len(existing) != len(desired) {
+      533 +    return false
+      534 +  }
+      535 +  em := make(map[string]multusInjectedState, len(existing))
+      536 +  for _, mi := range existing {
+      537 +    em[mi.nadName] = mi
+      538 +  }
+      539 +  for _, dmi := range desired {
+      540 +    emi, ok := em[dmi.nadName]
+      541 +    if !ok || emi.ifaceName != dmi.ifaceName || emi.delayMs != delayMs {
+      542 +      return false
+      543 +    }
+      544 +  }
+      545 +  return true
+      546 +}
+      547 +
+      548  // isPodReady returns true if the pod is running and all containers are ready.
+      549  func isPodReady(pod *corev1.Pod) bool {
+      550    if pod.Status.Phase != corev1.PodRunning {
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ Task 6: pkg/controller/tcinjector_controller_test.go
+
+⏺ Update(pkg/controller/tcinjector_controller_test.go)
+  ⎿  Added 57 lines, removed 10 lines
+      21
+      22  // ---- fakes ----
+      23
+      24 -// fakeVethFinder maps containerID -> interface name. Returns an error for unknown IDs.
+      24 +// fakeVethFinder maps containerID -> interface name and containerID -> netns path.
+      25 +// Returns an error for unknown IDs.
+      26  type fakeVethFinder struct {
+      26 -  mu      sync.Mutex
+      27 -  mapping map[string]string
+      27 +  mu           sync.Mutex
+      28 +  mapping      map[string]string // containerID -> host-side veth iface name
+      29 +  netnsMapping map[string]string // containerID -> netns path
+      30  }
+      31
+      32  func newFakeVethFinder(m map[string]string) *fakeVethFinder {
+     ...
+      42    return "", 0, fmt.Errorf("no veth mapping for container %q", containerID)
+      43  }
+      44
+      43 -// fakeTCApplier records Apply and Remove calls.
+      45 +func (f *fakeVethFinder) FindNetnsPath(_ context.Context, containerID string) (string, error) {
+      46 +  f.mu.Lock()
+      47 +  defer f.mu.Unlock()
+      48 +  if path, ok := f.netnsMapping[containerID]; ok {
+      49 +    return path, nil
+      50 +  }
+      51 +  return "", fmt.Errorf("no netns mapping for container %q", containerID)
+      52 +}
+      53 +
+      54 +// fakeTCApplier records Apply, Remove, ApplyInNetns, and RemoveInNetns calls.
+      55  type fakeTCApplier struct {
+      45 -  mu      sync.Mutex
+      46 -  applied map[string]int32  // iface -> last applied delayMs
+      47 -  removed []string
+      48 -  applyErr error
+      49 -  removeErr error
+      56 +  mu           sync.Mutex
+      57 +  applied      map[string]int32 // iface -> last applied delayMs (host iface)
+      58 +  appliedNetns map[string]int32 // "netnsPath:iface" -> last applied delayMs
+      59 +  removed      []string
+      60 +  removedNetns []string // "netnsPath:iface"
+      61 +  applyErr     error
+      62 +  removeErr    error
+      63  }
+      64
+      65  func newFakeTCApplier() *fakeTCApplier {
+      53 -  return &fakeTCApplier{applied: make(map[string]int32)}
+      66 +  return &fakeTCApplier{
+      67 +    applied:      make(map[string]int32),
+      68 +    appliedNetns: make(map[string]int32),
+      69 +  }
+      70  }
+      71
+      72  func (f *fakeTCApplier) Apply(iface string, delayMs int32) error {
+     ...
+       90    return nil
+       91  }
+       92
+       93 +func (f *fakeTCApplier) ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error) {
+       94 +  f.mu.Lock()
+       95 +  defer f.mu.Unlock()
+       96 +  if f.applyErr != nil {
+       97 +    return "", f.applyErr
+       98 +  }
+       99 +  key := netnsPath + ":" + iface
+      100 +  f.appliedNetns[key] = delayMs
+      101 +  return fmt.Sprintf("nsenter --net=%s -- tc qdisc replace dev %s root handle 1: netem delay %dms",
+      102 +    netnsPath, iface, delayMs), nil
+      103 +}
+      104 +
+      105 +func (f *fakeTCApplier) RemoveInNetns(netnsPath, iface string) error {
+      106 +  f.mu.Lock()
+      107 +  defer f.mu.Unlock()
+      108 +  if f.removeErr != nil {
+      109 +    return f.removeErr
+      110 +  }
+      111 +  key := netnsPath + ":" + iface
+      112 +  delete(f.appliedNetns, key)
+      113 +  f.removedNetns = append(f.removedNetns, key)
+      114 +  return nil
+      115 +}
+      116 +
+      117  func (f *fakeTCApplier) isApplied(iface string) bool {
+      118    f.mu.Lock()
+      119    defer f.mu.Unlock()
+     ...
+      121    return ok
+      122  }
+      123
+      124 +func (f *fakeTCApplier) isAppliedInNetns(netnsPath, iface string) bool {
+      125 +  f.mu.Lock()
+      126 +  defer f.mu.Unlock()
+      127 +  _, ok := f.appliedNetns[netnsPath+":"+iface]
+      128 +  return ok
+      129 +}
+      130 +
+      131  func (f *fakeTCApplier) wasRemoved(iface string) bool {
+      132    f.mu.Lock()
+      133    defer f.mu.Unlock()
+  ⎿  Found 2 new diagnostic issues in 1 file (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Found 3 new diagnostic issues in 2 files (ctrl+o to expand)
+
+⏺ コンパイルエラーは解消されています。残りのタスクを続けます。
+
+  Task 7: config/crd/tcinjector.yaml
+
+⏺ Update(config/crd/tcinjector.yaml)
+  ⎿  Added 10 lines
+      102                          format: int32
+      103                          minimum: 0
+      104                          description: Maximum delay in milliseconds. Must be >= minDelay.
+      105 +                      multusNetworks:
+      106 +                        type: array
+      107 +                        description: >
+      108 +                          Optional list of NetworkAttachmentDefinition names whose pod-side
+      109 +                          interfaces also receive delay injection. Each entry may be "name"
+      110 +                          (matches any namespace) or "namespace/name" (exact match).
+      111 +                          Interfaces are resolved via the k8s.v1.cni.cncf.io/networks-status
+      112 +                          pod annotation. If omitted, only the primary interface is targeted.
+      113 +                        items:
+      114 +                          type: string
+      115              status:
+      116                type: object
+      117                properties:
+
+⏺ Update(config/crd/tcinjector.yaml)
+  ⎿  Added 20 lines
+      148                        tcCommand:
+      149                          type: string
+      150                          description: The tc command line that was applied.
+      151 +                      multusInterfaces:
+      152 +                        type: array
+      153 +                        description: tc rules applied to Multus-managed interfaces of this pod.
+      154 +                        items:
+      155 +                          type: object
+      156 +                          required: [nadName, interface, delayMs, tcCommand]
+      157 +                          properties:
+      158 +                            nadName:
+      159 +                              type: string
+      160 +                              description: NetworkAttachmentDefinition identifier (namespace/name) from the Multus annotation.
+      161 +                            interface:
+      162 +                              type: string
+      163 +                              description: Interface name inside the pod (e.g. net1).
+      164 +                            delayMs:
+      165 +                              type: integer
+      166 +                              format: int32
+      167 +                              description: Injected delay in milliseconds.
+      168 +                            tcCommand:
+      169 +                              type: string
+      170 +                              description: The tc command line that was applied.
+      171                  conditions:
+      172                    type: array
+      173                    items:
+
+⏺ Task 8: config/samples/tcinjector-example.yaml
+
+⏺ Update(config/samples/tcinjector-example.yaml)
+  ⎿  Added 12 lines
+      34              values: [platform, infra]
+      35        minDelay: 5
+      36        maxDelay: 30
+      37 +
+      38 +    # Add 20–80 ms delay on both the primary interface and a Multus-attached interface
+      39 +    # (NetworkAttachmentDefinition "mynetwork" in the "default" namespace).
+      40 +    # The NAD name may be specified as "default/mynetwork" (exact) or just "mynetwork"
+      41 +    # (matches that name in any namespace).
+      42 +    - selector:
+      43 +        matchLabels:
+      44 +          app: worker
+      45 +      minDelay: 20
+      46 +      maxDelay: 80
+      47 +      multusNetworks:
+      48 +        - default/mynetwork
+
+⏺ Task 9: Dockerfile
+
+⏺ Update(Dockerfile)
+  ⎿  Added 1 line, removed 1 line
+      16  # Runtime image — must include iproute for the tc(8) binary.
+      17  FROM quay.io/centos/centos:stream10-minimal
+      18
+      19 -RUN microdnf install -y iproute iproute-tc && microdnf clean all
+      19 +RUN microdnf install -y iproute iproute-tc util-linux && microdnf clean all
+      20
+      21  COPY --from=builder /tc-injector /tc-injector
+      22
+
+⏺ ビルドで確認します。
+
+⏺ Bash(go build ./... 2>&1)
+  ⎿  (No output)
+
+⏺ Bash(go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       1.858s
+     … +2 lines (ctrl+o to expand)
+
+⏺ ビルド・テスト全て通りました。実装した変更をまとめます。
+
+  ---
+  変更内容まとめ
+
+  アーキテクチャ
+
+  # プライマリインターフェース (既存・変更なし)
+  Pod (eth0) ←→ host-side veth
+                       ↑ tc qdisc (host 側で適用)
+
+  # Multus ipvlan インターフェース (新規)
+  Pod netns: [net1 (ipvlan slave)]
+                  ↑ nsenter --net=/proc/<pid>/ns/net -- tc qdisc
+
+  変更ファイル一覧
+
+  ┌──────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │                   ファイル                   │                                                          変更内容                                                           │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ pkg/api/v1alpha1/types.go                    │ DelayRule に multusNetworks []string を追加、InjectedInterfaceStatus 新規追加、InjectedPodStatus に MultusInterfaces を追加 │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ pkg/api/v1alpha1/zz_generated.deepcopy.go    │ 新型の DeepCopy 実装を追加・更新                                                                                            │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ pkg/tc/tc.go                                 │ ApplyInNetns・RemoveInNetns を追加 (nsenter 経由で Pod netns 内に tc 適用)                                                  │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ pkg/veth/finder.go                           │ FindNetnsPath メソッドを追加                                                                                                │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ pkg/controller/tcinjector_controller.go      │ VethFinder/TCApplier インターフェース拡張、Multus アノテーション解析、NAD マッチング、reconcile ループ拡張、状態管理拡張    │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ pkg/controller/tcinjector_controller_test.go │ フェイク実装を拡張                                                                                                          │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ config/crd/tcinjector.yaml                   │ multusNetworks・multusInterfaces をスキーマに追加                                                                           │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ config/samples/tcinjector-example.yaml       │ Multus NAD 指定例を追加                                                                                                     │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Dockerfile                                   │ util-linux (nsenter 提供) を追加                                                                                            │
+  └──────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  NAD 名の指定方法
+
+  multusNetworks:
+    - mynetwork           # どの namespace の mynetwork とも一致
+    - default/mynetwork   # default/mynetwork に完全一致
+
+  Multus の k8s.v1.cni.cncf.io/networks-status アノテーションと照合して、対応するインターフェース名 (例: net1) を自動解決します。
+
+✻ Sautéed for 10m 16s
+
+  9 tasks (0 done, 9 open)
+  ◻ types.go: Add MultusNetworks to DelayRule and InjectedInterfaceStatus
+  ◻ deepcopy: Update zz_generated.deepcopy.go for new types
+  ◻ tc.go: Add ApplyInNetns and RemoveInNetns
+  ◻ finder.go: Add FindNetnsPath method
+  ◻ controller: Add Multus support to reconcile loop
+  ◻ controller_test: Update fakes for new interfaces
+  ◻ CRD YAML: Add new fields to schema
+  ◻ samples: Add Multus NAD example
+  ◻ Dockerfile: Add util-linux for nsenter
+```
+
+```
+❯ README.mdの更新もお願いします
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 14 lines
+      33  └─────────────────────────────────────────────────────────┘
+      34  ```
+      35
+      36 +### Multus Interface Support
+      37 +
+      38 +When a rule specifies `multusNetworks`, tc-injector also injects delay into interfaces added by [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) (e
+         +.g. ipvlan secondary interfaces). Because Multus-managed interfaces (such as ipvlan slaves) exist only inside the pod's network namespace — unlike primary `veth` i
+         +nterfaces which have a host-side peer — the `tc` rule must be applied **inside** the pod's network namespace using `nsenter`.
+      39 +
+      40 +```
+      41 +# Primary interface (veth) — tc applied on host side (existing behavior)
+      42 +pod eth0  ←──peer──►  host vethXXXX  ←─[netem delay]
+      43 +
+      44 +# Multus interface (e.g. ipvlan) — tc applied inside pod netns
+      45 +pod net1 (ipvlan slave) ←─[netem delay, via nsenter]
+      46 +```
+      47 +
+      48 +Multus writes the list of attached interfaces and their NetworkAttachmentDefinition (NAD) names into the `k8s.v1.cni.cncf.io/networks-status` pod annotation. tc-in
+         +jector reads this annotation to resolve which interface name inside the pod corresponds to each requested NAD.
+      49 +
+      50  ### Rule Matching
+      51
+      52  - Rules are evaluated in order; **the last matching rule wins**.
+
+⏺ Update(README.md)
+  ⎿  Added 1 line
+      65  - CRI: containerd or CRI-O
+      66  - `tc` and `netem` kernel module available on nodes (`iproute2` package)
+      67  - Cluster-admin privileges (required to apply CRD and RBAC)
+      68 +- (Optional) [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) for secondary interface injection
+      69
+      70  ## Installation
+      71
+
+⏺ Update(README.md)
+  ⎿  Added 3 lines
+      133            env: production
+      134        minDelay: 10           # (required) Minimum delay in milliseconds (>= 0)
+      135        maxDelay: 50           # (required) Maximum delay in milliseconds (>= minDelay)
+      136 +      multusNetworks:        # (optional) Multus NAD names to also inject delay into
+      137 +        - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
+      138
+      139    # enablePeriodicDelayRotation re-randomizes delays within [minDelay, maxDelay]
+      140    # at the interval specified by delayInterval.
+     ...
+      156  | `spec.rules[].namespaceSelector` | `LabelSelector` | No | Matches pods by their namespace's labels. Empty matches all namespaces. |
+      157  | `spec.rules[].minDelay` | `int32` (ms) | Yes | Minimum delay (>= 0) |
+      158  | `spec.rules[].maxDelay` | `int32` (ms) | Yes | Maximum delay (>= minDelay) |
+      159 +| `spec.rules[].multusNetworks` | `[]string` | No | Multus NAD names to inject delay into in addition to the primary interface. See [Multus interface targeting](#
+          +multus-interface-targeting). |
+      160  | `spec.enablePeriodicDelayRotation` | `bool` | No | Periodically re-randomize delays. Default: `false` |
+      161  | `spec.delayInterval` | `Duration` | No | Re-randomization interval. Default: `30s` |
+      162
+
+⏺ Examples セクションに Multus の例を追加します。
+
+⏺ Update(README.md)
+  ⎿  Added 45 lines
+      268        maxDelay: 200
+      269  ```
+      270
+      271 +### Multus interface targeting
+      272 +
+      273 +Inject delay on both the primary interface (`eth0`) and a secondary interface attached by Multus (e.g. an ipvlan interface backed by the `mynetwork` NetworkAttach
+          +mentDefinition in the `default` namespace):
+      274 +
+      275 +```yaml
+      276 +apiVersion: tc-injector.setns.net/v1alpha1
+      277 +kind: TCInjector
+      278 +metadata:
+      279 +  name: multus-delay
+      280 +spec:
+      281 +  rules:
+      282 +    - selector:
+      283 +        matchLabels:
+      284 +          app: worker
+      285 +      minDelay: 20
+      286 +      maxDelay: 80
+      287 +      multusNetworks:
+      288 +        - default/mynetwork   # exact match: namespace/name
+      289 +        # - mynetwork         # name-only: matches "mynetwork" in any namespace
+      290 +```
+      291 +
+      292 +**How NAD names are matched** against the `k8s.v1.cni.cncf.io/networks-status` annotation:
+      293 +
+      294 +| Entry in `multusNetworks` | Matches annotation name |
+      295 +|---|---|
+      296 +| `default/mynetwork` | `default/mynetwork` (exact) |
+      297 +| `mynetwork` | `default/mynetwork`, `kube-system/mynetwork`, `mynetwork`, etc. |
+      298 +
+      299 +**Checking the applied rule** inside the pod network namespace:
+      300 +
+      301 +```bash
+      302 +# Find the target pod's PID on the node
+      303 +kubectl exec -n tc-injector-system <tc-injector-pod> -- \
+      304 +  cat /proc/$(pgrep -n -f <target-process>)/ns/net
+      305 +
+      306 +# Or inspect via nsenter directly on the node
+      307 +nsenter --net=/proc/<pid>/ns/net -- tc qdisc show dev net1
+      308 +```
+      309 +
+      310 +A successfully applied rule shows:
+      311 +
+      312 +```
+      313 +qdisc netem 1: root refcnt 2 limit 1000 delay 45ms
+      314 +```
+      315 +
+      316  ## Verifying That tc Rules Are Applied
+      317
+      318  ### 1. Check the TCInjector status
+
+⏺ Status の確認方法に Multus 情報を追加します。
+
+⏺ Update(README.md)
+  ⎿  Added 17 lines, removed 4 lines
+      321  kubectl get tcinjector <name> -o yaml
+      322  ```
+      323
+      324 -Look for `status.injectedPods` (number of pods currently receiving delay on each node) and `status.conditions`:
+      324 +Look for `status.injectedPods` (number of pods currently receiving delay on each node) and `status.injectedPodDetails`:
+      325
+      326  ```yaml
+      327  status:
+      328 -  injectedPods: 3
+      328 +  injectedPods: 2
+      329 +  injectedPodDetails:
+      330 +    - nodeName: worker-1
+      331 +      namespace: default
+      332 +      podName: worker-abc
+      333 +      interface: veth1a2b3c       # host-side veth for eth0
+      334 +      interfaceIndex: 42
+      335 +      delayMs: 37
+      336 +      tcCommand: "tc qdisc replace dev veth1a2b3c root handle 1: netem delay 37ms"
+      337 +      multusInterfaces:           # present when multusNetworks is specified
+      338 +        - nadName: default/mynetwork
+      339 +          interface: net1         # interface name inside the pod
+      340 +          delayMs: 37
+      341 +          tcCommand: "nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 37ms"
+      342    conditions:
+      330 -    - type: Ready
+      343 +    - type: worker-1
+      344        status: "True"
+      332 -      message: "3 pod(s) injected on node worker-1"
+      345 +      message: "2 pod(s) injected on node worker-1"
+      346  ```
+      347
+      348  ### 2. Check the controller logs
+
+⏺ トラブルシューティングに Multus 関連の項目を追加します。
+
+⏺ Update(README.md)
+  ⎿  Added 7 lines
+      405  | No `applying tc delay` in logs | Pod not ready | Ensure pod is `Running` with all containers ready |
+      406  | Log shows injection but no measured delay | tc applied to wrong interface | Verify with `tc qdisc show dev <iface>` inside the DaemonSet pod |
+      407  | Pod is not targeted despite matching labels | Namespace labels missing | Run `kubectl get namespace <ns> --show-labels` and add required labels |
+      408 +| Multus interface not injected (`multusInterfaces` empty in status) | Annotation missing or NAD name mismatch | Check the pod annotation and NAD name format (see
+          + below) |
+      409 +| Log shows `skipping multus interface: netns path unavailable` | CRI lookup failed | Check DaemonSet logs for the preceding error from `FindNetnsPath` |
+      410
+      411  ```bash
+      412  # Debug selector matching
+      413  kubectl get pod <target-pod> -o jsonpath='{.metadata.labels}'
+      414  kubectl get namespace <target-namespace> --show-labels
+      415  kubectl get tcinjector <name> -o jsonpath='{.spec.rules}'
+      416 +
+      417 +# Debug Multus interface resolution
+      418 +kubectl get pod <target-pod> -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/networks-status}' | jq .
+      419  ```
+      420
+      421 +The `networks-status` annotation lists all attached interfaces. Confirm the `name` field matches the entry in `multusNetworks`. For example, if the annotation sho
+          +ws `"name": "default/mynetwork"`, the rule should specify `multusNetworks: [default/mynetwork]` or `multusNetworks: [mynetwork]`.
+      422 +
+      423  ## Uninstallation
+      424
+      425  ```bash
+
+⏺ 最終確認としてビルドとテストを再実行します。
+
+⏺ Bash(go build ./... && go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       (cached)
+     … +2 lines (ctrl+o to expand)
+
+⏺ README.md の更新が完了しました。主な変更内容です。
+
+  ---
+  README に追加した内容
+
+  "How It Works" セクション
+  - Multus インターフェースサポートの説明を追加（ipvlan の場合に tc を pod netns 内で適用する理由を含む）
+  - veth vs ipvlan のアーキテクチャ図を追加
+
+  "Prerequisites" セクション
+  - Multus CNI をオプション前提条件として追加
+
+  "Custom Resource Reference" セクション
+  - CRD サンプルに multusNetworks フィールドを追加
+  - フィールドリファレンス表に multusNetworks を追加
+
+  "Examples" セクション
+  - Multus インターフェースターゲティングの例を追加（NAD 名のマッチング仕様表を含む）
+  - nsenter で適用済みルールを確認する方法を追加
+
+  "Verifying" セクション
+  - status.injectedPodDetails.multusInterfaces を含む status 出力例に更新
+
+  "Troubleshooting" セクション
+  - Multus インターフェースが注入されない場合の原因と対処法を追加
+  - networks-status アノテーションのデバッグコマンドを追加
+
+✻ Cogitated for 1m 52s
+```
