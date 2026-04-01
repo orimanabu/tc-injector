@@ -29,7 +29,9 @@ import (
 
 // multusNetworkStatusAnnotation is the pod annotation written by Multus that lists
 // all attached network interfaces and their NetworkAttachmentDefinition names.
-const multusNetworkStatusAnnotation = "k8s.v1.cni.cncf.io/networks-status"
+// The authoritative key is defined in the network-attachment-definition-client library
+// as NetworkStatusAnnot = "k8s.v1.cni.cncf.io/network-status" (no trailing 's' on "network").
+const multusNetworkStatusAnnotation = "k8s.v1.cni.cncf.io/network-status"
 
 // VethFinder resolves a container ID to the host-side veth interface name/ifindex
 // and to the pod's network namespace path.

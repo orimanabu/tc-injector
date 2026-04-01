@@ -6641,3 +6641,111 @@ directory
 
 ✻ Cogitated for 5m 43s
 ```
+
+```
+❯ 更新して再度実行しましたが、`kubectl logs -n tc-injector-system -l app=tc-injector | grep "multus"` の出力はありませんでした。multus
+NADにマッチしているPodに関するログは以下のとおりです。
+```
+2026-04-01T16:02:49Z    INFO    applying tc delay       {"controller": "tcinjector", "controllerGroup": "tc-injector.setns.net", "controllerKind": "TCInjector", "TCInjector":
+{"name":"example-delay"}, "namespace": "", "name": "example-delay", "reconcileID": "88f0ad2a-1b41-4946-a3dc-a5b359180fbb", "request": {"name":"example-delay"}, "pod": "ipvlan-1",
+"iface": "6af924439fdb769", "delayMs": 682, "tcCmd": "tc qdisc replace dev 6af924439fdb769 root handle 1: netem delay 682ms"}
+```
+Podのアノテーションは次のようになっています。
+```
+    k8s.v1.cni.cncf.io/network-status: |-
+      [{
+          "name": "ovn-kubernetes",
+          "interface": "eth0",
+          "ips": [
+              "10.128.7.47"
+          ],
+          "mac": "0a:58:0a:80:07:2f",
+          "default": true,
+          "dns": {}
+      },{
+          "name": "tmp/nad-ipvlan-1",
+          "interface": "net1",
+          "ips": [
+              "172.17.10.11"
+          ],
+          "mac": "52:54:00:73:ce:05",
+          "dns": {}
+      }]
+    k8s.v1.cni.cncf.io/networks: '[ { "name": "nad-ipvlan-1", "ips": [ "172.17.10.11/24"
+      ] } ]'
+```
+引き続き調査をお願いします
+
+⏺ ログとアノテーションの内容から2つの問題が特定できます。
+
+  問題 1（直接原因）— CRD が再 apply されていない
+
+  rule.MultusNetworks が空なら len(nadNames) == 0 の早期 return で ログが一切出ません。ユーザーが観察した「multus ログなし」はこれと一致します。
+
+  Kubernetes は CRD スキーマに存在しないフィールドを サイレントに削除（prune） します。multusNetworks を追加した CRD が再 apply されていないと、TCInjector の YAML に書いた
+  multusNetworks が etcd への保存時に消去されます。コントローラが読むオブジェクトには multusNetworks が空のまま届きます。
+
+  問題 2（次に当たるバグ）— アノテーションキーの typo
+
+  Pod のアノテーションを見ると：
+
+  k8s.v1.cni.cncf.io/network-status   ← 実際のキー（networks に s がない）
+
+  コードの定数は：
+
+  const multusNetworkStatusAnnotation = "k8s.v1.cni.cncf.io/networks-status"
+  //                                                           ^^^^^^^^ s が余分
+
+  Multus が使う正式なキーは network-attachment-definition-client ライブラリで定義されており network-status（s なし）です。CRD 問題を解消した後、次はこの mismatch
+  でアノテーションが見つからずやはり inject されません。
+
+  修正
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 3 lines, removed 1 line
+      29
+      30  // multusNetworkStatusAnnotation is the pod annotation written by Multus that lists
+      31  // all attached network interfaces and their NetworkAttachmentDefinition names.
+      32 -const multusNetworkStatusAnnotation = "k8s.v1.cni.cncf.io/networks-status"
+      32 +// The authoritative key is defined in the network-attachment-definition-client library
+      33 +// as NetworkStatusAnnot = "k8s.v1.cni.cncf.io/network-status" (no trailing 's' on "network").
+      34 +const multusNetworkStatusAnnotation = "k8s.v1.cni.cncf.io/network-status"
+      35
+      36  // VethFinder resolves a container ID to the host-side veth interface name/ifindex
+      37  // and to the pod's network namespace path.
+
+⏺ Bash(go build ./... && go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       0.716s
+     … +2 lines (ctrl+o to expand)
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ 対処手順
+
+  コードの再ビルド・再デプロイに加えて、以下の順序でクラスター側の操作が必要です：
+
+  # 1. CRD を再 apply（multusNetworks フィールドをスキーマに登録）
+  kubectl apply -f config/crd/tcinjector.yaml
+
+  # 2. TCInjector を削除して再作成（既存オブジェクトから pruned されたフィールドを復元）
+  kubectl delete tcinjector example-delay
+  kubectl apply -f your-tcinjector.yaml
+
+  # 3. 新しいイメージをデプロイ
+  kubectl rollout restart daemonset/tc-injector -n tc-injector-system
+
+  CRD を先に apply しないと手順 2 でも multusNetworks がまた消えます。
+
+  修正内容まとめ
+
+  ┌─────┬──────────────────────────────┬─────────────────────────────────────────────────────────────┬───────────────────────────────────────┐
+  │  #  │             問題             │                            原因                             │                 修正                  │
+  ├─────┼──────────────────────────────┼─────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+  │ 1   │ multusNetworks が無視される  │ CRD スキーマ未更新により Kubernetes がフィールドを prune    │ CRD 再 apply が必要（コード変更なし） │
+  ├─────┼──────────────────────────────┼─────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+  │ 2   │ アノテーションが見つからない │ networks-status（s あり）と network-status（s なし）の typo │ 定数を network-status に修正          │
+  └─────┴──────────────────────────────┴─────────────────────────────────────────────────────────────┴───────────────────────────────────────┘
+
+✻ Cogitated for 1m 31s
+```
