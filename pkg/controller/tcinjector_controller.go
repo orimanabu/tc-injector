@@ -80,6 +80,7 @@ type injectedState struct {
 	podName          string
 	podNamespace     string
 	delayMs          int32
+	primaryInjected  bool // true when a tc rule is active on the primary interface
 	tcCmd            string
 	multusInterfaces []multusInjectedState
 }
@@ -87,6 +88,7 @@ type injectedState struct {
 // desiredPodState holds the computed tc configuration that should be applied to a pod.
 type desiredPodState struct {
 	delayMs          int32
+	injectPrimary    bool // whether to inject delay on the primary interface
 	multusInterfaces []multusDesiredIface
 }
 
@@ -208,6 +210,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				}
 				desired[uid] = desiredPodState{
 					delayMs:          delayMs,
+					injectPrimary:    rule.InjectPrimaryInterface == nil || *rule.InjectPrimaryInterface,
 					multusInterfaces: multusIfaces,
 				}
 			}
@@ -218,8 +221,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	for uid, state := range r.injected {
 		if _, ok := desired[uid]; !ok {
 			logger.Info("removing tc rules", "podUID", uid, "iface", state.ifaceName)
-			if err := r.TCApplier.Remove(state.ifaceName); err != nil {
-				logger.Error(err, "failed to remove tc rule", "iface", state.ifaceName)
+			if state.primaryInjected {
+				if err := r.TCApplier.Remove(state.ifaceName); err != nil {
+					logger.Error(err, "failed to remove tc rule", "iface", state.ifaceName)
+				}
 			}
 			for _, mi := range state.multusInterfaces {
 				if err := r.TCApplier.RemoveInNetns(mi.netnsPath, mi.ifaceName); err != nil {
@@ -264,22 +269,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		existing := r.injected[uid]
 
 		// Check whether primary interface or Multus interfaces changed.
-		primaryUnchanged := existing.ifaceName == iface && existing.delayMs == des.delayMs
+		// primaryUnchanged considers both the desired injection flag and the current state.
+		var primaryUnchanged bool
+		if !des.injectPrimary {
+			// Desired: no primary injection. Unchanged only if primary was already not injected.
+			primaryUnchanged = !existing.primaryInjected
+		} else {
+			// Desired: inject primary. Unchanged if same iface, same delay, and was already injected.
+			primaryUnchanged = existing.primaryInjected &&
+				existing.ifaceName == iface &&
+				existing.delayMs == des.delayMs
+		}
 		multusUnchanged := multusIfaceSetsEqual(existing.multusInterfaces, des.multusInterfaces, des.delayMs)
 		if primaryUnchanged && multusUnchanged {
 			injectedCount++
 			continue
 		}
 
-		// Apply primary interface if changed.
+		// Apply or remove the primary interface rule as needed.
 		var newTCCmd string
 		if !primaryUnchanged {
-			newTCCmd = fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, des.delayMs)
-			logger.Info("applying tc delay", "pod", pod.Name, "iface", iface,
-				"delayMs", des.delayMs, "tcCmd", newTCCmd)
-			if err := r.TCApplier.Apply(iface, des.delayMs); err != nil {
-				logger.Error(err, "tc apply failed", "iface", iface)
-				continue
+			if des.injectPrimary {
+				newTCCmd = fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, des.delayMs)
+				logger.Info("applying tc delay", "pod", pod.Name, "iface", iface,
+					"delayMs", des.delayMs, "tcCmd", newTCCmd)
+				if err := r.TCApplier.Apply(iface, des.delayMs); err != nil {
+					logger.Error(err, "tc apply failed", "iface", iface)
+					continue
+				}
+			} else if existing.primaryInjected {
+				// injectPrimary toggled from true to false — remove the existing rule.
+				logger.Info("removing primary tc rule (injectPrimaryInterface=false)",
+					"pod", pod.Name, "iface", iface)
+				if err := r.TCApplier.Remove(iface); err != nil {
+					logger.Error(err, "tc remove failed", "iface", iface)
+				}
 			}
 		} else {
 			newTCCmd = existing.tcCmd
@@ -348,6 +372,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			podName:          pod.Name,
 			podNamespace:     pod.Namespace,
 			delayMs:          des.delayMs,
+			primaryInjected:  des.injectPrimary,
 			tcCmd:            newTCCmd,
 			multusInterfaces: newMultus,
 		}
@@ -363,13 +388,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
 		for _, state := range r.injected {
 			podStatus := tcv1alpha1.InjectedPodStatus{
-				NodeName:       r.NodeName,
-				Namespace:      state.podNamespace,
-				PodName:        state.podName,
-				Interface:      state.ifaceName,
-				InterfaceIndex: int32(state.ifaceIndex),
-				DelayMs:        state.delayMs,
-				TCCommand:      state.tcCmd,
+				NodeName:  r.NodeName,
+				Namespace: state.podNamespace,
+				PodName:   state.podName,
+				DelayMs:   state.delayMs,
+			}
+			if state.primaryInjected {
+				podStatus.Interface      = state.ifaceName
+				podStatus.InterfaceIndex = int32(state.ifaceIndex)
+				podStatus.TCCommand      = state.tcCmd
 			}
 			for _, mi := range state.multusInterfaces {
 				podStatus.MultusInterfaces = append(podStatus.MultusInterfaces,

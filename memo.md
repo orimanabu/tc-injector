@@ -6749,3 +6749,363 @@ Podのアノテーションは次のようになっています。
 
 ✻ Cogitated for 1m 31s
 ```
+
+```
+❯ うまく動いたと思います。multus側のpingのRTTが遅くなりました。statusの出力を見ると、Podネットワーク側にも遅延が入っているように見えますがあってますか？multus側だけに遅延を入れる
+ような設定を実現したいのですが、TCInjector CRDをどのようなスキーマにすればよいと思いますか
+```
+  - delayMs: 614
+    interface: 6af924439fdb769
+    interfaceIndex: 3645
+    multusInterfaces:
+    - delayMs: 614
+      interface: net1
+      nadName: tmp/nad-ipvlan-1
+      tcCommand: 'nsenter --net=/proc/752739/ns/net -- tc qdisc replace dev net1 root
+        handle 1: netem delay 614ms'
+    namespace: tmp
+    nodeName: wk3
+    podName: ipvlan-1
+    tcCommand: 'tc qdisc replace dev 6af924439fdb769 root handle 1: netem delay 614ms'
+```
+
+⏺ はい、Status を見ると現状の動作は正しく理解できます。
+
+  - tcCommand: 'tc qdisc replace dev 6af924439fdb769 ...' → プライマリ (eth0) にも遅延が入っている
+  - multusInterfaces[].tcCommand: 'nsenter ... dev net1 ...' → Multus (net1) にも入っている
+
+  現在の実装は「multusNetworks を指定した場合でもプライマリインターフェースに必ず遅延を追加し、さらに Multus 側にも追加する」という設計です。
+
+  CRD スキーマの提案
+
+  プライマリへの注入を制御する boolean フィールド injectPrimaryInterface を DelayRule に追加するのがシンプルで後方互換性も保てます。
+
+  # 提案するスキーマ (DelayRule)
+  rules:
+    - selector:
+        matchLabels:
+          app: multus-ipvlan
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: tmp
+      minDelay: 600
+      maxDelay: 700
+      multusNetworks:
+        - tmp/nad-ipvlan-1
+      injectPrimaryInterface: false   # ← 追加フィールド。false にするとeth0をスキップ
+
+  ┌────────────────────────┬─────────────────────┬─────────────────────────────────────────────┐
+  │ injectPrimaryInterface │ multusNetworks 指定 │                    動作                     │
+  ├────────────────────────┼─────────────────────┼─────────────────────────────────────────────┤
+  │ true（デフォルト）     │ なし                │ プライマリのみ注入（従来と同じ）            │
+  ├────────────────────────┼─────────────────────┼─────────────────────────────────────────────┤
+  │ true（デフォルト）     │ あり                │ プライマリ ＋ Multus 両方注入（現在の動作） │
+  ├────────────────────────┼─────────────────────┼─────────────────────────────────────────────┤
+  │ false                  │ あり                │ Multus のみ注入（今回実現したいもの）       │
+  ├────────────────────────┼─────────────────────┼─────────────────────────────────────────────┤
+  │ false                  │ なし                │ 何も注入しない（無意味な設定だが許容）      │
+  └────────────────────────┴─────────────────────┴─────────────────────────────────────────────┘
+
+  デフォルトを true にしておけば既存の TCInjector リソースへの影響はありません。
+
+  実装しますか？
+
+✻ Brewed for 44s
+
+❯ お願いします
+
+⏺ 実装します。変更するファイルを確認してから作業を始めます。
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ 全体像を把握しました。実装します。
+
+  1. pkg/api/v1alpha1/types.go
+
+⏺ Update(pkg/api/v1alpha1/types.go)
+  ⎿  Added 7 lines, removed 1 line
+      50    // MultusNetworks is an optional list of NetworkAttachmentDefinition names whose
+      51    // pod-side interfaces should also receive delay injection.
+      52    // Each entry may be "name" (matches any namespace) or "namespace/name" (exact match).
+      53 -  // Interfaces are resolved via the k8s.v1.cni.cncf.io/networks-status pod annotation.
+      53 +  // Interfaces are resolved via the k8s.v1.cni.cncf.io/network-status pod annotation.
+      54    // If empty, only the primary interface is targeted.
+      55    // +optional
+      56    MultusNetworks []string `json:"multusNetworks,omitempty"`
+      57 +  // InjectPrimaryInterface controls whether delay is injected on the pod's primary
+      58 +  // interface (eth0). Defaults to true for backward compatibility.
+      59 +  // Set to false when delay should be applied only to interfaces listed in MultusNetworks.
+      60 +  // +optional
+      61 +  // +kubebuilder:default=true
+      62 +  InjectPrimaryInterface *bool `json:"injectPrimaryInterface,omitempty"`
+      63  }
+      64
+      65  // InjectedInterfaceStatus describes a tc rule applied to a Multus-managed interface.
+
+⏺ 2. zz_generated.deepcopy.go
+
+⏺ Update(pkg/api/v1alpha1/zz_generated.deepcopy.go)
+  ⎿  Added 5 lines
+      171      *out = make([]string, len(*in))
+      172      copy(*out, *in)
+      173    }
+      174 +  if in.InjectPrimaryInterface != nil {
+      175 +    in, out := &in.InjectPrimaryInterface, &out.InjectPrimaryInterface
+      176 +    *out = new(bool)
+      177 +    **out = **in
+      178 +  }
+      179  }
+      180
+      181  // DeepCopy returns a deep copy of this DelayRule.
+
+⏺ 3. pkg/controller/tcinjector_controller.go
+
+  desiredPodState と injectedState に injectPrimary / primaryInjected を追加します。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 1 line
+      87  // desiredPodState holds the computed tc configuration that should be applied to a pod.
+      88  type desiredPodState struct {
+      89    delayMs          int32
+      90 +  injectPrimary    bool // whether to inject delay on the primary interface
+      91    multusInterfaces []multusDesiredIface
+      92  }
+      93
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 1 line
+      80    podName          string
+      81    podNamespace     string
+      82    delayMs          int32
+      83 +  primaryInjected  bool // true when a tc rule is active on the primary interface
+      84    tcCmd            string
+      85    multusInterfaces []multusInjectedState
+      86  }
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ desired state 構築部分で injectPrimary を設定します。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 1 line
+      210          }
+      211          desired[uid] = desiredPodState{
+      212            delayMs:          delayMs,
+      213 +          injectPrimary:    rule.InjectPrimaryInterface == nil || *rule.InjectPrimaryInterface,
+      214            multusInterfaces: multusIfaces,
+      215          }
+      216        }
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ 不要になった Pod の削除時に primaryInjected を見て Remove するよう修正します。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 4 lines, removed 2 lines
+      221    for uid, state := range r.injected {
+      222      if _, ok := desired[uid]; !ok {
+      223        logger.Info("removing tc rules", "podUID", uid, "iface", state.ifaceName)
+      224 -      if err := r.TCApplier.Remove(state.ifaceName); err != nil {
+      225 -        logger.Error(err, "failed to remove tc rule", "iface", state.ifaceName)
+      224 +      if state.primaryInjected {
+      225 +        if err := r.TCApplier.Remove(state.ifaceName); err != nil {
+      226 +          logger.Error(err, "failed to remove tc rule", "iface", state.ifaceName)
+      227 +        }
+      228        }
+      229        for _, mi := range state.multusInterfaces {
+      230          if err := r.TCApplier.RemoveInNetns(mi.netnsPath, mi.ifaceName); err != nil {
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ apply ループで primaryUnchanged の判定と apply/remove ロジックを書き換えます。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 27 lines, removed 8 lines
+      269      existing := r.injected[uid]
+      270
+      271      // Check whether primary interface or Multus interfaces changed.
+      272 -    primaryUnchanged := existing.ifaceName == iface && existing.delayMs == des.delayMs
+      272 +    // primaryUnchanged considers both the desired injection flag and the current state.
+      273 +    var primaryUnchanged bool
+      274 +    if !des.injectPrimary {
+      275 +      // Desired: no primary injection. Unchanged only if primary was already not injected.
+      276 +      primaryUnchanged = !existing.primaryInjected
+      277 +    } else {
+      278 +      // Desired: inject primary. Unchanged if same iface, same delay, and was already injected.
+      279 +      primaryUnchanged = existing.primaryInjected &&
+      280 +        existing.ifaceName == iface &&
+      281 +        existing.delayMs == des.delayMs
+      282 +    }
+      283      multusUnchanged := multusIfaceSetsEqual(existing.multusInterfaces, des.multusInterfaces, des.delayMs)
+      284      if primaryUnchanged && multusUnchanged {
+      285        injectedCount++
+      286        continue
+      287      }
+      288
+      279 -    // Apply primary interface if changed.
+      289 +    // Apply or remove the primary interface rule as needed.
+      290      var newTCCmd string
+      291      if !primaryUnchanged {
+      282 -      newTCCmd = fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, des.delayMs)
+      283 -      logger.Info("applying tc delay", "pod", pod.Name, "iface", iface,
+      284 -        "delayMs", des.delayMs, "tcCmd", newTCCmd)
+      285 -      if err := r.TCApplier.Apply(iface, des.delayMs); err != nil {
+      286 -        logger.Error(err, "tc apply failed", "iface", iface)
+      287 -        continue
+      292 +      if des.injectPrimary {
+      293 +        newTCCmd = fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, des.delayMs)
+      294 +        logger.Info("applying tc delay", "pod", pod.Name, "iface", iface,
+      295 +          "delayMs", des.delayMs, "tcCmd", newTCCmd)
+      296 +        if err := r.TCApplier.Apply(iface, des.delayMs); err != nil {
+      297 +          logger.Error(err, "tc apply failed", "iface", iface)
+      298 +          continue
+      299 +        }
+      300 +      } else if existing.primaryInjected {
+      301 +        // injectPrimary toggled from true to false — remove the existing rule.
+      302 +        logger.Info("removing primary tc rule (injectPrimaryInterface=false)",
+      303 +          "pod", pod.Name, "iface", iface)
+      304 +        if err := r.TCApplier.Remove(iface); err != nil {
+      305 +          logger.Error(err, "tc remove failed", "iface", iface)
+      306 +        }
+      307        }
+      308      } else {
+      309        newTCCmd = existing.tcCmd
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ r.injected[uid] への格納と status 生成を更新します。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 1 line
+      372        podName:          pod.Name,
+      373        podNamespace:     pod.Namespace,
+      374        delayMs:          des.delayMs,
+      375 +      primaryInjected:  des.injectPrimary,
+      376        tcCmd:            newTCCmd,
+      377        multusInterfaces: newMultus,
+      378      }
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ status 出力でプライマリが inject されていない場合は interface/tcCommand を省略します。
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 9 lines, removed 7 lines
+      388      thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
+      389      for _, state := range r.injected {
+      390        podStatus := tcv1alpha1.InjectedPodStatus{
+      391 -        NodeName:       r.NodeName,
+      392 -        Namespace:      state.podNamespace,
+      393 -        PodName:        state.podName,
+      394 -        Interface:      state.ifaceName,
+      395 -        InterfaceIndex: int32(state.ifaceIndex),
+      396 -        DelayMs:        state.delayMs,
+      397 -        TCCommand:      state.tcCmd,
+      391 +        NodeName:  r.NodeName,
+      392 +        Namespace: state.podNamespace,
+      393 +        PodName:   state.podName,
+      394 +        DelayMs:   state.delayMs,
+      395        }
+      396 +      if state.primaryInjected {
+      397 +        podStatus.Interface      = state.ifaceName
+      398 +        podStatus.InterfaceIndex = int32(state.ifaceIndex)
+      399 +        podStatus.TCCommand      = state.tcCmd
+      400 +      }
+      401        for _, mi := range state.multusInterfaces {
+      402          podStatus.MultusInterfaces = append(podStatus.MultusInterfaces,
+      403            tcv1alpha1.InjectedInterfaceStatus{
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ 4. config/crd/tcinjector.yaml
+
+⏺ Update(config/crd/tcinjector.yaml)
+  ⎿  Added 8 lines, removed 1 line
+      108                            Optional list of NetworkAttachmentDefinition names whose pod-side
+      109                            interfaces also receive delay injection. Each entry may be "name"
+      110                            (matches any namespace) or "namespace/name" (exact match).
+      111 -                          Interfaces are resolved via the k8s.v1.cni.cncf.io/networks-status
+      111 +                          Interfaces are resolved via the k8s.v1.cni.cncf.io/network-status
+      112                            pod annotation. If omitted, only the primary interface is targeted.
+      113                          items:
+      114                            type: string
+      115 +                      injectPrimaryInterface:
+      116 +                        type: boolean
+      117 +                        default: true
+      118 +                        description: >
+      119 +                          When false, skip tc delay injection on the pod's primary interface
+      120 +                          (eth0/veth). Use this to inject delay only on interfaces listed in
+      121 +                          multusNetworks. Defaults to true for backward compatibility.
+      122              status:
+      123                type: object
+      124                properties:
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ 5. config/samples/tcinjector-example.yaml
+
+⏺ Update(config/samples/tcinjector-example.yaml)
+  ⎿  Added 11 lines, removed 4 lines
+      35        minDelay: 5
+      36        maxDelay: 30
+      37
+      38 -    # Add 20–80 ms delay on both the primary interface and a Multus-attached interface
+      39 -    # (NetworkAttachmentDefinition "mynetwork" in the "default" namespace).
+      40 -    # The NAD name may be specified as "default/mynetwork" (exact) or just "mynetwork"
+      41 -    # (matches that name in any namespace).
+      38 +    # Add 20–80 ms delay on both the primary interface and a Multus-attached interface.
+      39      - selector:
+      40          matchLabels:
+      41            app: worker
+      42        minDelay: 20
+      43        maxDelay: 80
+      44        multusNetworks:
+      45 +        - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
+      46 +
+      47 +    # Add 100–200 ms delay on a Multus interface ONLY (primary interface is skipped).
+      48 +    - selector:
+      49 +        matchLabels:
+      50 +          app: multus-only
+      51 +      minDelay: 100
+      52 +      maxDelay: 200
+      53 +      injectPrimaryInterface: false
+      54 +      multusNetworks:
+      55          - default/mynetwork
+
+⏺ ビルド・テストで確認します。
+
+⏺ Bash(go build ./... && go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       0.709s
+     … +2 lines (ctrl+o to expand)
+
+⏺ ---
+  実装が完了しました。使い方は次のとおりです。
+
+  Multus インターフェースのみに遅延を入れる設定:
+
+  - selector:
+      matchLabels:
+        app: multus-ipvlan
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: tmp
+    minDelay: 600
+    maxDelay: 700
+    injectPrimaryInterface: false   # ← これを追加
+    multusNetworks:
+      - tmp/nad-ipvlan-1
+
+  期待される status:
+
+  - delayMs: 659
+    # interface / tcCommand は出力されない（プライマリに tc 未適用）
+    multusInterfaces:
+    - delayMs: 659
+      interface: net1
+      nadName: tmp/nad-ipvlan-1
+      tcCommand: 'nsenter --net=/proc/752739/ns/net -- tc qdisc replace dev net1 ...'
+    namespace: tmp
+    nodeName: wk3
+    podName: ipvlan-1
+
+  反映には CRD の再 apply も必要です:
+
+  kubectl apply -f config/crd/tcinjector.yaml
+
+✻ Worked for 2m 39s
+```
