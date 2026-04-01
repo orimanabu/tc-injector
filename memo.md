@@ -7109,3 +7109,540 @@ Podのアノテーションは次のようになっています。
 
 ✻ Worked for 2m 39s
 ```
+
+```
+❯ READMEも更新お願いします。テストコードももしなければ追加してください
+
+✻ Conversation compacted (ctrl+o for history)
+
+  ⎿  Read config/samples/tcinjector-example.yaml (56 lines)
+  ⎿  Read config/crd/tcinjector.yaml (205 lines)
+  ⎿  Referenced file pkg/controller/tcinjector_controller.go
+  ⎿  Read pkg/api/v1alpha1/zz_generated.deepcopy.go (190 lines)
+  ⎿  Read pkg/api/v1alpha1/types.go (116 lines)
+
+  Searched for 1 pattern, read 3 files (ctrl+o to expand)
+
+⏺ Now let me also look at a Multus-related test to understand the existing pattern:
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ Now I have everything I need. Let me add tests for injectPrimaryInterface and helper functions, then update the README.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now I'll add the tests. I'll append them to the test file after line 769:
+
+⏺ Update(pkg/controller/tcinjector_controller_test.go)
+  ⎿  Added 311 lines
+       766      t.Fatalf("expected 2 conditions, got %d", len(injector.Status.Conditions))
+       767    }
+       768  }
+       769 +
+       770 +// ---- injectPrimaryInterface tests ----
+       771 +
+       772 +func boolPtr(b bool) *bool { return &b }
+       773 +
+       774 +func TestReconcile_InjectPrimaryInterface_Default_AppliesPrimary(t *testing.T) {
+       775 +  // nil InjectPrimaryInterface (default) must apply tc to the primary interface.
+       776 +  pod := readyPod("pod1", "default", "node-1", "containerd://ipi1",
+       777 +    map[string]string{"app": "worker"})
+       778 +  injector := tcInjector("test", []tcv1alpha1.DelayRule{
+       779 +    {
+       780 +      Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+       781 +      MinDelay: 50, MaxDelay: 50,
+       782 +      // InjectPrimaryInterface: nil → treated as true
+       783 +    },
+       784 +  })
+       785 +  finder := newFakeVethFinder(map[string]string{"containerd://ipi1": "vethIPI1"})
+       786 +  applier := newFakeTCApplier()
+       787 +  r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+       788 +
+       789 +  _, err := r.Reconcile(context.Background(), reconcileReq("test"))
+       790 +  if err != nil {
+       791 +    t.Fatalf("Reconcile error: %v", err)
+       792 +  }
+       793 +  if !applier.isApplied("vethIPI1") {
+       794 +    t.Error("expected tc rule applied to primary interface vethIPI1")
+       795 +  }
+       796 +}
+       797 +
+       798 +func TestReconcile_InjectPrimaryInterface_True_AppliesPrimary(t *testing.T) {
+       799 +  // Explicit true must apply tc to the primary interface.
+       800 +  pod := readyPod("pod1", "default", "node-1", "containerd://ipi2",
+       801 +    map[string]string{"app": "worker"})
+       802 +  injector := tcInjector("test", []tcv1alpha1.DelayRule{
+       803 +    {
+       804 +      Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+       805 +      MinDelay:               40, MaxDelay: 40,
+       806 +      InjectPrimaryInterface: boolPtr(true),
+       807 +    },
+       808 +  })
+       809 +  finder := newFakeVethFinder(map[string]string{"containerd://ipi2": "vethIPI2"})
+       810 +  applier := newFakeTCApplier()
+       811 +  r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+       812 +
+       813 +  _, err := r.Reconcile(context.Background(), reconcileReq("test"))
+       814 +  if err != nil {
+       815 +    t.Fatalf("Reconcile error: %v", err)
+       816 +  }
+       817 +  if !applier.isApplied("vethIPI2") {
+       818 +    t.Error("expected tc rule applied to primary interface vethIPI2")
+       819 +  }
+       820 +}
+       821 +
+       822 +func TestReconcile_InjectPrimaryInterface_False_SkipsPrimary(t *testing.T) {
+       823 +  // injectPrimaryInterface: false with no multusNetworks → no tc applied at all.
+       824 +  pod := readyPod("pod1", "default", "node-1", "containerd://ipi3",
+       825 +    map[string]string{"app": "worker"})
+       826 +  injector := tcInjector("test", []tcv1alpha1.DelayRule{
+       827 +    {
+       828 +      Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+       829 +      MinDelay:               30, MaxDelay: 30,
+       830 +      InjectPrimaryInterface: boolPtr(false),
+       831 +    },
+       832 +  })
+       833 +  finder := newFakeVethFinder(map[string]string{"containerd://ipi3": "vethIPI3"})
+       834 +  applier := newFakeTCApplier()
+       835 +  r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+       836 +
+       837 +  _, err := r.Reconcile(context.Background(), reconcileReq("test"))
+       838 +  if err != nil {
+       839 +    t.Fatalf("Reconcile error: %v", err)
+       840 +  }
+       841 +  if applier.isApplied("vethIPI3") {
+       842 +    t.Error("expected primary interface to be skipped, but tc was applied")
+       843 +  }
+       844 +  if len(applier.applied) != 0 || len(applier.appliedNetns) != 0 {
+       845 +    t.Errorf("expected no tc rules applied at all, got host=%v netns=%v",
+       846 +      applier.applied, applier.appliedNetns)
+       847 +  }
+       848 +}
+       849 +
+       850 +func TestReconcile_InjectPrimaryInterface_False_MultusOnly(t *testing.T) {
+       851 +  // injectPrimaryInterface: false + multusNetworks → only Multus interface gets tc,
+       852 +  // primary interface is untouched.
+       853 +  const containerID = "containerd://ipi4"
+       854 +  const netnsPath = "/proc/9999/ns/net"
+       855 +  const multusAnnotation = `[{"name":"default/mynetwork","interface":"net1"}]`
+       856 +
+       857 +  pod := readyPod("pod1", "default", "node-1", containerID,
+       858 +    map[string]string{"app": "multus-only"})
+       859 +  pod.Annotations = map[string]string{
+       860 +    multusNetworkStatusAnnotation: multusAnnotation,
+       861 +  }
+       862 +  injector := tcInjector("test", []tcv1alpha1.DelayRule{
+       863 +    {
+       864 +      Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "multus-only"}},
+       865 +      MinDelay:               60, MaxDelay: 60,
+       866 +      MultusNetworks:         []string{"default/mynetwork"},
+       867 +      InjectPrimaryInterface: boolPtr(false),
+       868 +    },
+       869 +  })
+       870 +  finder := &fakeVethFinder{
+       871 +    mapping:      map[string]string{containerID: "vethIPI4"},
+       872 +    netnsMapping: map[string]string{containerID: netnsPath},
+       873 +  }
+       874 +  applier := newFakeTCApplier()
+       875 +  r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+       876 +
+       877 +  _, err := r.Reconcile(context.Background(), reconcileReq("test"))
+       878 +  if err != nil {
+       879 +    t.Fatalf("Reconcile error: %v", err)
+       880 +  }
+       881 +  if applier.isApplied("vethIPI4") {
+       882 +    t.Error("primary interface should be skipped when injectPrimaryInterface=false")
+       883 +  }
+       884 +  if !applier.isAppliedInNetns(netnsPath, "net1") {
+       885 +    t.Error("expected tc rule applied inside netns for Multus interface net1")
+       886 +  }
+       887 +  if applier.appliedNetns[netnsPath+":net1"] != 60 {
+       888 +    t.Errorf("Multus delay = %d, want 60", applier.appliedNetns[netnsPath+":net1"])
+       889 +  }
+       890 +}
+       891 +
+       892 +func TestReconcile_InjectPrimaryInterface_ToggleFalse_RemovesPrimary(t *testing.T) {
+       893 +  // First reconcile: injectPrimaryInterface=true → primary tc applied.
+       894 +  // Second reconcile: injectPrimaryInterface=false → primary tc removed.
+       895 +  const containerID = "containerd://ipi5"
+       896 +
+       897 +  pod := readyPod("pod1", "default", "node-1", containerID,
+       898 +    map[string]string{"app": "worker"})
+       899 +  injector := tcInjector("test", []tcv1alpha1.DelayRule{
+       900 +    {
+       901 +      Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+       902 +      MinDelay:               25, MaxDelay: 25,
+       903 +      InjectPrimaryInterface: boolPtr(true),
+       904 +    },
+       905 +  })
+       906 +  finder := newFakeVethFinder(map[string]string{containerID: "vethIPI5"})
+       907 +  applier := newFakeTCApplier()
+       908 +  r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+       909 +
+       910 +  // First reconcile: primary should be injected.
+       911 +  if _, err := r.Reconcile(context.Background(), reconcileReq("test")); err != nil {
+       912 +    t.Fatalf("first Reconcile error: %v", err)
+       913 +  }
+       914 +  if !applier.isApplied("vethIPI5") {
+       915 +    t.Fatal("expected primary interface to be injected after first reconcile")
+       916 +  }
+       917 +
+       918 +  // Update the injector to disable primary injection.
+       919 +  var current tcv1alpha1.TCInjector
+       920 +  if err := r.Client.Get(context.Background(), client.ObjectKey{Name: "test"}, &current); err != nil {
+       921 +    t.Fatalf("Get injector: %v", err)
+       922 +  }
+       923 +  current.Spec.Rules[0].InjectPrimaryInterface = boolPtr(false)
+       924 +  if err := r.Client.Update(context.Background(), &current); err != nil {
+       925 +    t.Fatalf("Update injector: %v", err)
+       926 +  }
+       927 +
+       928 +  // Second reconcile: primary should be removed.
+       929 +  if _, err := r.Reconcile(context.Background(), reconcileReq("test")); err != nil {
+       930 +    t.Fatalf("second Reconcile error: %v", err)
+       931 +  }
+       932 +  if applier.isApplied("vethIPI5") {
+       933 +    t.Error("expected primary interface tc to be removed after injectPrimaryInterface toggled to false")
+       934 +  }
+       935 +  if !applier.wasRemoved("vethIPI5") {
+       936 +    t.Error("expected Remove to be called for vethIPI5")
+       937 +  }
+       938 +}
+       939 +
+       940 +// ---- nadMatches tests ----
+       941 +
+       942 +func TestNadMatches(t *testing.T) {
+       943 +  tests := []struct {
+       944 +    annotationName string
+       945 +    nadName        string
+       946 +    want           bool
+       947 +  }{
+       948 +    // Exact namespace/name match.
+       949 +    {"default/mynetwork", "default/mynetwork", true},
+       950 +    // Name-only matches any namespace.
+       951 +    {"default/mynetwork", "mynetwork", true},
+       952 +    {"kube-system/mynetwork", "mynetwork", true},
+       953 +    // Name-only does not match a different name.
+       954 +    {"default/mynetwork", "other", false},
+       955 +    // Fully qualified nadName does not match different namespace.
+       956 +    {"default/mynetwork", "kube-system/mynetwork", false},
+       957 +    // Annotation name without namespace, exact match.
+       958 +    {"mynetwork", "mynetwork", true},
+       959 +    // Annotation name without namespace, name-only search (no slash in nadName).
+       960 +    // strings.Cut won't find "/" in annotationName → falls through to false.
+       961 +    {"mynetwork", "other", false},
+       962 +  }
+       963 +  for _, tt := range tests {
+       964 +    t.Run(tt.annotationName+"~"+tt.nadName, func(t *testing.T) {
+       965 +      if got := nadMatches(tt.annotationName, tt.nadName); got != tt.want {
+       966 +        t.Errorf("nadMatches(%q, %q) = %v, want %v",
+       967 +          tt.annotationName, tt.nadName, got, tt.want)
+       968 +      }
+       969 +    })
+       970 +  }
+       971 +}
+       972 +
+       973 +// ---- resolveMultusInterfaces tests ----
+       974 +
+       975 +func TestResolveMultusInterfaces(t *testing.T) {
+       976 +  logger := logr.Discard()
+       977 +
+       978 +  t.Run("empty nadNames returns nil", func(t *testing.T) {
+       979 +    pod := &corev1.Pod{}
+       980 +    if got := resolveMultusInterfaces(logger, pod, nil); got != nil {
+       981 +      t.Errorf("expected nil, got %v", got)
+       982 +    }
+       983 +  })
+       984 +
+       985 +  t.Run("annotation absent returns nil", func(t *testing.T) {
+       986 +    pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}}
+       987 +    if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
+       988 +      t.Errorf("expected nil when annotation absent, got %v", got)
+       989 +    }
+       990 +  })
+       991 +
+       992 +  t.Run("invalid JSON returns nil", func(t *testing.T) {
+       993 +    pod := &corev1.Pod{
+       994 +      ObjectMeta: metav1.ObjectMeta{
+       995 +        Name:      "p",
+       996 +        Namespace: "default",
+       997 +        Annotations: map[string]string{
+       998 +          multusNetworkStatusAnnotation: "not-json",
+       999 +        },
+      1000 +      },
+      1001 +    }
+      1002 +    if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
+      1003 +      t.Errorf("expected nil on JSON error, got %v", got)
+      1004 +    }
+      1005 +  })
+      1006 +
+      1007 +  t.Run("exact namespace/name match", func(t *testing.T) {
+      1008 +    pod := &corev1.Pod{
+      1009 +      ObjectMeta: metav1.ObjectMeta{
+      1010 +        Name:      "p",
+      1011 +        Namespace: "default",
+      1012 +        Annotations: map[string]string{
+      1013 +          multusNetworkStatusAnnotation: `[{"name":"default/mynetwork","interface":"net1"}]`,
+      1014 +        },
+      1015 +      },
+      1016 +    }
+      1017 +    got := resolveMultusInterfaces(logger, pod, []string{"default/mynetwork"})
+      1018 +    if len(got) != 1 {
+      1019 +      t.Fatalf("expected 1 result, got %d", len(got))
+      1020 +    }
+      1021 +    if got[0].nadName != "default/mynetwork" || got[0].ifaceName != "net1" {
+      1022 +      t.Errorf("unexpected result: %+v", got[0])
+      1023 +    }
+      1024 +  })
+      1025 +
+      1026 +  t.Run("name-only match across namespace", func(t *testing.T) {
+      1027 +    pod := &corev1.Pod{
+      1028 +      ObjectMeta: metav1.ObjectMeta{
+      1029 +        Name:      "p",
+      1030 +        Namespace: "default",
+      1031 +        Annotations: map[string]string{
+      1032 +          multusNetworkStatusAnnotation: `[{"name":"kube-system/mynetwork","interface":"net2"}]`,
+      1033 +        },
+      1034 +      },
+      1035 +    }
+      1036 +    got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"})
+      1037 +    if len(got) != 1 {
+      1038 +      t.Fatalf("expected 1 result, got %d", len(got))
+      1039 +    }
+      1040 +    if got[0].ifaceName != "net2" {
+      1041 +      t.Errorf("expected interface net2, got %q", got[0].ifaceName)
+      1042 +    }
+      1043 +  })
+      1044 +
+      1045 +  t.Run("no match returns nil", func(t *testing.T) {
+      1046 +    pod := &corev1.Pod{
+      1047 +      ObjectMeta: metav1.ObjectMeta{
+      1048 +        Name:      "p",
+      1049 +        Namespace: "default",
+      1050 +        Annotations: map[string]string{
+      1051 +          multusNetworkStatusAnnotation: `[{"name":"default/other","interface":"net1"}]`,
+      1052 +        },
+      1053 +      },
+      1054 +    }
+      1055 +    if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
+      1056 +      t.Errorf("expected nil for no match, got %v", got)
+      1057 +    }
+      1058 +  })
+      1059 +
+      1060 +  t.Run("skips entry with empty interface name", func(t *testing.T) {
+      1061 +    pod := &corev1.Pod{
+      1062 +      ObjectMeta: metav1.ObjectMeta{
+      1063 +        Name:      "p",
+      1064 +        Namespace: "default",
+      1065 +        Annotations: map[string]string{
+      1066 +          // First entry has no interface (typical for the pod's own default network).
+      1067 +          multusNetworkStatusAnnotation: `[{"name":"default/mynetwork","interface":""},{"name":"default/mynetwork","interface":"net1"}]`,
+      1068 +        },
+      1069 +      },
+      1070 +    }
+      1071 +    got := resolveMultusInterfaces(logger, pod, []string{"default/mynetwork"})
+      1072 +    if len(got) != 1 {
+      1073 +      t.Fatalf("expected 1 result (empty interface skipped), got %d", len(got))
+      1074 +    }
+      1075 +    if got[0].ifaceName != "net1" {
+      1076 +      t.Errorf("expected interface net1, got %q", got[0].ifaceName)
+      1077 +    }
+      1078 +  })
+      1079 +}
+
+⏺ Now I need to add the logr import since resolveMultusInterfaces tests use logr.Discard():
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ Update(pkg/controller/tcinjector_controller_test.go)
+  ⎿  Added 1 line
+       7    "testing"
+       8    "time"
+       9
+      10 +  "github.com/go-logr/logr"
+      11    corev1 "k8s.io/api/core/v1"
+      12    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+      13    "k8s.io/apimachinery/pkg/runtime"
+
+⏺ Now let's compile-check the tests:
+
+⏺ Bash(go build ./pkg/controller/... 2>&1)
+  ⎿  (No output)
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ Bash(go test ./pkg/controller/... 2>&1)
+  ⎿  ok         github.com/tc-injector/tc-injector/pkg/controller       0.752s
+
+⏺ All tests pass. Now update the README:
+
+⏺ Update(README.md)
+  ⎿  Added 1 line
+      157  | `spec.rules[].minDelay` | `int32` (ms) | Yes | Minimum delay (>= 0) |
+      158  | `spec.rules[].maxDelay` | `int32` (ms) | Yes | Maximum delay (>= minDelay) |
+      159  | `spec.rules[].multusNetworks` | `[]string` | No | Multus NAD names to inject delay into in addition to the primary interface. See [Multus interface targeting](#
+           multus-interface-targeting). |
+      160 +| `spec.rules[].injectPrimaryInterface` | `bool` | No | When `false`, skip tc delay injection on the pod's primary interface (`eth0`/`veth`). Use this to target o
+          +nly the interfaces listed in `multusNetworks`. Default: `true`. |
+      161  | `spec.enablePeriodicDelayRotation` | `bool` | No | Periodically re-randomize delays. Default: `false` |
+      162  | `spec.delayInterval` | `Duration` | No | Re-randomization interval. Default: `30s` |
+      163
+
+⏺ Now update the CRD schema reference example to show injectPrimaryInterface:
+
+⏺ Update(README.md)
+  ⎿  Added 1 line
+      135        maxDelay: 50           # (required) Maximum delay in milliseconds (>= minDelay)
+      136        multusNetworks:        # (optional) Multus NAD names to also inject delay into
+      137          - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
+      138 +      injectPrimaryInterface: true  # (optional) set false to skip primary eth0/veth; default true
+      139
+      140    # enablePeriodicDelayRotation re-randomizes delays within [minDelay, maxDelay]
+      141    # at the interval specified by delayInterval.
+
+⏺ Now update the Multus interface targeting section to add the injectPrimaryInterface: false example and fix the annotation key:
+
+⏺ Update(README.md)
+  ⎿  Added 20 lines, removed 1 line
+      291          # - mynetwork         # name-only: matches "mynetwork" in any namespace
+      292  ```
+      293
+      294 -**How NAD names are matched** against the `k8s.v1.cni.cncf.io/networks-status` annotation:
+      294 +To inject delay **only on the Multus interface** and leave the primary interface (`eth0`) unaffected, set `injectPrimaryInterface: false`:
+      295
+      296 +```yaml
+      297 +apiVersion: tc-injector.setns.net/v1alpha1
+      298 +kind: TCInjector
+      299 +metadata:
+      300 +  name: multus-only-delay
+      301 +spec:
+      302 +  rules:
+      303 +    - selector:
+      304 +        matchLabels:
+      305 +          app: multus-only
+      306 +      minDelay: 100
+      307 +      maxDelay: 200
+      308 +      injectPrimaryInterface: false   # skip primary eth0/veth
+      309 +      multusNetworks:
+      310 +        - default/mynetwork
+      311 +```
+      312 +
+      313 +**How NAD names are matched** against the `k8s.v1.cni.cncf.io/network-status` annotation:
+      314 +
+      315  | Entry in `multusNetworks` | Matches annotation name |
+      316  |---|---|
+      317  | `default/mynetwork` | `default/mynetwork` (exact) |
+
+⏺ Now fix the other occurrences of networks-status (with 's') in the README:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+      45  pod net1 (ipvlan slave) ←─[netem delay, via nsenter]
+      46  ```
+      47
+      48 -Multus writes the list of attached interfaces and their NetworkAttachmentDefinition (NAD) names into the `k8s.v1.cni.cncf.io/networks-status` pod annotation. tc-in
+         -jector reads this annotation to resolve which interface name inside the pod corresponds to each requested NAD.
+      48 +Multus writes the list of attached interfaces and their NetworkAttachmentDefinition (NAD) names into the `k8s.v1.cni.cncf.io/network-status` pod annotation. tc-inj
+         +ector reads this annotation to resolve which interface name inside the pod corresponds to each requested NAD.
+      49
+      50  ### Rule Matching
+      51
+
+⏺ Update(README.md)
+  ⎿  Added 2 lines, removed 2 lines
+      436  kubectl get tcinjector <name> -o jsonpath='{.spec.rules}'
+      437
+      438  # Debug Multus interface resolution
+      439 -kubectl get pod <target-pod> -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/networks-status}' | jq .
+      439 +kubectl get pod <target-pod> -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}' | jq .
+      440  ```
+      441
+      442 -The `networks-status` annotation lists all attached interfaces. Confirm the `name` field matches the entry in `multusNetworks`. For example, if the annotation sho
+          -ws `"name": "default/mynetwork"`, the rule should specify `multusNetworks: [default/mynetwork]` or `multusNetworks: [mynetwork]`.
+      442 +The `network-status` annotation lists all attached interfaces. Confirm the `name` field matches the entry in `multusNetworks`. For example, if the annotation show
+          +s `"name": "default/mynetwork"`, the rule should specify `multusNetworks: [default/mynetwork]` or `multusNetworks: [mynetwork]`.
+      443
+      444  ## Uninstallation
+      445
+
+⏺ Now update the status example in README to show the injectPrimaryInterface: false scenario (primary-skipped output):
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 14 lines
+      348  status:
+      349    injectedPods: 2
+      350    injectedPodDetails:
+      351 +    # Pod with both primary and Multus interface injected (injectPrimaryInterface: true, default)
+      352      - nodeName: worker-1
+      353        namespace: default
+      354        podName: worker-abc
+     ...
+      361            interface: net1         # interface name inside the pod
+      362            delayMs: 37
+      363            tcCommand: "nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 37ms"
+      364 +    # Pod with Multus interface only (injectPrimaryInterface: false)
+      365 +    - nodeName: worker-1
+      366 +      namespace: default
+      367 +      podName: multus-only-xyz
+      368 +      interface: ""               # empty: primary interface was skipped
+      369 +      interfaceIndex: 0
+      370 +      delayMs: 150
+      371 +      tcCommand: ""
+      372 +      multusInterfaces:
+      373 +        - nadName: default/mynetwork
+      374 +          interface: net1
+      375 +          delayMs: 150
+      376 +          tcCommand: "nsenter --net=/proc/5678/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 150ms"
+      377    conditions:
+      378      - type: worker-1
+      379        status: "True"
+
+⏺ Now also update the troubleshooting table to mention injectPrimaryInterface:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 1 line
+      442  | Pod is not targeted despite matching labels | Namespace labels missing | Run `kubectl get namespace <ns> --show-labels` and add required labels |
+      443  | Multus interface not injected (`multusInterfaces` empty in status) | Annotation missing or NAD name mismatch | Check the pod annotation and NAD name format (see
+            below) |
+      444  | Log shows `skipping multus interface: netns path unavailable` | CRI lookup failed | Check DaemonSet logs for the preceding error from `FindNetnsPath` |
+      445 +| Primary interface delay unexpectedly absent | `injectPrimaryInterface: false` set in rule | This is intentional when targeting Multus interfaces only; set to `t
+          +rue` or omit to restore primary injection |
+      446
+      447  ```bash
+      448  # Debug selector matching
+
+⏺ Run the tests once more to confirm everything is clean:
+
+⏺ Bash(go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       (cached)
+     … +2 lines (ctrl+o to expand)
+
+⏺ All tests pass. Here's a summary of what was done:
+
+  Tests added (pkg/controller/tcinjector_controller_test.go):
+
+  - TestReconcile_InjectPrimaryInterface_Default_AppliesPrimary — nil field (backward compat) applies primary tc
+  - TestReconcile_InjectPrimaryInterface_True_AppliesPrimary — explicit true applies primary tc
+  - TestReconcile_InjectPrimaryInterface_False_SkipsPrimary — false with no multusNetworks → no tc applied anywhere
+  - TestReconcile_InjectPrimaryInterface_False_MultusOnly — false + multusNetworks → only Multus interface gets tc, primary untouched
+  - TestReconcile_InjectPrimaryInterface_ToggleFalse_RemovesPrimary — two reconciles: true→primary applied, false→primary removed
+  - TestNadMatches — table-driven tests for exact, name-only, and non-matching cases
+  - TestResolveMultusInterfaces — subtests for: empty nadNames, absent annotation, invalid JSON, exact match, name-only match, no match, empty interface skipped
+
+  README updates:
+
+  - Added injectPrimaryInterface row to the field reference table
+  - Added injectPrimaryInterface to the CRD schema example
+  - Added injectPrimaryInterface: false (Multus-only) example in the Multus targeting section
+  - Fixed annotation key networks-status → network-status (two occurrences)
+  - Expanded the status example to show what Multus-only output looks like
+  - Added troubleshooting row for absent primary delay
+```

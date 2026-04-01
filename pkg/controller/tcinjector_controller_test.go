@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -765,4 +766,315 @@ func TestSetCondition(t *testing.T) {
 	if len(injector.Status.Conditions) != 2 {
 		t.Fatalf("expected 2 conditions, got %d", len(injector.Status.Conditions))
 	}
+}
+
+// ---- injectPrimaryInterface tests ----
+
+func boolPtr(b bool) *bool { return &b }
+
+func TestReconcile_InjectPrimaryInterface_Default_AppliesPrimary(t *testing.T) {
+	// nil InjectPrimaryInterface (default) must apply tc to the primary interface.
+	pod := readyPod("pod1", "default", "node-1", "containerd://ipi1",
+		map[string]string{"app": "worker"})
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay: 50, MaxDelay: 50,
+			// InjectPrimaryInterface: nil → treated as true
+		},
+	})
+	finder := newFakeVethFinder(map[string]string{"containerd://ipi1": "vethIPI1"})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if !applier.isApplied("vethIPI1") {
+		t.Error("expected tc rule applied to primary interface vethIPI1")
+	}
+}
+
+func TestReconcile_InjectPrimaryInterface_True_AppliesPrimary(t *testing.T) {
+	// Explicit true must apply tc to the primary interface.
+	pod := readyPod("pod1", "default", "node-1", "containerd://ipi2",
+		map[string]string{"app": "worker"})
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay:               40, MaxDelay: 40,
+			InjectPrimaryInterface: boolPtr(true),
+		},
+	})
+	finder := newFakeVethFinder(map[string]string{"containerd://ipi2": "vethIPI2"})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if !applier.isApplied("vethIPI2") {
+		t.Error("expected tc rule applied to primary interface vethIPI2")
+	}
+}
+
+func TestReconcile_InjectPrimaryInterface_False_SkipsPrimary(t *testing.T) {
+	// injectPrimaryInterface: false with no multusNetworks → no tc applied at all.
+	pod := readyPod("pod1", "default", "node-1", "containerd://ipi3",
+		map[string]string{"app": "worker"})
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay:               30, MaxDelay: 30,
+			InjectPrimaryInterface: boolPtr(false),
+		},
+	})
+	finder := newFakeVethFinder(map[string]string{"containerd://ipi3": "vethIPI3"})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if applier.isApplied("vethIPI3") {
+		t.Error("expected primary interface to be skipped, but tc was applied")
+	}
+	if len(applier.applied) != 0 || len(applier.appliedNetns) != 0 {
+		t.Errorf("expected no tc rules applied at all, got host=%v netns=%v",
+			applier.applied, applier.appliedNetns)
+	}
+}
+
+func TestReconcile_InjectPrimaryInterface_False_MultusOnly(t *testing.T) {
+	// injectPrimaryInterface: false + multusNetworks → only Multus interface gets tc,
+	// primary interface is untouched.
+	const containerID = "containerd://ipi4"
+	const netnsPath = "/proc/9999/ns/net"
+	const multusAnnotation = `[{"name":"default/mynetwork","interface":"net1"}]`
+
+	pod := readyPod("pod1", "default", "node-1", containerID,
+		map[string]string{"app": "multus-only"})
+	pod.Annotations = map[string]string{
+		multusNetworkStatusAnnotation: multusAnnotation,
+	}
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "multus-only"}},
+			MinDelay:               60, MaxDelay: 60,
+			MultusNetworks:         []string{"default/mynetwork"},
+			InjectPrimaryInterface: boolPtr(false),
+		},
+	})
+	finder := &fakeVethFinder{
+		mapping:      map[string]string{containerID: "vethIPI4"},
+		netnsMapping: map[string]string{containerID: netnsPath},
+	}
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if applier.isApplied("vethIPI4") {
+		t.Error("primary interface should be skipped when injectPrimaryInterface=false")
+	}
+	if !applier.isAppliedInNetns(netnsPath, "net1") {
+		t.Error("expected tc rule applied inside netns for Multus interface net1")
+	}
+	if applier.appliedNetns[netnsPath+":net1"] != 60 {
+		t.Errorf("Multus delay = %d, want 60", applier.appliedNetns[netnsPath+":net1"])
+	}
+}
+
+func TestReconcile_InjectPrimaryInterface_ToggleFalse_RemovesPrimary(t *testing.T) {
+	// First reconcile: injectPrimaryInterface=true → primary tc applied.
+	// Second reconcile: injectPrimaryInterface=false → primary tc removed.
+	const containerID = "containerd://ipi5"
+
+	pod := readyPod("pod1", "default", "node-1", containerID,
+		map[string]string{"app": "worker"})
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay:               25, MaxDelay: 25,
+			InjectPrimaryInterface: boolPtr(true),
+		},
+	})
+	finder := newFakeVethFinder(map[string]string{containerID: "vethIPI5"})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	// First reconcile: primary should be injected.
+	if _, err := r.Reconcile(context.Background(), reconcileReq("test")); err != nil {
+		t.Fatalf("first Reconcile error: %v", err)
+	}
+	if !applier.isApplied("vethIPI5") {
+		t.Fatal("expected primary interface to be injected after first reconcile")
+	}
+
+	// Update the injector to disable primary injection.
+	var current tcv1alpha1.TCInjector
+	if err := r.Client.Get(context.Background(), client.ObjectKey{Name: "test"}, &current); err != nil {
+		t.Fatalf("Get injector: %v", err)
+	}
+	current.Spec.Rules[0].InjectPrimaryInterface = boolPtr(false)
+	if err := r.Client.Update(context.Background(), &current); err != nil {
+		t.Fatalf("Update injector: %v", err)
+	}
+
+	// Second reconcile: primary should be removed.
+	if _, err := r.Reconcile(context.Background(), reconcileReq("test")); err != nil {
+		t.Fatalf("second Reconcile error: %v", err)
+	}
+	if applier.isApplied("vethIPI5") {
+		t.Error("expected primary interface tc to be removed after injectPrimaryInterface toggled to false")
+	}
+	if !applier.wasRemoved("vethIPI5") {
+		t.Error("expected Remove to be called for vethIPI5")
+	}
+}
+
+// ---- nadMatches tests ----
+
+func TestNadMatches(t *testing.T) {
+	tests := []struct {
+		annotationName string
+		nadName        string
+		want           bool
+	}{
+		// Exact namespace/name match.
+		{"default/mynetwork", "default/mynetwork", true},
+		// Name-only matches any namespace.
+		{"default/mynetwork", "mynetwork", true},
+		{"kube-system/mynetwork", "mynetwork", true},
+		// Name-only does not match a different name.
+		{"default/mynetwork", "other", false},
+		// Fully qualified nadName does not match different namespace.
+		{"default/mynetwork", "kube-system/mynetwork", false},
+		// Annotation name without namespace, exact match.
+		{"mynetwork", "mynetwork", true},
+		// Annotation name without namespace, name-only search (no slash in nadName).
+		// strings.Cut won't find "/" in annotationName → falls through to false.
+		{"mynetwork", "other", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.annotationName+"~"+tt.nadName, func(t *testing.T) {
+			if got := nadMatches(tt.annotationName, tt.nadName); got != tt.want {
+				t.Errorf("nadMatches(%q, %q) = %v, want %v",
+					tt.annotationName, tt.nadName, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---- resolveMultusInterfaces tests ----
+
+func TestResolveMultusInterfaces(t *testing.T) {
+	logger := logr.Discard()
+
+	t.Run("empty nadNames returns nil", func(t *testing.T) {
+		pod := &corev1.Pod{}
+		if got := resolveMultusInterfaces(logger, pod, nil); got != nil {
+			t.Errorf("expected nil, got %v", got)
+		}
+	})
+
+	t.Run("annotation absent returns nil", func(t *testing.T) {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}}
+		if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
+			t.Errorf("expected nil when annotation absent, got %v", got)
+		}
+	})
+
+	t.Run("invalid JSON returns nil", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "p",
+				Namespace: "default",
+				Annotations: map[string]string{
+					multusNetworkStatusAnnotation: "not-json",
+				},
+			},
+		}
+		if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
+			t.Errorf("expected nil on JSON error, got %v", got)
+		}
+	})
+
+	t.Run("exact namespace/name match", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "p",
+				Namespace: "default",
+				Annotations: map[string]string{
+					multusNetworkStatusAnnotation: `[{"name":"default/mynetwork","interface":"net1"}]`,
+				},
+			},
+		}
+		got := resolveMultusInterfaces(logger, pod, []string{"default/mynetwork"})
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(got))
+		}
+		if got[0].nadName != "default/mynetwork" || got[0].ifaceName != "net1" {
+			t.Errorf("unexpected result: %+v", got[0])
+		}
+	})
+
+	t.Run("name-only match across namespace", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "p",
+				Namespace: "default",
+				Annotations: map[string]string{
+					multusNetworkStatusAnnotation: `[{"name":"kube-system/mynetwork","interface":"net2"}]`,
+				},
+			},
+		}
+		got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"})
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(got))
+		}
+		if got[0].ifaceName != "net2" {
+			t.Errorf("expected interface net2, got %q", got[0].ifaceName)
+		}
+	})
+
+	t.Run("no match returns nil", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "p",
+				Namespace: "default",
+				Annotations: map[string]string{
+					multusNetworkStatusAnnotation: `[{"name":"default/other","interface":"net1"}]`,
+				},
+			},
+		}
+		if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
+			t.Errorf("expected nil for no match, got %v", got)
+		}
+	})
+
+	t.Run("skips entry with empty interface name", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "p",
+				Namespace: "default",
+				Annotations: map[string]string{
+					// First entry has no interface (typical for the pod's own default network).
+					multusNetworkStatusAnnotation: `[{"name":"default/mynetwork","interface":""},{"name":"default/mynetwork","interface":"net1"}]`,
+				},
+			},
+		}
+		got := resolveMultusInterfaces(logger, pod, []string{"default/mynetwork"})
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result (empty interface skipped), got %d", len(got))
+		}
+		if got[0].ifaceName != "net1" {
+			t.Errorf("expected interface net1, got %q", got[0].ifaceName)
+		}
+	})
 }
