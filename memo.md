@@ -10353,3 +10353,558 @@ SCC等、セキュリティの観点でも見直して、もし必要な権限�
 
 ✻ Baked for 46s
 ```
+
+```
+❯ injectPrimaryInterfaceとmultusNetworksを、マップにまとめたいです。
+  ```
+  DelayRule
+  └── XXX
+       ├── injectPrimaryInterface
+       └── multusNetworks
+  ```
+  みたいなイメージにしたいのですが、XXXのところをどのような名前にすればよいと思いますか？tcTargetNetworkとかを思いついたのですが、もしもっといい名前があれば教えてください
+
+❯ `target`にしようと思います。実装をお願いします。ドキュメントとテストの更新もお願いします
+
+✻ Conversation compacted (ctrl+o for history)
+
+  ⎿  Read pkg/veth/finder.go (199 lines)
+  ⎿  Read pkg/tc/tc_test.go (316 lines)
+  ⎿  Read pkg/tc/tc.go (116 lines)
+  ⎿  Referenced file pkg/controller/tcinjector_controller.go
+  ⎿  Read pkg/api/v1alpha1/types.go (115 lines)
+
+  Read 5 files (ctrl+o to expand)
+
+⏺ Now I have a complete picture. Let me implement all the changes.
+
+⏺ Update(pkg/api/v1alpha1/types.go)
+  ⎿  Added 17 lines, removed 12 lines
+      33    DelayInterval *metav1.Duration `json:"delayInterval,omitempty"`
+      34  }
+      35
+      36 +// Target specifies which interfaces inside the pod should receive delay injection.
+      37 +type Target struct {
+      38 +  // Primary controls whether delay is injected on the pod's primary interface (eth0).
+      39 +  // Defaults to true when omitted.
+      40 +  // +optional
+      41 +  Primary *bool `json:"primary,omitempty"`
+      42 +  // MultusNetworks is an optional list of NetworkAttachmentDefinition names whose
+      43 +  // pod-side interfaces should also receive delay injection.
+      44 +  // Each entry may be "name" (matches any namespace) or "namespace/name" (exact match).
+      45 +  // Interfaces are resolved via the k8s.v1.cni.cncf.io/network-status pod annotation.
+      46 +  // +optional
+      47 +  MultusNetworks []string `json:"multusNetworks,omitempty"`
+      48 +}
+      49 +
+      50  // DelayRule pairs a pod label selector and a namespace selector with a delay range in milliseconds.
+      51  type DelayRule struct {
+      52    // Selector selects pods to inject delay into.
+     ...
+      61    // MaxDelay is the maximum delay in milliseconds. Must be >= MinDelay.
+      62    // +kubebuilder:validation:Minimum=0
+      63    MaxDelay int32 `json:"maxDelay"`
+      50 -  // MultusNetworks is an optional list of NetworkAttachmentDefinition names whose
+      51 -  // pod-side interfaces should also receive delay injection.
+      52 -  // Each entry may be "name" (matches any namespace) or "namespace/name" (exact match).
+      53 -  // Interfaces are resolved via the k8s.v1.cni.cncf.io/network-status pod annotation.
+      54 -  // If empty, only the primary interface is targeted.
+      64 +  // Target specifies which interfaces inside the pod should receive delay injection.
+      65 +  // If omitted, only the primary interface (eth0) is targeted.
+      66    // +optional
+      56 -  MultusNetworks []string `json:"multusNetworks,omitempty"`
+      57 -  // InjectPrimaryInterface controls whether delay is injected on the pod's primary
+      58 -  // interface (eth0). Defaults to true for backward compatibility.
+      59 -  // Set to false when delay should be applied only to interfaces listed in MultusNetworks.
+      60 -  // +optional
+      61 -  // +kubebuilder:default=true
+      62 -  InjectPrimaryInterface *bool `json:"injectPrimaryInterface,omitempty"`
+      67 +  Target *Target `json:"target,omitempty"`
+      68  }
+      69
+      70  // InjectedInterfaceStatus describes a tc rule applied to a Multus-managed interface.
+
+⏺ Now update deepcopy:
+
+⏺ Update(pkg/api/v1alpha1/zz_generated.deepcopy.go)
+  ⎿  Added 28 lines, removed 7 lines
+      162
+      163  // DeepCopyInto copies all properties of this object into another object of the
+      164  // same type that is provided as a pointer.
+      165 -func (in *DelayRule) DeepCopyInto(out *DelayRule) {
+      165 +func (in *Target) DeepCopyInto(out *Target) {
+      166    *out = *in
+      167 -  in.Selector.DeepCopyInto(&out.Selector)
+      168 -  in.NamespaceSelector.DeepCopyInto(&out.NamespaceSelector)
+      167 +  if in.Primary != nil {
+      168 +    in, out := &in.Primary, &out.Primary
+      169 +    *out = new(bool)
+      170 +    **out = **in
+      171 +  }
+      172    if in.MultusNetworks != nil {
+      173      in, out := &in.MultusNetworks, &out.MultusNetworks
+      174      *out = make([]string, len(*in))
+      175      copy(*out, *in)
+      176    }
+      174 -  if in.InjectPrimaryInterface != nil {
+      175 -    in, out := &in.InjectPrimaryInterface, &out.InjectPrimaryInterface
+      176 -    *out = new(bool)
+      177 -    **out = **in
+      177 +}
+      178 +
+      179 +// DeepCopy returns a deep copy of this Target.
+      180 +func (in *Target) DeepCopy() *Target {
+      181 +  if in == nil {
+      182 +    return nil
+      183    }
+      184 +  out := new(Target)
+      185 +  in.DeepCopyInto(out)
+      186 +  return out
+      187  }
+      188
+      189 +// DeepCopyInto copies all properties of this object into another object of the
+      190 +// same type that is provided as a pointer.
+      191 +func (in *DelayRule) DeepCopyInto(out *DelayRule) {
+      192 +  *out = *in
+      193 +  in.Selector.DeepCopyInto(&out.Selector)
+      194 +  in.NamespaceSelector.DeepCopyInto(&out.NamespaceSelector)
+      195 +  if in.Target != nil {
+      196 +    in, out := &in.Target, &out.Target
+      197 +    *out = new(Target)
+      198 +    (*in).DeepCopyInto(*out)
+      199 +  }
+      200 +}
+      201 +
+      202  // DeepCopy returns a deep copy of this DelayRule.
+      203  func (in *DelayRule) DeepCopy() *DelayRule {
+      204    if in == nil {
+  ⎿  Found 18 new diagnostic issues in 3 files (ctrl+o to expand)
+
+⏺ The edit appended a second DelayRule.DeepCopyInto — there's still the old one. Let me read the current state:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ The deepcopy file looks correct. Now update the controller to use rule.Target:
+
+⏺ Update(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 11 lines, removed 4 lines
+      199
+      200          // Build the desired interface list for this pod.
+      201          var ifaces []ifaceDesired
+      202 -        injectPrimary := rule.InjectPrimaryInterface == nil || *rule.InjectPrimaryInterface
+      202 +        var targetMultusNetworks []string
+      203 +        injectPrimary := true
+      204 +        if rule.Target != nil {
+      205 +          if rule.Target.Primary != nil {
+      206 +            injectPrimary = *rule.Target.Primary
+      207 +          }
+      208 +          targetMultusNetworks = rule.Target.MultusNetworks
+      209 +        }
+      210          if injectPrimary {
+      211            ifaces = append(ifaces, ifaceDesired{nadName: "", ifaceName: primaryIfaceName})
+      212          }
+      206 -        multusIfaces := resolveMultusInterfaces(logger, &pod, rule.MultusNetworks)
+      207 -        if len(rule.MultusNetworks) > 0 && len(multusIfaces) == 0 {
+      213 +        multusIfaces := resolveMultusInterfaces(logger, &pod, targetMultusNetworks)
+      214 +        if len(targetMultusNetworks) > 0 && len(multusIfaces) == 0 {
+      215            logger.Info("no multus interfaces resolved for pod; check annotation and NAD names",
+      216              "pod", pod.Name, "namespace", pod.Namespace,
+      210 -            "multusNetworks", rule.MultusNetworks)
+      217 +            "multusNetworks", targetMultusNetworks)
+      218          }
+      219          for _, mi := range multusIfaces {
+      220            ifaces = append(ifaces, ifaceDesired{nadName: mi.nadName, ifaceName: mi.ifaceName})
+
+⏺ Now update the test file. The tests use InjectPrimaryInterface and MultusNetworks directly on DelayRule — need to move them under Target:
+
+⏺ Update(pkg/controller/tcinjector_controller_test.go)
+  ⎿  Added 3 lines, removed 3 lines
+      623      map[string]string{"app": "worker"})
+      624    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      625      {
+      626 -      Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+      627 -      MinDelay:               40, MaxDelay: 40,
+      628 -      InjectPrimaryInterface: boolPtr(true),
+      626 +      Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+      627 +      MinDelay: 40, MaxDelay: 40,
+      628 +      Target: &tcv1alpha1.Target{Primary: boolPtr(true)},
+      629      },
+      630    })
+      631    finder := newFakePodFinder(map[string]string{containerID: ns})
+
+⏺ Update(pkg/controller/tcinjector_controller_test.go)
+  ⎿  Added 3 lines, removed 3 lines
+      649      map[string]string{"app": "worker"})
+      650    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      651      {
+      652 -      Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+      653 -      MinDelay:               30, MaxDelay: 30,
+      654 -      InjectPrimaryInterface: boolPtr(false),
+      652 +      Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+      653 +      MinDelay: 30, MaxDelay: 30,
+      654 +      Target: &tcv1alpha1.Target{Primary: boolPtr(false)},
+      655      },
+      656    })
+      657    finder := newFakePodFinder(map[string]string{containerID: ns})
+
+⏺ Update(pkg/controller/tcinjector_controller_test.go)
+  ⎿  Added 6 lines, removed 4 lines
+      684    }
+      685    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      686      {
+      687 -      Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "multus-only"}},
+      688 -      MinDelay:               60, MaxDelay: 60,
+      689 -      MultusNetworks:         []string{"default/mynetwork"},
+      690 -      InjectPrimaryInterface: boolPtr(false),
+      687 +      Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "multus-only"}},
+      688 +      MinDelay: 60, MaxDelay: 60,
+      689 +      Target: &tcv1alpha1.Target{
+      690 +        Primary:        boolPtr(false),
+      691 +        MultusNetworks: []string{"default/mynetwork"},
+      692 +      },
+      693      },
+      694    })
+      695    finder := newFakePodFinder(map[string]string{containerID: ns})
+
+⏺ Now fix the toggle test at line 724/743:
+
+⏺ Update(pkg/controller/tcinjector_controller_test.go)
+  ⎿  Added 3 lines, removed 3 lines
+      721      map[string]string{"app": "worker"})
+      722    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      723      {
+      724 -      Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+      725 -      MinDelay:               25, MaxDelay: 25,
+      726 -      InjectPrimaryInterface: boolPtr(true),
+      724 +      Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+      725 +      MinDelay: 25, MaxDelay: 25,
+      726 +      Target: &tcv1alpha1.Target{Primary: boolPtr(true)},
+      727      },
+      728    })
+      729    finder := newFakePodFinder(map[string]string{containerID: ns})
+  ⎿  Found 3 new diagnostic issues in 1 file (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(pkg/controller/tcinjector_controller_test.go)
+  ⎿  Added 1 line, removed 1 line
+      742    if err := r.Client.Get(context.Background(), client.ObjectKey{Name: "test"}, &current); err != nil {
+      743      t.Fatalf("Get injector: %v", err)
+      744    }
+      745 -  current.Spec.Rules[0].InjectPrimaryInterface = boolPtr(false)
+      745 +  current.Spec.Rules[0].Target = &tcv1alpha1.Target{Primary: boolPtr(false)}
+      746    if err := r.Client.Update(context.Background(), &current); err != nil {
+      747      t.Fatalf("Update injector: %v", err)
+      748    }
+
+⏺ Update(pkg/controller/tcinjector_controller_test.go)
+  ⎿  Added 3 lines, removed 3 lines
+      772    }
+      773    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      774      {
+      775 -      Selector:       metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+      776 -      MinDelay:       80, MaxDelay: 80,
+      777 -      MultusNetworks: []string{"default/mynetwork"},
+      775 +      Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+      776 +      MinDelay: 80, MaxDelay: 80,
+      777 +      Target: &tcv1alpha1.Target{MultusNetworks: []string{"default/mynetwork"}},
+      778      },
+      779    })
+      780    finder := newFakePodFinder(map[string]string{containerID: ns})
+
+⏺ Also update test comments that mention injectPrimaryInterface:
+
+  Searched for 1 pattern (ctrl+o to expand)
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ There's still a MultusNetworks reference on line 691. Let me check:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ That MultusNetworks is correctly inside Target{}, so that's fine. Now update the CRD YAML:
+
+⏺ Update(config/crd/tcinjector.yaml)
+  ⎿  Added 21 lines, removed 16 lines
+      102                          format: int32
+      103                          minimum: 0
+      104                          description: Maximum delay in milliseconds. Must be >= minDelay.
+      105 -                      multusNetworks:
+      106 -                        type: array
+      105 +                      target:
+      106 +                        type: object
+      107                          description: >
+      108 -                          Optional list of NetworkAttachmentDefinition names whose pod-side
+      109 -                          interfaces also receive delay injection. Each entry may be "name"
+      110 -                          (matches any namespace) or "namespace/name" (exact match).
+      111 -                          Interfaces are resolved via the k8s.v1.cni.cncf.io/network-status
+      112 -                          pod annotation. If omitted, only the primary interface is targeted.
+      113 -                        items:
+      114 -                          type: string
+      115 -                      injectPrimaryInterface:
+      116 -                        type: boolean
+      117 -                        default: true
+      118 -                        description: >
+      119 -                          When false, skip tc delay injection on the pod's primary interface
+      120 -                          (eth0/veth). Use this to inject delay only on interfaces listed in
+      121 -                          multusNetworks. Defaults to true for backward compatibility.
+      108 +                          Specifies which interfaces inside the pod receive delay injection.
+      109 +                          If omitted, only the primary interface (eth0) is targeted.
+      110 +                        properties:
+      111 +                          primary:
+      112 +                            type: boolean
+      113 +                            description: >
+      114 +                              When false, skip tc delay injection on the pod's primary interface (eth0).
+      115 +                              Use this to inject delay only on interfaces listed in multusNetworks.
+      116 +                              Defaults to true when omitted.
+      117 +                          multusNetworks:
+      118 +                            type: array
+      119 +                            description: >
+      120 +                              Optional list of NetworkAttachmentDefinition names whose pod-side
+      121 +                              interfaces also receive delay injection. Each entry may be "name"
+      122 +                              (matches any namespace) or "namespace/name" (exact match).
+      123 +                              Interfaces are resolved via the k8s.v1.cni.cncf.io/network-status
+      124 +                              pod annotation.
+      125 +                            items:
+      126 +                              type: string
+      127              status:
+      128                type: object
+      129                properties:
+
+⏺ Also fix the CRD status description that references injectPrimaryInterface:
+
+⏺ Update(config/crd/tcinjector.yaml)
+  ⎿  Added 1 line, removed 1 line
+      150                          type: string
+      151                          description: >
+      152                            Pod-side network interface name on which tc delay is injected
+      153 -                          (e.g. "eth0"). Empty when injectPrimaryInterface is false.
+      153 +                          (e.g. "eth0"). Empty when target.primary is false.
+      154                        delayMs:
+      155                          type: integer
+      156                          format: int32
+
+⏺ Now update the sample YAML:
+
+⏺ Write(config/samples/tcinjector-example.yaml)
+  ⎿  Added 7 lines, removed 5 lines
+      41            app: worker
+      42        minDelay: 20
+      43        maxDelay: 80
+      44 -      multusNetworks:
+      45 -        - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
+      44 +      target:
+      45 +        multusNetworks:
+      46 +          - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
+      47
+      48      # Add 100–200 ms delay on a Multus interface ONLY (primary interface is skipped).
+      49      - selector:
+     ...
+      51            app: multus-only
+      52        minDelay: 100
+      53        maxDelay: 200
+      53 -      injectPrimaryInterface: false
+      54 -      multusNetworks:
+      55 -        - default/mynetwork
+      54 +      target:
+      55 +        primary: false
+      56 +        multusNetworks:
+      57 +          - default/mynetwork
+
+⏺ Now let's verify it builds:
+
+⏺ Bash(go build ./... 2>&1)
+  ⎿  (No output)
+
+⏺ Clean build. Run the tests:
+
+⏺ Bash(go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       0.824s
+     … +2 lines (ctrl+o to expand)
+
+⏺ All tests pass. Now update the README:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 4 lines, removed 3 lines
+      135            env: production
+      136        minDelay: 10           # (required) Minimum delay in milliseconds (>= 0)
+      137        maxDelay: 50           # (required) Maximum delay in milliseconds (>= minDelay)
+      138 -      multusNetworks:        # (optional) Multus NAD names to also inject delay into
+      139 -        - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
+      140 -      injectPrimaryInterface: true  # (optional) set false to skip primary eth0/veth; default true
+      138 +      target:                # (optional) which interfaces to inject delay into
+      139 +        # primary: true      # (optional) set false to skip primary eth0; default true
+      140 +        multusNetworks:      # (optional) Multus NAD names to also inject delay into
+      141 +          - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
+      142
+      143    # enablePeriodicDelayRotation re-randomizes delays within [minDelay, maxDelay]
+      144    # at the interval specified by delayInterval.
+
+⏺ Update(README.md)
+  ⎿  Added 3 lines, removed 2 lines
+      160  | `spec.rules[].namespaceSelector` | `LabelSelector` | No | Matches pods by their namespace's labels. Empty matches all namespaces. |
+      161  | `spec.rules[].minDelay` | `int32` (ms) | Yes | Minimum delay (>= 0) |
+      162  | `spec.rules[].maxDelay` | `int32` (ms) | Yes | Maximum delay (>= minDelay) |
+      163 -| `spec.rules[].multusNetworks` | `[]string` | No | Multus NAD names to inject delay into in addition to the primary interface. See [Multus interface targeting](#
+          -multus-interface-targeting). |
+      164 -| `spec.rules[].injectPrimaryInterface` | `bool` | No | When `false`, skip tc delay injection on the pod's primary interface (`eth0`/`veth`). Use this to target o
+          -nly the interfaces listed in `multusNetworks`. Default: `true`. |
+      163 +| `spec.rules[].target` | `Target` | No | Specifies which interfaces inside the pod receive delay injection. If omitted, only the primary interface (`eth0`) is ta
+          +rgeted. |
+      164 +| `spec.rules[].target.primary` | `bool` | No | When `false`, skip tc delay injection on the pod's primary interface (`eth0`). Use this to target only the interfa
+          +ces listed in `multusNetworks`. Default: `true`. |
+      165 +| `spec.rules[].target.multusNetworks` | `[]string` | No | Multus NAD names to inject delay into. See [Multus interface targeting](#multus-interface-targeting). |
+      166  | `spec.enablePeriodicDelayRotation` | `bool` | No | Periodically re-randomize delays. Default: `false` |
+      167  | `spec.delayInterval` | `Duration` | No | Re-randomization interval. Default: `30s` |
+      168
+
+⏺ Now update the Multus section examples in the README:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 10 lines, removed 8 lines
+      290            app: worker
+      291        minDelay: 20
+      292        maxDelay: 80
+      293 -      multusNetworks:
+      294 -        - default/mynetwork   # exact match: namespace/name
+      295 -        # - mynetwork         # name-only: matches "mynetwork" in any namespace
+      293 +      target:
+      294 +        multusNetworks:
+      295 +          - default/mynetwork   # exact match: namespace/name
+      296 +          # - mynetwork         # name-only: matches "mynetwork" in any namespace
+      297  ```
+      298
+      298 -To inject delay **only on the Multus interface** and leave the primary interface (`eth0`) unaffected, set `injectPrimaryInterface: false`:
+      299 +To inject delay **only on the Multus interface** and leave the primary interface (`eth0`) unaffected, set `target.primary: false`:
+      300
+      301  ```yaml
+      302  apiVersion: tc-injector.setns.net/v1alpha1
+     ...
+      310            app: multus-only
+      311        minDelay: 100
+      312        maxDelay: 200
+      312 -      injectPrimaryInterface: false   # skip primary eth0/veth
+      313 -      multusNetworks:
+      314 -        - default/mynetwork
+      313 +      target:
+      314 +        primary: false          # skip primary eth0
+      315 +        multusNetworks:
+      316 +          - default/mynetwork
+      317  ```
+      318
+      319  **How NAD names are matched** against the `k8s.v1.cni.cncf.io/network-status` annotation:
+      320
+      319 -| Entry in `multusNetworks` | Matches annotation name |
+      321 +| Entry in `target.multusNetworks` | Matches annotation name |
+      322  |---|---|
+      323  | `default/mynetwork` | `default/mynetwork` (exact) |
+      324  | `mynetwork` | `default/mynetwork`, `kube-system/mynetwork`, `mynetwork`, etc. |
+
+⏺ Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+      354  status:
+      355    injectedPods: 2
+      356    injectedPodDetails:
+      357 -    # Pod with both primary and Multus interface injected (injectPrimaryInterface: true, default)
+      357 +    # Pod with both primary and Multus interface injected (target.primary: true, default)
+      358      - nodeName: worker-1
+      359        namespace: default
+      360        podName: worker-abc
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+      361        interface: eth0             # pod-side primary interface name
+      362        delayMs: 37
+      363        tcCommand: "nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev eth0 root handle 1: netem delay 37ms"
+      364 -      multusInterfaces:           # present when multusNetworks is specified
+      364 +      multusInterfaces:           # present when target.multusNetworks is specified
+      365          - nadName: default/mynetwork
+      366            interface: net1         # interface name inside the pod
+      367            delayMs: 37
+
+⏺ Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+      366            interface: net1         # interface name inside the pod
+      367            delayMs: 37
+      368            tcCommand: "nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 37ms"
+      369 -    # Pod with Multus interface only (injectPrimaryInterface: false)
+      369 +    # Pod with Multus interface only (target.primary: false)
+      370      - nodeName: worker-1
+      371        namespace: default
+      372        podName: multus-only-xyz
+
+⏺ Now fix the troubleshooting section in the README that still references the old field name:
+
+⏺ Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+      444  | Pod is not targeted despite matching labels | Namespace labels missing | Run `kubectl get namespace <ns> --show-labels` and add required labels |
+      445  | Multus interface not injected (`multusInterfaces` empty in status) | Annotation missing or NAD name mismatch | Check the pod annotation and NAD name format (see
+            below) |
+      446  | Log shows `cannot find netns path` | CRI lookup failed for container | Check DaemonSet logs; ensure the CRI socket is correctly mounted |
+      447 -| Primary interface delay unexpectedly absent | `injectPrimaryInterface: false` set in rule | Intentional when targeting only Multus interfaces; set to `true` or
+          -omit to restore primary injection |
+      447 +| Primary interface delay unexpectedly absent | `target.primary: false` set in rule | Intentional when targeting only Multus interfaces; set `target.primary: true
+          +` or omit `target` to restore primary injection |
+      448
+      449  ```bash
+      450  # Debug selector matching
+
+⏺ Now fix the last README reference in the NAD name matching section:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+      456  kubectl get pod <target-pod> -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}' | jq .
+      457  ```
+      458
+      459 -The `network-status` annotation lists all attached interfaces. Confirm the `name` field matches the entry in `multusNetworks`. For example, if the annotation show
+          -s `"name": "default/mynetwork"`, the rule should specify `multusNetworks: [default/mynetwork]` or `multusNetworks: [mynetwork]`.
+      459 +The `network-status` annotation lists all attached interfaces. Confirm the `name` field matches the entry in `target.multusNetworks`. For example, if the annotati
+          +on shows `"name": "default/mynetwork"`, the rule should specify `target.multusNetworks: [default/mynetwork]` or `target.multusNetworks: [mynetwork]`.
+      460
+      461  ## Uninstallation
+      462
+
+⏺ Final build and test run to confirm everything is clean:
+
+⏺ Bash(go build ./... && go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       (cached)
+     … +2 lines (ctrl+o to expand)
+
+⏺ All clean. Here's a summary of what was changed:
+
+  pkg/api/v1alpha1/types.go
+  - Added new Target struct with Primary *bool and MultusNetworks []string
+  - Replaced InjectPrimaryInterface *bool and MultusNetworks []string in DelayRule with Target *Target
+
+  pkg/api/v1alpha1/zz_generated.deepcopy.go
+  - Added Target.DeepCopyInto and Target.DeepCopy
+  - Updated DelayRule.DeepCopyInto to deep-copy the Target pointer
+
+  pkg/controller/tcinjector_controller.go
+  - Updated reconcile loop to read rule.Target.Primary and rule.Target.MultusNetworks instead of the old flat fields
+
+  pkg/controller/tcinjector_controller_test.go
+  - Updated all test cases using InjectPrimaryInterface / MultusNetworks to use Target: &tcv1alpha1.Target{...}
+
+  config/crd/tcinjector.yaml
+  - Replaced multusNetworks and injectPrimaryInterface fields with a target sub-object containing primary and multusNetworks
+
+  config/samples/tcinjector-example.yaml
+  - Updated the last two examples to use target: sub-object
+
+  README.md
+  - Updated field reference table, YAML examples, and troubleshooting entries to use target.primary / target.multusNetworks
+
+✻ Brewed for 6m 2s
+```

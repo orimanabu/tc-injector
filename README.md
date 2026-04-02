@@ -135,9 +135,10 @@ spec:
           env: production
       minDelay: 10           # (required) Minimum delay in milliseconds (>= 0)
       maxDelay: 50           # (required) Maximum delay in milliseconds (>= minDelay)
-      multusNetworks:        # (optional) Multus NAD names to also inject delay into
-        - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
-      injectPrimaryInterface: true  # (optional) set false to skip primary eth0/veth; default true
+      target:                # (optional) which interfaces to inject delay into
+        # primary: true      # (optional) set false to skip primary eth0; default true
+        multusNetworks:      # (optional) Multus NAD names to also inject delay into
+          - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
 
   # enablePeriodicDelayRotation re-randomizes delays within [minDelay, maxDelay]
   # at the interval specified by delayInterval.
@@ -159,8 +160,9 @@ spec:
 | `spec.rules[].namespaceSelector` | `LabelSelector` | No | Matches pods by their namespace's labels. Empty matches all namespaces. |
 | `spec.rules[].minDelay` | `int32` (ms) | Yes | Minimum delay (>= 0) |
 | `spec.rules[].maxDelay` | `int32` (ms) | Yes | Maximum delay (>= minDelay) |
-| `spec.rules[].multusNetworks` | `[]string` | No | Multus NAD names to inject delay into in addition to the primary interface. See [Multus interface targeting](#multus-interface-targeting). |
-| `spec.rules[].injectPrimaryInterface` | `bool` | No | When `false`, skip tc delay injection on the pod's primary interface (`eth0`/`veth`). Use this to target only the interfaces listed in `multusNetworks`. Default: `true`. |
+| `spec.rules[].target` | `Target` | No | Specifies which interfaces inside the pod receive delay injection. If omitted, only the primary interface (`eth0`) is targeted. |
+| `spec.rules[].target.primary` | `bool` | No | When `false`, skip tc delay injection on the pod's primary interface (`eth0`). Use this to target only the interfaces listed in `multusNetworks`. Default: `true`. |
+| `spec.rules[].target.multusNetworks` | `[]string` | No | Multus NAD names to inject delay into. See [Multus interface targeting](#multus-interface-targeting). |
 | `spec.enablePeriodicDelayRotation` | `bool` | No | Periodically re-randomize delays. Default: `false` |
 | `spec.delayInterval` | `Duration` | No | Re-randomization interval. Default: `30s` |
 
@@ -288,12 +290,13 @@ spec:
           app: worker
       minDelay: 20
       maxDelay: 80
-      multusNetworks:
-        - default/mynetwork   # exact match: namespace/name
-        # - mynetwork         # name-only: matches "mynetwork" in any namespace
+      target:
+        multusNetworks:
+          - default/mynetwork   # exact match: namespace/name
+          # - mynetwork         # name-only: matches "mynetwork" in any namespace
 ```
 
-To inject delay **only on the Multus interface** and leave the primary interface (`eth0`) unaffected, set `injectPrimaryInterface: false`:
+To inject delay **only on the Multus interface** and leave the primary interface (`eth0`) unaffected, set `target.primary: false`:
 
 ```yaml
 apiVersion: tc-injector.setns.net/v1alpha1
@@ -307,14 +310,15 @@ spec:
           app: multus-only
       minDelay: 100
       maxDelay: 200
-      injectPrimaryInterface: false   # skip primary eth0/veth
-      multusNetworks:
-        - default/mynetwork
+      target:
+        primary: false          # skip primary eth0
+        multusNetworks:
+          - default/mynetwork
 ```
 
 **How NAD names are matched** against the `k8s.v1.cni.cncf.io/network-status` annotation:
 
-| Entry in `multusNetworks` | Matches annotation name |
+| Entry in `target.multusNetworks` | Matches annotation name |
 |---|---|
 | `default/mynetwork` | `default/mynetwork` (exact) |
 | `mynetwork` | `default/mynetwork`, `kube-system/mynetwork`, `mynetwork`, etc. |
@@ -350,19 +354,19 @@ Look for `status.injectedPods` (number of pods currently receiving delay on each
 status:
   injectedPods: 2
   injectedPodDetails:
-    # Pod with both primary and Multus interface injected (injectPrimaryInterface: true, default)
+    # Pod with both primary and Multus interface injected (target.primary: true, default)
     - nodeName: worker-1
       namespace: default
       podName: worker-abc
       interface: eth0             # pod-side primary interface name
       delayMs: 37
       tcCommand: "nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev eth0 root handle 1: netem delay 37ms"
-      multusInterfaces:           # present when multusNetworks is specified
+      multusInterfaces:           # present when target.multusNetworks is specified
         - nadName: default/mynetwork
           interface: net1         # interface name inside the pod
           delayMs: 37
           tcCommand: "nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 37ms"
-    # Pod with Multus interface only (injectPrimaryInterface: false)
+    # Pod with Multus interface only (target.primary: false)
     - nodeName: worker-1
       namespace: default
       podName: multus-only-xyz
@@ -440,7 +444,7 @@ The measured RTT increase should correspond to the injected delay (`minDelay`-`m
 | Pod is not targeted despite matching labels | Namespace labels missing | Run `kubectl get namespace <ns> --show-labels` and add required labels |
 | Multus interface not injected (`multusInterfaces` empty in status) | Annotation missing or NAD name mismatch | Check the pod annotation and NAD name format (see below) |
 | Log shows `cannot find netns path` | CRI lookup failed for container | Check DaemonSet logs; ensure the CRI socket is correctly mounted |
-| Primary interface delay unexpectedly absent | `injectPrimaryInterface: false` set in rule | Intentional when targeting only Multus interfaces; set to `true` or omit to restore primary injection |
+| Primary interface delay unexpectedly absent | `target.primary: false` set in rule | Intentional when targeting only Multus interfaces; set `target.primary: true` or omit `target` to restore primary injection |
 
 ```bash
 # Debug selector matching
@@ -452,7 +456,7 @@ kubectl get tcinjector <name> -o jsonpath='{.spec.rules}'
 kubectl get pod <target-pod> -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}' | jq .
 ```
 
-The `network-status` annotation lists all attached interfaces. Confirm the `name` field matches the entry in `multusNetworks`. For example, if the annotation shows `"name": "default/mynetwork"`, the rule should specify `multusNetworks: [default/mynetwork]` or `multusNetworks: [mynetwork]`.
+The `network-status` annotation lists all attached interfaces. Confirm the `name` field matches the entry in `target.multusNetworks`. For example, if the annotation shows `"name": "default/mynetwork"`, the rule should specify `target.multusNetworks: [default/mynetwork]` or `target.multusNetworks: [mynetwork]`.
 
 ## Uninstallation
 

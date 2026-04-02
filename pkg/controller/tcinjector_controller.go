@@ -199,15 +199,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 
 				// Build the desired interface list for this pod.
 				var ifaces []ifaceDesired
-				injectPrimary := rule.InjectPrimaryInterface == nil || *rule.InjectPrimaryInterface
+				var targetMultusNetworks []string
+				injectPrimary := true
+				if rule.Target != nil {
+					if rule.Target.Primary != nil {
+						injectPrimary = *rule.Target.Primary
+					}
+					targetMultusNetworks = rule.Target.MultusNetworks
+				}
 				if injectPrimary {
 					ifaces = append(ifaces, ifaceDesired{nadName: "", ifaceName: primaryIfaceName})
 				}
-				multusIfaces := resolveMultusInterfaces(logger, &pod, rule.MultusNetworks)
-				if len(rule.MultusNetworks) > 0 && len(multusIfaces) == 0 {
+				multusIfaces := resolveMultusInterfaces(logger, &pod, targetMultusNetworks)
+				if len(targetMultusNetworks) > 0 && len(multusIfaces) == 0 {
 					logger.Info("no multus interfaces resolved for pod; check annotation and NAD names",
 						"pod", pod.Name, "namespace", pod.Namespace,
-						"multusNetworks", rule.MultusNetworks)
+						"multusNetworks", targetMultusNetworks)
 				}
 				for _, mi := range multusIfaces {
 					ifaces = append(ifaces, ifaceDesired{nadName: mi.nadName, ifaceName: mi.ifaceName})

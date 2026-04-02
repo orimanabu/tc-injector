@@ -162,19 +162,40 @@ func (in *TCInjectorStatus) DeepCopy() *TCInjectorStatus {
 
 // DeepCopyInto copies all properties of this object into another object of the
 // same type that is provided as a pointer.
-func (in *DelayRule) DeepCopyInto(out *DelayRule) {
+func (in *Target) DeepCopyInto(out *Target) {
 	*out = *in
-	in.Selector.DeepCopyInto(&out.Selector)
-	in.NamespaceSelector.DeepCopyInto(&out.NamespaceSelector)
+	if in.Primary != nil {
+		in, out := &in.Primary, &out.Primary
+		*out = new(bool)
+		**out = **in
+	}
 	if in.MultusNetworks != nil {
 		in, out := &in.MultusNetworks, &out.MultusNetworks
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
-	if in.InjectPrimaryInterface != nil {
-		in, out := &in.InjectPrimaryInterface, &out.InjectPrimaryInterface
-		*out = new(bool)
-		**out = **in
+}
+
+// DeepCopy returns a deep copy of this Target.
+func (in *Target) DeepCopy() *Target {
+	if in == nil {
+		return nil
+	}
+	out := new(Target)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto copies all properties of this object into another object of the
+// same type that is provided as a pointer.
+func (in *DelayRule) DeepCopyInto(out *DelayRule) {
+	*out = *in
+	in.Selector.DeepCopyInto(&out.Selector)
+	in.NamespaceSelector.DeepCopyInto(&out.NamespaceSelector)
+	if in.Target != nil {
+		in, out := &in.Target, &out.Target
+		*out = new(Target)
+		(*in).DeepCopyInto(*out)
 	}
 }
 

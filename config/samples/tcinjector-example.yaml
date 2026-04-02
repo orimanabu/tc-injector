@@ -41,8 +41,9 @@ spec:
           app: worker
       minDelay: 20
       maxDelay: 80
-      multusNetworks:
-        - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
+      target:
+        multusNetworks:
+          - default/mynetwork  # "namespace/name" (exact) or "name" (any namespace)
 
     # Add 100–200 ms delay on a Multus interface ONLY (primary interface is skipped).
     - selector:
@@ -50,6 +51,7 @@ spec:
           app: multus-only
       minDelay: 100
       maxDelay: 200
-      injectPrimaryInterface: false
-      multusNetworks:
-        - default/mynetwork
+      target:
+        primary: false
+        multusNetworks:
+          - default/mynetwork

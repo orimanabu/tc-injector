@@ -33,6 +33,20 @@ type TCInjectorSpec struct {
 	DelayInterval *metav1.Duration `json:"delayInterval,omitempty"`
 }
 
+// Target specifies which interfaces inside the pod should receive delay injection.
+type Target struct {
+	// Primary controls whether delay is injected on the pod's primary interface (eth0).
+	// Defaults to true when omitted.
+	// +optional
+	Primary *bool `json:"primary,omitempty"`
+	// MultusNetworks is an optional list of NetworkAttachmentDefinition names whose
+	// pod-side interfaces should also receive delay injection.
+	// Each entry may be "name" (matches any namespace) or "namespace/name" (exact match).
+	// Interfaces are resolved via the k8s.v1.cni.cncf.io/network-status pod annotation.
+	// +optional
+	MultusNetworks []string `json:"multusNetworks,omitempty"`
+}
+
 // DelayRule pairs a pod label selector and a namespace selector with a delay range in milliseconds.
 type DelayRule struct {
 	// Selector selects pods to inject delay into.
@@ -47,19 +61,10 @@ type DelayRule struct {
 	// MaxDelay is the maximum delay in milliseconds. Must be >= MinDelay.
 	// +kubebuilder:validation:Minimum=0
 	MaxDelay int32 `json:"maxDelay"`
-	// MultusNetworks is an optional list of NetworkAttachmentDefinition names whose
-	// pod-side interfaces should also receive delay injection.
-	// Each entry may be "name" (matches any namespace) or "namespace/name" (exact match).
-	// Interfaces are resolved via the k8s.v1.cni.cncf.io/network-status pod annotation.
-	// If empty, only the primary interface is targeted.
+	// Target specifies which interfaces inside the pod should receive delay injection.
+	// If omitted, only the primary interface (eth0) is targeted.
 	// +optional
-	MultusNetworks []string `json:"multusNetworks,omitempty"`
-	// InjectPrimaryInterface controls whether delay is injected on the pod's primary
-	// interface (eth0). Defaults to true for backward compatibility.
-	// Set to false when delay should be applied only to interfaces listed in MultusNetworks.
-	// +optional
-	// +kubebuilder:default=true
-	InjectPrimaryInterface *bool `json:"injectPrimaryInterface,omitempty"`
+	Target *Target `json:"target,omitempty"`
 }
 
 // InjectedInterfaceStatus describes a tc rule applied to a Multus-managed interface.

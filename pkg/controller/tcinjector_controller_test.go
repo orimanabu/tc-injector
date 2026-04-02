@@ -623,9 +623,9 @@ func TestReconcile_InjectPrimaryInterface_True_AppliesPrimary(t *testing.T) {
 		map[string]string{"app": "worker"})
 	injector := tcInjector("test", []tcv1alpha1.DelayRule{
 		{
-			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
-			MinDelay:               40, MaxDelay: 40,
-			InjectPrimaryInterface: boolPtr(true),
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay: 40, MaxDelay: 40,
+			Target: &tcv1alpha1.Target{Primary: boolPtr(true)},
 		},
 	})
 	finder := newFakePodFinder(map[string]string{containerID: ns})
@@ -649,9 +649,9 @@ func TestReconcile_InjectPrimaryInterface_False_SkipsPrimary(t *testing.T) {
 		map[string]string{"app": "worker"})
 	injector := tcInjector("test", []tcv1alpha1.DelayRule{
 		{
-			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
-			MinDelay:               30, MaxDelay: 30,
-			InjectPrimaryInterface: boolPtr(false),
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay: 30, MaxDelay: 30,
+			Target: &tcv1alpha1.Target{Primary: boolPtr(false)},
 		},
 	})
 	finder := newFakePodFinder(map[string]string{containerID: ns})
@@ -684,10 +684,12 @@ func TestReconcile_InjectPrimaryInterface_False_MultusOnly(t *testing.T) {
 	}
 	injector := tcInjector("test", []tcv1alpha1.DelayRule{
 		{
-			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "multus-only"}},
-			MinDelay:               60, MaxDelay: 60,
-			MultusNetworks:         []string{"default/mynetwork"},
-			InjectPrimaryInterface: boolPtr(false),
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "multus-only"}},
+			MinDelay: 60, MaxDelay: 60,
+			Target: &tcv1alpha1.Target{
+				Primary:        boolPtr(false),
+				MultusNetworks: []string{"default/mynetwork"},
+			},
 		},
 	})
 	finder := newFakePodFinder(map[string]string{containerID: ns})
@@ -719,9 +721,9 @@ func TestReconcile_InjectPrimaryInterface_ToggleFalse_RemovesPrimary(t *testing.
 		map[string]string{"app": "worker"})
 	injector := tcInjector("test", []tcv1alpha1.DelayRule{
 		{
-			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
-			MinDelay:               25, MaxDelay: 25,
-			InjectPrimaryInterface: boolPtr(true),
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay: 25, MaxDelay: 25,
+			Target: &tcv1alpha1.Target{Primary: boolPtr(true)},
 		},
 	})
 	finder := newFakePodFinder(map[string]string{containerID: ns})
@@ -740,7 +742,7 @@ func TestReconcile_InjectPrimaryInterface_ToggleFalse_RemovesPrimary(t *testing.
 	if err := r.Client.Get(context.Background(), client.ObjectKey{Name: "test"}, &current); err != nil {
 		t.Fatalf("Get injector: %v", err)
 	}
-	current.Spec.Rules[0].InjectPrimaryInterface = boolPtr(false)
+	current.Spec.Rules[0].Target = &tcv1alpha1.Target{Primary: boolPtr(false)}
 	if err := r.Client.Update(context.Background(), &current); err != nil {
 		t.Fatalf("Update injector: %v", err)
 	}
@@ -770,9 +772,9 @@ func TestReconcile_MultusInterface_Applied(t *testing.T) {
 	}
 	injector := tcInjector("test", []tcv1alpha1.DelayRule{
 		{
-			Selector:       metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
-			MinDelay:       80, MaxDelay: 80,
-			MultusNetworks: []string{"default/mynetwork"},
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay: 80, MaxDelay: 80,
+			Target: &tcv1alpha1.Target{MultusNetworks: []string{"default/mynetwork"}},
 		},
 	})
 	finder := newFakePodFinder(map[string]string{containerID: ns})
