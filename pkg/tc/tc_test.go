@@ -115,12 +115,12 @@ func TestValidateIface_Valid(t *testing.T) {
 func TestValidateIface_Invalid(t *testing.T) {
 	invalid := []string{
 		"",
-		"iface name",   // space
-		"iface;drop",   // semicolon
-		"iface$",       // dollar
-		"../../etc",    // path traversal
-		"iface\nmore",  // newline
-		"iface`cmd`",   // backtick
+		"iface name",  // space
+		"iface;drop",  // semicolon
+		"iface$",      // dollar
+		"../../etc",   // path traversal
+		"iface\nmore", // newline
+		"iface`cmd`",  // backtick
 	}
 	for _, name := range invalid {
 		if err := validateIface(name); err == nil {
@@ -129,35 +129,38 @@ func TestValidateIface_Invalid(t *testing.T) {
 	}
 }
 
-// ---- Apply ----
+// ---- ApplyInNetns ----
 
-func TestApply_SuccessOnFirstReplace(t *testing.T) {
+func TestApplyInNetns_SuccessOnFirstReplace(t *testing.T) {
 	f := newFakeRunner()
 	defer f.install()()
 
-	// "replace" succeeds immediately.
 	f.setResponse("replace", "", nil)
 
-	if err := Apply("veth0", 50); err != nil {
-		t.Fatalf("Apply: unexpected error: %v", err)
+	cmd, err := ApplyInNetns("/proc/100/ns/net", "eth0", 50)
+	if err != nil {
+		t.Fatalf("ApplyInNetns: unexpected error: %v", err)
 	}
 	if len(f.calls) != 1 {
 		t.Fatalf("expected 1 call, got %d", len(f.calls))
 	}
 	assertArgContains(t, f.calls[0].args, "replace")
 	assertArgContains(t, f.calls[0].args, "50ms")
+	assertArgContains(t, f.calls[0].args, "eth0")
+	if !strings.Contains(cmd, "nsenter") {
+		t.Errorf("returned command %q does not mention nsenter", cmd)
+	}
 }
 
-func TestApply_FallsBackToAddWhenReplaceFails(t *testing.T) {
+func TestApplyInNetns_FallsBackToAddWhenReplaceFails(t *testing.T) {
 	f := newFakeRunner()
 	defer f.install()()
 
-	// "replace" fails (qdisc doesn't exist yet); "add" succeeds.
 	f.setResponse("replace", "RTNETLINK error", errors.New("exit 2"))
 	f.setResponse("add", "", nil)
 
-	if err := Apply("veth0", 100); err != nil {
-		t.Fatalf("Apply: unexpected error: %v", err)
+	if _, err := ApplyInNetns("/proc/100/ns/net", "net1", 100); err != nil {
+		t.Fatalf("ApplyInNetns: unexpected error: %v", err)
 	}
 	if len(f.calls) != 2 {
 		t.Fatalf("expected 2 calls (replace then add), got %d", len(f.calls))
@@ -165,83 +168,93 @@ func TestApply_FallsBackToAddWhenReplaceFails(t *testing.T) {
 	assertArgContains(t, f.calls[1].args, "add")
 }
 
-func TestApply_BothReplaceAndAddFail(t *testing.T) {
+func TestApplyInNetns_BothReplaceAndAddFail(t *testing.T) {
 	f := newFakeRunner()
 	defer f.install()()
 
 	f.setResponse("replace", "err", errors.New("replace failed"))
 	f.setResponse("add", "err", errors.New("add failed"))
 
-	if err := Apply("veth0", 50); err == nil {
-		t.Fatal("Apply expected error when both replace and add fail")
+	if _, err := ApplyInNetns("/proc/100/ns/net", "eth0", 50); err == nil {
+		t.Fatal("ApplyInNetns expected error when both replace and add fail")
 	}
 }
 
-func TestApply_InvalidIface(t *testing.T) {
+func TestApplyInNetns_InvalidIface(t *testing.T) {
 	f := newFakeRunner()
 	defer f.install()()
 
-	if err := Apply("bad iface", 50); err == nil {
-		t.Fatal("Apply with invalid iface should return error")
+	if _, err := ApplyInNetns("/proc/100/ns/net", "bad iface", 50); err == nil {
+		t.Fatal("ApplyInNetns with invalid iface should return error")
 	}
 	if len(f.calls) != 0 {
 		t.Fatal("runCmd should not be called for invalid iface")
 	}
 }
 
-func TestApply_CommandContainsNetem(t *testing.T) {
+func TestApplyInNetns_CommandContainsNetem(t *testing.T) {
 	f := newFakeRunner()
 	defer f.install()()
 
 	f.setResponse("replace", "", nil)
-	_ = Apply("eth0", 25)
+	_ , _ = ApplyInNetns("/proc/100/ns/net", "eth0", 25)
 
 	assertArgContains(t, f.calls[0].args, "netem")
 }
 
-// ---- Remove ----
+// ---- RemoveInNetns ----
 
-func TestRemove_Success(t *testing.T) {
+func TestRemoveInNetns_Success(t *testing.T) {
 	f := newFakeRunner()
 	defer f.install()()
 
 	f.setResponse("del", "", nil)
 
-	if err := Remove("veth0"); err != nil {
-		t.Fatalf("Remove: unexpected error: %v", err)
+	if err := RemoveInNetns("/proc/100/ns/net", "eth0"); err != nil {
+		t.Fatalf("RemoveInNetns: unexpected error: %v", err)
 	}
 	assertArgContains(t, f.calls[0].args, "del")
 }
 
-func TestRemove_NoopWhenQdiscAbsent(t *testing.T) {
+func TestRemoveInNetns_NoopWhenQdiscAbsent(t *testing.T) {
 	f := newFakeRunner()
 	defer f.install()()
 
-	// tc prints "RTNETLINK answers: No such file or directory" when qdisc is missing.
 	f.setResponse("del", "RTNETLINK answers: No such file or directory", errors.New("exit 2"))
 
-	if err := Remove("veth0"); err != nil {
-		t.Fatalf("Remove should be a no-op when qdisc is absent, got: %v", err)
+	if err := RemoveInNetns("/proc/100/ns/net", "eth0"); err != nil {
+		t.Fatalf("RemoveInNetns should be a no-op when qdisc is absent, got: %v", err)
 	}
 }
 
-func TestRemove_ReturnsErrorOnUnexpectedFailure(t *testing.T) {
+func TestRemoveInNetns_NoopWhenNetnsGone(t *testing.T) {
+	f := newFakeRunner()
+	defer f.install()()
+
+	f.setResponse("del", "Cannot open network namespace", errors.New("exit 1"))
+
+	if err := RemoveInNetns("/proc/99999/ns/net", "eth0"); err != nil {
+		t.Fatalf("RemoveInNetns should be a no-op when netns is gone, got: %v", err)
+	}
+}
+
+func TestRemoveInNetns_ReturnsErrorOnUnexpectedFailure(t *testing.T) {
 	f := newFakeRunner()
 	defer f.install()()
 
 	f.setResponse("del", "some unexpected error", errors.New("exit 1"))
 
-	if err := Remove("veth0"); err == nil {
-		t.Fatal("Remove expected error on unexpected failure")
+	if err := RemoveInNetns("/proc/100/ns/net", "eth0"); err == nil {
+		t.Fatal("RemoveInNetns expected error on unexpected failure")
 	}
 }
 
-func TestRemove_InvalidIface(t *testing.T) {
+func TestRemoveInNetns_InvalidIface(t *testing.T) {
 	f := newFakeRunner()
 	defer f.install()()
 
-	if err := Remove(""); err == nil {
-		t.Fatal("Remove with empty iface should return error")
+	if err := RemoveInNetns("/proc/100/ns/net", ""); err == nil {
+		t.Fatal("RemoveInNetns with empty iface should return error")
 	}
 	if len(f.calls) != 0 {
 		t.Fatal("runCmd should not be called for invalid iface")
@@ -257,7 +270,7 @@ func TestShow_ReturnsOutput(t *testing.T) {
 	expected := "qdisc netem 1: root refcnt 2 limit 1000 delay 50ms"
 	f.setResponse("show", expected, nil)
 
-	out, err := Show("veth0")
+	out, err := Show("/proc/100/ns/net", "eth0")
 	if err != nil {
 		t.Fatalf("Show: unexpected error: %v", err)
 	}
@@ -270,7 +283,7 @@ func TestShow_InvalidIface(t *testing.T) {
 	f := newFakeRunner()
 	defer f.install()()
 
-	if _, err := Show("bad;iface"); err == nil {
+	if _, err := Show("/proc/100/ns/net", "bad;iface"); err == nil {
 		t.Fatal("Show with invalid iface should return error")
 	}
 }
@@ -287,16 +300,16 @@ func assertArgContains(t *testing.T, args []string, want string) {
 	t.Errorf("tc args %v do not contain %q", args, want)
 }
 
-func ExampleApply() {
-	// Replace runCmd so this example works without a real tc binary.
+func ExampleApplyInNetns() {
+	// Replace runCmd so this example works without a real nsenter binary.
 	prev := runCmd
 	runCmd = func(_ string, args ...string) (string, error) {
-		fmt.Println("tc", strings.Join(args, " "))
+		fmt.Println("nsenter", strings.Join(args, " "))
 		return "", nil
 	}
 	defer func() { runCmd = prev }()
 
-	_ = Apply("veth0abc", 50)
+	_, _ = ApplyInNetns("/proc/1234/ns/net", "eth0", 50)
 	// Output:
-	// tc qdisc replace dev veth0abc root handle 1: netem delay 50ms
+	// nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev eth0 root handle 1: netem delay 50ms
 }

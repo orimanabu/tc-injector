@@ -1,5 +1,5 @@
 // Package tc wraps the Linux tc(8) command to apply netem delay rules
-// on network interfaces.
+// on network interfaces inside pod network namespaces via nsenter(1).
 package tc
 
 import (
@@ -10,14 +10,6 @@ import (
 	"time"
 )
 
-// Rule describes a delay to apply to an interface.
-type Rule struct {
-	// Iface is the host-side veth interface name (e.g. "veth1a2b3c").
-	Iface string
-	// DelayMs is the exact delay in milliseconds to inject.
-	DelayMs int32
-}
-
 // RandomDelay returns a random delay between minMs and maxMs (inclusive).
 func RandomDelay(minMs, maxMs int32) int32 {
 	if minMs >= maxMs {
@@ -26,51 +18,6 @@ func RandomDelay(minMs, maxMs int32) int32 {
 	//nolint:gosec // non-cryptographic random is fine for delay jitter
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return minMs + r.Int31n(maxMs-minMs+1)
-}
-
-// Apply installs or replaces a netem delay qdisc on the given interface.
-// Calling Apply on an interface that already has a rule replaces it atomically.
-func Apply(iface string, delayMs int32) error {
-	if err := validateIface(iface); err != nil {
-		return err
-	}
-
-	// Try to replace first (idempotent if qdisc already exists).
-	args := []string{
-		"qdisc", "replace", "dev", iface,
-		"root", "handle", "1:", "netem",
-		"delay", fmt.Sprintf("%dms", delayMs),
-	}
-	if out, err := runCmd("tc", args...); err != nil {
-		// replace fails on a pristine interface; fall back to add.
-		addArgs := []string{
-			"qdisc", "add", "dev", iface,
-			"root", "handle", "1:", "netem",
-			"delay", fmt.Sprintf("%dms", delayMs),
-		}
-		if out2, err2 := runCmd("tc", addArgs...); err2 != nil {
-			return fmt.Errorf("tc qdisc add/replace on %s: %w (replace output: %s, add output: %s)",
-				iface, err2, out, out2)
-		}
-	}
-	return nil
-}
-
-// Remove deletes the root qdisc from the given interface, restoring normal
-// scheduling. It is a no-op if no qdisc is present.
-func Remove(iface string) error {
-	if err := validateIface(iface); err != nil {
-		return err
-	}
-	args := []string{"qdisc", "del", "dev", iface, "root"}
-	if out, err := runCmd("tc", args...); err != nil {
-		// RTNETLINK answers: No such file or directory → qdisc was already absent.
-		if strings.Contains(out, "RTNETLINK") || strings.Contains(out, "No such") {
-			return nil
-		}
-		return fmt.Errorf("tc qdisc del on %s: %w (output: %s)", iface, err, out)
-	}
-	return nil
 }
 
 // ApplyInNetns installs or replaces a netem delay qdisc on iface inside the
@@ -129,12 +76,13 @@ func RemoveInNetns(netnsPath, iface string) error {
 	return nil
 }
 
-// Show returns the current tc qdisc configuration for an interface.
-func Show(iface string) (string, error) {
+// Show returns the current tc qdisc configuration for an interface inside the
+// given network namespace.
+func Show(netnsPath, iface string) (string, error) {
 	if err := validateIface(iface); err != nil {
 		return "", err
 	}
-	out, err := runCmd("tc", "qdisc", "show", "dev", iface)
+	out, err := runCmd("nsenter", "--net="+netnsPath, "--", "tc", "qdisc", "show", "dev", iface)
 	return out, err
 }
 

@@ -33,17 +33,18 @@ import (
 // as NetworkStatusAnnot = "k8s.v1.cni.cncf.io/network-status" (no trailing 's' on "network").
 const multusNetworkStatusAnnotation = "k8s.v1.cni.cncf.io/network-status"
 
-// VethFinder resolves a container ID to the host-side veth interface name/ifindex
-// and to the pod's network namespace path.
-type VethFinder interface {
-	FindHostVeth(ctx context.Context, containerID string) (ifaceName string, ifaceIndex int, err error)
+// primaryIfaceName is the pod-side primary network interface name.
+// tc delay is applied to this interface inside the pod netns when injectPrimaryInterface is true.
+const primaryIfaceName = "eth0"
+
+// PodFinder resolves a container ID to the pod's network namespace path.
+type PodFinder interface {
 	FindNetnsPath(ctx context.Context, containerID string) (string, error)
 }
 
-// TCApplier applies and removes tc netem delay rules on network interfaces.
+// TCApplier applies and removes tc netem delay rules on network interfaces
+// inside pod network namespaces via nsenter(1).
 type TCApplier interface {
-	Apply(iface string, delayMs int32) error
-	Remove(iface string) error
 	// ApplyInNetns installs or replaces a netem qdisc on iface inside the network
 	// namespace at netnsPath. Returns the tc command string that was executed.
 	ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error)
@@ -55,8 +56,6 @@ type TCApplier interface {
 // RealTCApplier delegates to the tc package and is used in production.
 type RealTCApplier struct{}
 
-func (RealTCApplier) Apply(iface string, delayMs int32) error { return tc.Apply(iface, delayMs) }
-func (RealTCApplier) Remove(iface string) error               { return tc.Remove(iface) }
 func (RealTCApplier) ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error) {
 	return tc.ApplyInNetns(netnsPath, iface, delayMs)
 }
@@ -64,32 +63,33 @@ func (RealTCApplier) RemoveInNetns(netnsPath, iface string) error {
 	return tc.RemoveInNetns(netnsPath, iface)
 }
 
-// multusInjectedState records the tc rule applied to a single Multus-managed interface.
-type multusInjectedState struct {
-	nadName   string // NetworkAttachmentDefinition identifier from the annotation
-	ifaceName string // interface name inside the pod (e.g. net1)
-	netnsPath string // /proc/<pid>/ns/net used to enter the pod network namespace
+// ifaceInjectedState records the tc rule applied to a single interface inside the pod.
+type ifaceInjectedState struct {
+	nadName   string // empty for the primary interface; NAD identifier for Multus
+	ifaceName string // interface name inside the pod (e.g. "eth0", "net1")
 	delayMs   int32
 	tcCmd     string
 }
 
 // injectedState records all tc rules currently applied to a pod.
 type injectedState struct {
-	ifaceName        string // host-side veth interface name
-	ifaceIndex       int
-	podName          string
-	podNamespace     string
-	delayMs          int32
-	primaryInjected  bool // true when a tc rule is active on the primary interface
-	tcCmd            string
-	multusInterfaces []multusInjectedState
+	podName      string
+	podNamespace string
+	netnsPath    string               // /proc/<pid>/ns/net stored for cleanup after pod deletion
+	delayMs      int32
+	interfaces   []ifaceInjectedState // primary (eth0) and/or Multus interfaces
+}
+
+// ifaceDesired describes one interface to inject delay into.
+type ifaceDesired struct {
+	nadName   string // empty for the primary interface
+	ifaceName string
 }
 
 // desiredPodState holds the computed tc configuration that should be applied to a pod.
 type desiredPodState struct {
-	delayMs          int32
-	injectPrimary    bool // whether to inject delay on the primary interface
-	multusInterfaces []multusDesiredIface
+	delayMs    int32
+	interfaces []ifaceDesired
 }
 
 // multusDesiredIface identifies a Multus-managed interface to inject delay into.
@@ -109,7 +109,7 @@ type Reconciler struct {
 	client.Client
 	Scheme    *runtime.Scheme
 	NodeName  string
-	Finder    VethFinder
+	Finder    PodFinder
 	TCApplier TCApplier
 
 	// mu guards injected.
@@ -185,22 +185,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				if !podSel.Matches(labels.Set(pod.Labels)) {
 					continue
 				}
-				// Use empty labels if namespace is not found (e.g., recently deleted).
-				// An empty NamespaceSelector matches all namespaces including this case.
 				nsLabels := namespaceLabelMap[pod.Namespace]
 				if !nsSel.Matches(nsLabels) {
 					continue
 				}
 				uid := string(pod.UID)
-				// Preserve the existing delay when the pod is already injected and
-				// periodic rotation is not active. This prevents re-randomizing on
-				// every reconcile triggered by unrelated pod or resource changes.
-				// Last matching rule wins; earlier rules can be overridden.
 				var delayMs int32
 				if existing, alreadyInjected := r.injected[uid]; alreadyInjected && !shouldRotate {
 					delayMs = existing.delayMs
 				} else {
 					delayMs = tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+				}
+
+				// Build the desired interface list for this pod.
+				var ifaces []ifaceDesired
+				injectPrimary := rule.InjectPrimaryInterface == nil || *rule.InjectPrimaryInterface
+				if injectPrimary {
+					ifaces = append(ifaces, ifaceDesired{nadName: "", ifaceName: primaryIfaceName})
 				}
 				multusIfaces := resolveMultusInterfaces(logger, &pod, rule.MultusNetworks)
 				if len(rule.MultusNetworks) > 0 && len(multusIfaces) == 0 {
@@ -208,10 +209,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 						"pod", pod.Name, "namespace", pod.Namespace,
 						"multusNetworks", rule.MultusNetworks)
 				}
+				for _, mi := range multusIfaces {
+					ifaces = append(ifaces, ifaceDesired{nadName: mi.nadName, ifaceName: mi.ifaceName})
+				}
+
 				desired[uid] = desiredPodState{
-					delayMs:          delayMs,
-					injectPrimary:    rule.InjectPrimaryInterface == nil || *rule.InjectPrimaryInterface,
-					multusInterfaces: multusIfaces,
+					delayMs:    delayMs,
+					interfaces: ifaces,
 				}
 			}
 		}
@@ -220,16 +224,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// Remove tc rules for pods that are no longer in the desired set.
 	for uid, state := range r.injected {
 		if _, ok := desired[uid]; !ok {
-			logger.Info("removing tc rules", "podUID", uid, "iface", state.ifaceName)
-			if state.primaryInjected {
-				if err := r.TCApplier.Remove(state.ifaceName); err != nil {
-					logger.Error(err, "failed to remove tc rule", "iface", state.ifaceName)
-				}
-			}
-			for _, mi := range state.multusInterfaces {
-				if err := r.TCApplier.RemoveInNetns(mi.netnsPath, mi.ifaceName); err != nil {
-					logger.Error(err, "failed to remove multus tc rule",
-						"iface", mi.ifaceName, "nad", mi.nadName)
+			logger.Info("removing tc rules", "podUID", uid)
+			for _, iface := range state.interfaces {
+				if err := r.TCApplier.RemoveInNetns(state.netnsPath, iface.ifaceName); err != nil {
+					logger.Error(err, "failed to remove tc rule",
+						"iface", iface.ifaceName, "nad", iface.nadName)
 				}
 			}
 			delete(r.injected, uid)
@@ -250,131 +249,81 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			continue
 		}
 
-		iface, ifaceIdx, err := r.Finder.FindHostVeth(ctx, containerID)
+		netnsPath, err := r.Finder.FindNetnsPath(ctx, containerID)
 		if err != nil {
-			logger.Error(err, "cannot find host veth", "pod", pod.Name, "containerID", containerID)
+			logger.Error(err, "cannot find netns path", "pod", pod.Name, "containerID", containerID)
 			continue
-		}
-
-		// Resolve netns path only when Multus interfaces are requested.
-		var netnsPath string
-		if len(des.multusInterfaces) > 0 {
-			netnsPath, err = r.Finder.FindNetnsPath(ctx, containerID)
-			if err != nil {
-				logger.Error(err, "cannot find netns path for multus injection", "pod", pod.Name)
-				// Continue: the primary interface can still be processed.
-			}
 		}
 
 		existing := r.injected[uid]
 
-		// Check whether primary interface or Multus interfaces changed.
-		// primaryUnchanged considers both the desired injection flag and the current state.
-		var primaryUnchanged bool
-		if !des.injectPrimary {
-			// Desired: no primary injection. Unchanged only if primary was already not injected.
-			primaryUnchanged = !existing.primaryInjected
-		} else {
-			// Desired: inject primary. Unchanged if same iface, same delay, and was already injected.
-			primaryUnchanged = existing.primaryInjected &&
-				existing.ifaceName == iface &&
-				existing.delayMs == des.delayMs
-		}
-		multusUnchanged := multusIfaceSetsEqual(existing.multusInterfaces, des.multusInterfaces, des.delayMs)
-		if primaryUnchanged && multusUnchanged {
+		// Skip if nothing changed: same netns, same delay, same interface set.
+		if existing.netnsPath == netnsPath &&
+			existing.delayMs == des.delayMs &&
+			ifaceSetsEqual(existing.interfaces, des.interfaces) {
 			injectedCount++
 			continue
 		}
 
-		// Apply or remove the primary interface rule as needed.
-		var newTCCmd string
-		if !primaryUnchanged {
-			if des.injectPrimary {
-				newTCCmd = fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, des.delayMs)
-				logger.Info("applying tc delay", "pod", pod.Name, "iface", iface,
-					"delayMs", des.delayMs, "tcCmd", newTCCmd)
-				if err := r.TCApplier.Apply(iface, des.delayMs); err != nil {
-					logger.Error(err, "tc apply failed", "iface", iface)
-					continue
-				}
-			} else if existing.primaryInjected {
-				// injectPrimary toggled from true to false — remove the existing rule.
-				logger.Info("removing primary tc rule (injectPrimaryInterface=false)",
-					"pod", pod.Name, "iface", iface)
-				if err := r.TCApplier.Remove(iface); err != nil {
-					logger.Error(err, "tc remove failed", "iface", iface)
-				}
-			}
-		} else {
-			newTCCmd = existing.tcCmd
+		// Remove interfaces that are no longer in the desired set.
+		desiredIfaceSet := make(map[string]bool, len(des.interfaces))
+		for _, di := range des.interfaces {
+			desiredIfaceSet[di.ifaceName] = true
 		}
-
-		// Build a map of existing Multus state for efficient lookup.
-		existingMultusMap := make(map[string]multusInjectedState, len(existing.multusInterfaces))
-		for _, mi := range existing.multusInterfaces {
-			existingMultusMap[mi.nadName] = mi
-		}
-
-		// Remove Multus interfaces that are no longer desired (NAD removed from rule).
-		desiredNADs := make(map[string]bool, len(des.multusInterfaces))
-		for _, dmi := range des.multusInterfaces {
-			desiredNADs[dmi.nadName] = true
-		}
-		for _, mi := range existing.multusInterfaces {
-			if !desiredNADs[mi.nadName] {
-				if err := r.TCApplier.RemoveInNetns(mi.netnsPath, mi.ifaceName); err != nil {
-					logger.Error(err, "failed to remove multus tc rule",
-						"iface", mi.ifaceName, "nad", mi.nadName)
+		for _, ei := range existing.interfaces {
+			if !desiredIfaceSet[ei.ifaceName] {
+				if err := r.TCApplier.RemoveInNetns(existing.netnsPath, ei.ifaceName); err != nil {
+					logger.Error(err, "failed to remove tc rule for removed interface",
+						"pod", pod.Name, "iface", ei.ifaceName, "nad", ei.nadName)
 				}
 			}
 		}
 
-		// Apply desired Multus interfaces (add new or update changed ones).
-		newMultus := make([]multusInjectedState, 0, len(des.multusInterfaces))
-		for _, dmi := range des.multusInterfaces {
-			emi, wasInjected := existingMultusMap[dmi.nadName]
-			miUnchanged := wasInjected &&
-				emi.ifaceName == dmi.ifaceName &&
-				emi.delayMs == des.delayMs
+		// Build a map of existing interface state for efficient lookup.
+		existingIfaceMap := make(map[string]ifaceInjectedState, len(existing.interfaces))
+		for _, ei := range existing.interfaces {
+			existingIfaceMap[ei.ifaceName] = ei
+		}
 
-			if miUnchanged {
-				newMultus = append(newMultus, emi)
+		// Apply or re-apply each desired interface.
+		newIfaces := make([]ifaceInjectedState, 0, len(des.interfaces))
+		for _, di := range des.interfaces {
+			ei, wasInjected := existingIfaceMap[di.ifaceName]
+			ifaceUnchanged := wasInjected &&
+				ei.delayMs == des.delayMs &&
+				existing.netnsPath == netnsPath
+			if ifaceUnchanged {
+				newIfaces = append(newIfaces, ei)
 				continue
 			}
 
-			if netnsPath == "" {
-				logger.Info("skipping multus interface: netns path unavailable",
-					"pod", pod.Name, "nad", dmi.nadName)
-				continue
+			nadLabel := di.nadName
+			if nadLabel == "" {
+				nadLabel = "primary"
 			}
-
-			miCmd, err := r.TCApplier.ApplyInNetns(netnsPath, dmi.ifaceName, des.delayMs)
+			tcCmd, err := r.TCApplier.ApplyInNetns(netnsPath, di.ifaceName, des.delayMs)
 			if err != nil {
-				logger.Error(err, "multus tc apply failed",
-					"pod", pod.Name, "iface", dmi.ifaceName, "nad", dmi.nadName)
+				logger.Error(err, "tc apply failed",
+					"pod", pod.Name, "iface", di.ifaceName, "nad", nadLabel)
 				continue
 			}
-			logger.Info("applying multus tc delay", "pod", pod.Name,
-				"nad", dmi.nadName, "iface", dmi.ifaceName, "delayMs", des.delayMs,
-				"tcCmd", miCmd)
-			newMultus = append(newMultus, multusInjectedState{
-				nadName:   dmi.nadName,
-				ifaceName: dmi.ifaceName,
-				netnsPath: netnsPath,
+			logger.Info("applying tc delay",
+				"pod", pod.Name, "iface", di.ifaceName, "nad", nadLabel,
+				"delayMs", des.delayMs, "tcCmd", tcCmd)
+			newIfaces = append(newIfaces, ifaceInjectedState{
+				nadName:   di.nadName,
+				ifaceName: di.ifaceName,
 				delayMs:   des.delayMs,
-				tcCmd:     miCmd,
+				tcCmd:     tcCmd,
 			})
 		}
 
 		r.injected[uid] = injectedState{
-			ifaceName:        iface,
-			ifaceIndex:       ifaceIdx,
-			podName:          pod.Name,
-			podNamespace:     pod.Namespace,
-			delayMs:          des.delayMs,
-			primaryInjected:  des.injectPrimary,
-			tcCmd:            newTCCmd,
-			multusInterfaces: newMultus,
+			podName:      pod.Name,
+			podNamespace: pod.Namespace,
+			netnsPath:    netnsPath,
+			delayMs:      des.delayMs,
+			interfaces:   newIfaces,
 		}
 		injectedCount++
 	}
@@ -384,7 +333,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// same TCInjector status concurrently. On conflict we re-read the latest
 	// resource version and re-merge before retrying.
 	if req.Name != "" {
-		// Build this node's details once; they do not change between retries.
 		thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
 		for _, state := range r.injected {
 			podStatus := tcv1alpha1.InjectedPodStatus{
@@ -393,19 +341,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				PodName:   state.podName,
 				DelayMs:   state.delayMs,
 			}
-			if state.primaryInjected {
-				podStatus.Interface      = state.ifaceName
-				podStatus.InterfaceIndex = int32(state.ifaceIndex)
-				podStatus.TCCommand      = state.tcCmd
-			}
-			for _, mi := range state.multusInterfaces {
-				podStatus.MultusInterfaces = append(podStatus.MultusInterfaces,
-					tcv1alpha1.InjectedInterfaceStatus{
-						NADName:   mi.nadName,
-						Interface: mi.ifaceName,
-						DelayMs:   mi.delayMs,
-						TCCommand: mi.tcCmd,
-					})
+			for _, iface := range state.interfaces {
+				if iface.nadName == "" {
+					// Primary interface (eth0): populate top-level fields.
+					podStatus.Interface  = iface.ifaceName
+					podStatus.TCCommand  = iface.tcCmd
+				} else {
+					// Multus interface: append to MultusInterfaces.
+					podStatus.MultusInterfaces = append(podStatus.MultusInterfaces,
+						tcv1alpha1.InjectedInterfaceStatus{
+							NADName:   iface.nadName,
+							Interface: iface.ifaceName,
+							DelayMs:   iface.delayMs,
+							TCCommand: iface.tcCmd,
+						})
+				}
 			}
 			thisNodeDetails = append(thisNodeDetails, podStatus)
 		}
@@ -418,7 +368,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				logger.Error(err, "failed to get TCInjector for status update")
 				break
 			}
-			// Preserve entries from other nodes; replace only this node's entries.
 			merged := make([]tcv1alpha1.InjectedPodStatus, 0, len(injector.Status.InjectedPodDetails))
 			for _, d := range injector.Status.InjectedPodDetails {
 				if d.NodeName != r.NodeName {
@@ -428,7 +377,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			merged = append(merged, thisNodeDetails...)
 			injector.Status.InjectedPods = int32(len(merged))
 			injector.Status.InjectedPodDetails = merged
-			// Use the node name as the condition type so each node upserts its own condition.
 			setCondition(injector, metav1.Condition{
 				Type:               r.NodeName,
 				Status:             metav1.ConditionTrue,
@@ -467,7 +415,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 // SetupWithManager registers the controller with the manager, watching both
 // TCInjector resources and Pods on this node.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Index pods by spec.nodeName for efficient listing.
 	if err := mgr.GetFieldIndexer().IndexField(
 		context.Background(),
 		&corev1.Pod{},
@@ -481,11 +428,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		// GenerationChangedPredicate prevents reconciles triggered by status
-		// updates, which do not increment metadata.generation. Without this,
-		// each Status().Update() call would re-trigger reconcile indefinitely.
 		For(&tcv1alpha1.TCInjector{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		// Also trigger reconcile when pods on this node change.
 		Watches(
 			&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(r.podToTCInjector),
@@ -508,15 +451,66 @@ func (r *Reconciler) podToTCInjector(ctx context.Context, obj client.Object) []r
 	requests := make([]reconcile.Request, 0, len(injectorList.Items))
 	for _, injector := range injectorList.Items {
 		requests = append(requests, reconcile.Request{
-			NamespacedName: client.ObjectKey{Name: injector.Name, Namespace: injector.Namespace},
+			NamespacedName: client.ObjectKey{Name: injector.Name},
 		})
 	}
 	return requests
 }
 
+// isPodReady returns true when the pod is Running with all containers ready.
+func isPodReady(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if !cs.Ready {
+			return false
+		}
+	}
+	return true
+}
+
+// firstReadyContainerID returns the container ID of the first ready container.
+func firstReadyContainerID(pod *corev1.Pod) string {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Ready && cs.ContainerID != "" {
+			return cs.ContainerID
+		}
+	}
+	return ""
+}
+
+// findPodByUID returns the pod with the given UID, or nil if not found.
+func findPodByUID(pods []corev1.Pod, uid string) *corev1.Pod {
+	for i := range pods {
+		if string(pods[i].UID) == uid {
+			return &pods[i]
+		}
+	}
+	return nil
+}
+
+// ifaceSetsEqual returns true when the set of interface names in existing
+// matches the set in desired (order-independent, delay-agnostic).
+// The caller checks delayMs separately before deciding whether to re-apply.
+func ifaceSetsEqual(existing []ifaceInjectedState, desired []ifaceDesired) bool {
+	if len(existing) != len(desired) {
+		return false
+	}
+	em := make(map[string]bool, len(existing))
+	for _, ei := range existing {
+		em[ei.ifaceName] = true
+	}
+	for _, di := range desired {
+		if !em[di.ifaceName] {
+			return false
+		}
+	}
+	return true
+}
+
 // resolveMultusInterfaces parses the Multus networks-status annotation on the pod and
 // returns the interfaces that match any of the requested NAD names.
-// It logs the reason when no interfaces are resolved so operators can diagnose mismatches.
 func resolveMultusInterfaces(logger logr.Logger, pod *corev1.Pod, nadNames []string) []multusDesiredIface {
 	if len(nadNames) == 0 {
 		return nil
@@ -534,7 +528,6 @@ func resolveMultusInterfaces(logger logr.Logger, pod *corev1.Pod, nadNames []str
 			"pod", pod.Name, "namespace", pod.Namespace)
 		return nil
 	}
-	// Collect the NAD names present in the annotation for diagnostic logging.
 	annotationNames := make([]string, 0, len(statuses))
 	for _, s := range statuses {
 		annotationNames = append(annotationNames, s.Name)
@@ -571,7 +564,6 @@ func nadMatches(annotationName, nadName string) bool {
 	if annotationName == nadName {
 		return true
 	}
-	// If the user-specified name contains no slash, match the name part only.
 	if !strings.Contains(nadName, "/") {
 		if _, name, found := strings.Cut(annotationName, "/"); found {
 			return name == nadName
@@ -580,63 +572,10 @@ func nadMatches(annotationName, nadName string) bool {
 	return false
 }
 
-// multusIfaceSetsEqual returns true if the existing Multus injected state exactly
-// matches the desired Multus interfaces (same set of NADs, same interface names,
-// and the same delayMs).
-func multusIfaceSetsEqual(existing []multusInjectedState, desired []multusDesiredIface, delayMs int32) bool {
-	if len(existing) != len(desired) {
-		return false
-	}
-	em := make(map[string]multusInjectedState, len(existing))
-	for _, mi := range existing {
-		em[mi.nadName] = mi
-	}
-	for _, dmi := range desired {
-		emi, ok := em[dmi.nadName]
-		if !ok || emi.ifaceName != dmi.ifaceName || emi.delayMs != delayMs {
-			return false
-		}
-	}
-	return true
-}
-
-// isPodReady returns true if the pod is running and all containers are ready.
-func isPodReady(pod *corev1.Pod) bool {
-	if pod.Status.Phase != corev1.PodRunning {
-		return false
-	}
-	for _, cs := range pod.Status.ContainerStatuses {
-		if !cs.Ready {
-			return false
-		}
-	}
-	return true
-}
-
-// firstReadyContainerID returns the container ID of the first ready container.
-func firstReadyContainerID(pod *corev1.Pod) string {
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.Ready && cs.ContainerID != "" {
-			return cs.ContainerID
-		}
-	}
-	return ""
-}
-
-// findPodByUID returns the pod with the given UID from the list.
-func findPodByUID(pods []corev1.Pod, uid string) *corev1.Pod {
-	for i := range pods {
-		if string(pods[i].UID) == uid {
-			return &pods[i]
-		}
-	}
-	return nil
-}
-
-// setCondition upserts a condition on the TCInjector status.
+// setCondition upserts a Condition into the TCInjector status by type.
 func setCondition(injector *tcv1alpha1.TCInjector, cond metav1.Condition) {
-	for i, existing := range injector.Status.Conditions {
-		if existing.Type == cond.Type {
+	for i, c := range injector.Status.Conditions {
+		if c.Type == cond.Type {
 			injector.Status.Conditions[i] = cond
 			return
 		}

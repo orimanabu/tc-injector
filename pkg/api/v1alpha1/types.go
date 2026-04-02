@@ -83,13 +83,12 @@ type InjectedPodStatus struct {
 	Namespace string `json:"namespace"`
 	// PodName is the name of the target pod.
 	PodName string `json:"podName"`
-	// Interface is the host-side network interface name.
+	// Interface is the pod-side network interface name on which tc delay is injected
+	// (e.g. "eth0"). Empty when injectPrimaryInterface is false.
 	Interface string `json:"interface"`
-	// InterfaceIndex is the ifindex of the host-side interface.
-	InterfaceIndex int32 `json:"interfaceIndex"`
 	// DelayMs is the injected delay in milliseconds.
 	DelayMs int32 `json:"delayMs"`
-	// TCCommand is the tc command line that was applied.
+	// TCCommand is the tc command line that was applied to the primary interface.
 	TCCommand string `json:"tcCommand"`
 	// MultusInterfaces lists tc rules applied to Multus-managed interfaces of this pod.
 	// +optional

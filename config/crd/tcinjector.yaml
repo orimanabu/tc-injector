@@ -130,7 +130,7 @@ spec:
                   description: Details of tc rules currently applied on this node.
                   items:
                     type: object
-                    required: [nodeName, namespace, podName, interface, interfaceIndex, delayMs, tcCommand]
+                    required: [nodeName, namespace, podName, interface, delayMs, tcCommand]
                     properties:
                       nodeName:
                         type: string
@@ -143,11 +143,9 @@ spec:
                         description: Name of the target pod.
                       interface:
                         type: string
-                        description: Host-side network interface name.
-                      interfaceIndex:
-                        type: integer
-                        format: int32
-                        description: ifindex of the host-side interface.
+                        description: >
+                          Pod-side network interface name on which tc delay is injected
+                          (e.g. "eth0"). Empty when injectPrimaryInterface is false.
                       delayMs:
                         type: integer
                         format: int32

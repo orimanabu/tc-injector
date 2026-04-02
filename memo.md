@@ -7646,3 +7646,2643 @@ Podのアノテーションは次のようになっています。
   - Expanded the status example to show what Multus-only output looks like
   - Added troubleshooting row for absent primary delay
 ```
+
+```
+❯ 今の実装だと、Podのプライマリインターフェースの場合はホスト上でvethに対して、Multusの追加インターフェースの場合はPodのnetwork namespaceにnsenterしてPod内のnet1に対してtcコマンド
+をinjectしています。もしPodのプライマリインターフェースに対してもnsenterしてtcをinjectすることにしたら、コードはシンプルになりますか？検討をお願いします
+
+⏺ いい観点です。技術的に実現可能かどうかも含めて検討します。まず現在の実装を確認します。
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ 全体を把握できました。検討結果を整理します。
+
+  ---
+  検討結果：プライマリインターフェースもnsenterで扱う場合
+
+  技術的な前提：動作の違いがある
+
+  これが最重要ポイントです。
+
+  ┌──────────────────────────┬───────────────────────────────────────────┬───────────────────────────────────────┐
+  │           方式           │             tcを適用する場所              │                 方向                  │
+  ├──────────────────────────┼───────────────────────────────────────────┼───────────────────────────────────────┤
+  │ 現在（ホスト側veth）     │ tc qdisc replace dev vethXXXX ...         │ ホスト→Pod方向（Podへの受信）に遅延   │
+  ├──────────────────────────┼───────────────────────────────────────────┼───────────────────────────────────────┤
+  │ nsenter方式（Pod内eth0） │ nsenter ... tc qdisc replace dev eth0 ... │ Pod→ホスト方向（Podからの送信）に遅延 │
+  └──────────────────────────┴───────────────────────────────────────────┴───────────────────────────────────────┘
+
+  pingのようなRTT計測では合計遅延は同じですが、方向は逆になります。現在の実装では「Podに入ってくるパケット」に遅延を加えていますが、nsenter方式では「Podから出ていくパケット」に遅延
+  を加えることになります。
+
+  コードがどのくらいシンプルになるか
+
+  削除できるもの：
+
+  pkg/veth/finder.go
+    FindHostVeth()           ← 不要になる（CRIでPIDを引くのは残るがveth探索ロジックが消える）
+    findHostVethFromNetns()  ← veth peer探索ロジックごと削除
+    podVethPeerIndex()       ← 削除
+    netlink依存              ← github.com/vishvananda/netlink が不要になる可能性
+
+  pkg/tc/tc.go
+    Apply()                  ← 不要になる
+    Remove()                 ← 不要になる
+
+  controller.go
+    VethFinder.FindHostVeth  ← インターフェースから削除
+    TCApplier.Apply          ← インターフェースから削除
+    TCApplier.Remove         ← インターフェースから削除
+    injectedState.ifaceName  ← host veth名が不要になる（pod内のeth0に統一）
+    injectedState.ifaceIndex ← 不要（ホスト側のifindexを持つ意味がなくなる）
+    injectedState.primaryInjected ← 「primary」と「Multus」を区別する必要がなくなる
+    primaryUnchanged の分岐  ← Multusと同じロジックに統一できる
+
+  統一後のイメージ：
+
+  現在は「primary」と「Multus」で2つのコードパスがあります：
+
+  // 現在：2つのコードパス
+  if des.injectPrimary {
+      r.TCApplier.Apply(hostVethName, delayMs)   // ホスト側
+  }
+  for _, dmi := range des.multusInterfaces {
+      r.TCApplier.ApplyInNetns(netnsPath, dmi.ifaceName, delayMs)  // Pod内
+  }
+
+  nsenter統一後は、注入するインターフェースのリスト（eth0 + net1, net2, ...）を同じ方法で扱えます：
+
+  // nsenter統一後：1つのコードパス
+  for _, iface := range allIfaces {  // eth0 も net1 も同列
+      r.TCApplier.ApplyInNetns(netnsPath, iface.name, delayMs)
+  }
+
+  injectedState も primary/Multus の区別がなくなり、単一の []injectedIface リストに統一できます。
+
+  トレードオフ一覧
+
+  ┌──────────────────────────────────┬───────────────────────────────────────────────────────┬─────────────────────────────────────────┐
+  │               観点               │                      nsenter統一                      │               現在の実装                │
+  ├──────────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ コードの複雑さ                   │ シンプル（パスが1本）                                 │ 2パス、bool flag多い                    │
+  ├──────────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ 削除できるコード                 │ netlink依存、FindHostVeth、Apply/Remove               │ —                                       │
+  ├──────────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ tc方向                           │ Podからの送信に遅延                                   │ Podへの受信に遅延                       │
+  ├──────────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ 後方互換性                       │ 遅延方向が逆になる（破壊的変更）                      │ —                                       │
+  ├──────────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ 必要なケイパビリティ             │ nsenterのみ（既に付与済み）                           │ nsenter + netlink                       │
+  ├──────────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ Pod削除時の挙動                  │ netns消滅 → RemoveInNetnsが冪等処理済み（既存と同じ） │ vethが一瞬残る                          │
+  ├──────────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ interface/interfaceIndexのstatus │ Pod内のeth0のifindex（ホスト管理者には見づらい）      │ ホスト側veth名（tc qdisc showしやすい） │
+  └──────────────────────────────────┴───────────────────────────────────────────────────────┴─────────────────────────────────────────┘
+
+  結論
+
+  コードはかなりシンプルになります。特に pkg/veth/finder.go の veth 探索ロジック（netlink を使った peer ifindex の解決）が丸ごと削除でき、コントローラ内の primary/Multus
+  二重管理が単一ループに統一されます。
+
+  ただし、遅延の方向が逆になるという動作変更が伴います。pingやHTTPのRTT計測が目的なら実用上の影響は軽微ですが、「サービスBへの入力遅延を模擬したい」のか「サービスBからの出力遅延を
+  模擬したい」のかが要件として重要な場合は注意が必要です。
+
+  実施すべきかどうかの判断基準：
+  - 遅延方向を問わずRTT増加を見たいだけ → 移行する価値あり（コードが大幅簡素化）
+  - 受信遅延と送信遅延を明示的に区別したい → 現状維持またはフラグで切り替え対応
+
+✻ Cogitated for 1m 25s
+
+❯ 送信方向で遅延を入れたいので、nsenterに統一したいと思います。実装をお願いします。テストおよびドキュメントの更新もお願いします。Linux Capability,
+SCC等、セキュリティの観点でも見直して、もし必要な権限を絞れるようであればそれもお願いします
+
+⏺ まず実装に必要なファイルをすべて確認します。
+
+  Searched for 1 pattern, read 3 files (ctrl+o to expand)
+
+⏺ 全体を把握しました。変更範囲を整理してから実装します。
+
+  Searched for 3 patterns, read 6 files (ctrl+o to expand)
+
+⏺ 全体像を把握しました。変更ファイルは11個。段階的に実装します。
+
+  まず pkg/tc/tc.go から（Apply/Remove/Rule を削除）：
+
+⏺ Write(pkg/tc/tc.go)
+  ⎿  Added 5 lines, removed 57 lines
+      1  // Package tc wraps the Linux tc(8) command to apply netem delay rules
+      2 -// on network interfaces.
+      2 +// on network interfaces inside pod network namespaces via nsenter(1).
+      3  package tc
+      4
+      5  import (
+     ...
+      10    "time"
+      11  )
+      12
+      13 -// Rule describes a delay to apply to an interface.
+      14 -type Rule struct {
+      15 -  // Iface is the host-side veth interface name (e.g. "veth1a2b3c").
+      16 -  Iface string
+      17 -  // DelayMs is the exact delay in milliseconds to inject.
+      18 -  DelayMs int32
+      19 -}
+      20 -
+      13  // RandomDelay returns a random delay between minMs and maxMs (inclusive).
+      14  func RandomDelay(minMs, maxMs int32) int32 {
+      15    if minMs >= maxMs {
+     ...
+      20    return minMs + r.Int31n(maxMs-minMs+1)
+      21  }
+      22
+      31 -// Apply installs or replaces a netem delay qdisc on the given interface.
+      32 -// Calling Apply on an interface that already has a rule replaces it atomically.
+      33 -func Apply(iface string, delayMs int32) error {
+      34 -  if err := validateIface(iface); err != nil {
+      35 -    return err
+      36 -  }
+      37 -
+      38 -  // Try to replace first (idempotent if qdisc already exists).
+      39 -  args := []string{
+      40 -    "qdisc", "replace", "dev", iface,
+      41 -    "root", "handle", "1:", "netem",
+      42 -    "delay", fmt.Sprintf("%dms", delayMs),
+      43 -  }
+      44 -  if out, err := runCmd("tc", args...); err != nil {
+      45 -    // replace fails on a pristine interface; fall back to add.
+      46 -    addArgs := []string{
+      47 -      "qdisc", "add", "dev", iface,
+      48 -      "root", "handle", "1:", "netem",
+      49 -      "delay", fmt.Sprintf("%dms", delayMs),
+      50 -    }
+      51 -    if out2, err2 := runCmd("tc", addArgs...); err2 != nil {
+      52 -      return fmt.Errorf("tc qdisc add/replace on %s: %w (replace output: %s, add output: %s)",
+      53 -        iface, err2, out, out2)
+      54 -    }
+      55 -  }
+      56 -  return nil
+      57 -}
+      58 -
+      59 -// Remove deletes the root qdisc from the given interface, restoring normal
+      60 -// scheduling. It is a no-op if no qdisc is present.
+      61 -func Remove(iface string) error {
+      62 -  if err := validateIface(iface); err != nil {
+      63 -    return err
+      64 -  }
+      65 -  args := []string{"qdisc", "del", "dev", iface, "root"}
+      66 -  if out, err := runCmd("tc", args...); err != nil {
+      67 -    // RTNETLINK answers: No such file or directory → qdisc was already absent.
+      68 -    if strings.Contains(out, "RTNETLINK") || strings.Contains(out, "No such") {
+      69 -      return nil
+      70 -    }
+      71 -    return fmt.Errorf("tc qdisc del on %s: %w (output: %s)", iface, err, out)
+      72 -  }
+      73 -  return nil
+      74 -}
+      75 -
+      23  // ApplyInNetns installs or replaces a netem delay qdisc on iface inside the
+      24  // network namespace identified by netnsPath (a /proc/<pid>/ns/net path).
+      25  // It runs tc(8) via nsenter(1) and returns the command string that was executed.
+     ...
+       76    return nil
+       77  }
+       78
+      132 -// Show returns the current tc qdisc configuration for an interface.
+      133 -func Show(iface string) (string, error) {
+       79 +// Show returns the current tc qdisc configuration for an interface inside the
+       80 +// given network namespace.
+       81 +func Show(netnsPath, iface string) (string, error) {
+       82    if err := validateIface(iface); err != nil {
+       83      return "", err
+       84    }
+      137 -  out, err := runCmd("tc", "qdisc", "show", "dev", iface)
+       85 +  out, err := runCmd("nsenter", "--net="+netnsPath, "--", "tc", "qdisc", "show", "dev", iface)
+       86    return out, err
+       87  }
+       88
+
+⏺ 次に pkg/tc/tc_test.go（Apply/Remove のテストを削除、Show のシグネチャ更新）：
+
+⏺ Write(pkg/tc/tc_test.go)
+  ⎿  Added 57 lines, removed 44 lines
+      115  func TestValidateIface_Invalid(t *testing.T) {
+      116    invalid := []string{
+      117      "",
+      118 -    "iface name",   // space
+      119 -    "iface;drop",   // semicolon
+      120 -    "iface$",       // dollar
+      121 -    "../../etc",    // path traversal
+      122 -    "iface\nmore",  // newline
+      123 -    "iface`cmd`",   // backtick
+      118 +    "iface name",  // space
+      119 +    "iface;drop",  // semicolon
+      120 +    "iface$",      // dollar
+      121 +    "../../etc",   // path traversal
+      122 +    "iface\nmore", // newline
+      123 +    "iface`cmd`",  // backtick
+      124    }
+      125    for _, name := range invalid {
+      126      if err := validateIface(name); err == nil {
+     ...
+      129    }
+      130  }
+      131
+      132 -// ---- Apply ----
+      132 +// ---- ApplyInNetns ----
+      133
+      134 -func TestApply_SuccessOnFirstReplace(t *testing.T) {
+      134 +func TestApplyInNetns_SuccessOnFirstReplace(t *testing.T) {
+      135    f := newFakeRunner()
+      136    defer f.install()()
+      137
+      138 -  // "replace" succeeds immediately.
+      138    f.setResponse("replace", "", nil)
+      139
+      141 -  if err := Apply("veth0", 50); err != nil {
+      142 -    t.Fatalf("Apply: unexpected error: %v", err)
+      140 +  cmd, err := ApplyInNetns("/proc/100/ns/net", "eth0", 50)
+      141 +  if err != nil {
+      142 +    t.Fatalf("ApplyInNetns: unexpected error: %v", err)
+      143    }
+      144    if len(f.calls) != 1 {
+      145      t.Fatalf("expected 1 call, got %d", len(f.calls))
+      146    }
+      147    assertArgContains(t, f.calls[0].args, "replace")
+      148    assertArgContains(t, f.calls[0].args, "50ms")
+      149 +  assertArgContains(t, f.calls[0].args, "eth0")
+      150 +  if !strings.Contains(cmd, "nsenter") {
+      151 +    t.Errorf("returned command %q does not mention nsenter", cmd)
+      152 +  }
+      153  }
+      154
+      151 -func TestApply_FallsBackToAddWhenReplaceFails(t *testing.T) {
+      155 +func TestApplyInNetns_FallsBackToAddWhenReplaceFails(t *testing.T) {
+      156    f := newFakeRunner()
+      157    defer f.install()()
+      158
+      155 -  // "replace" fails (qdisc doesn't exist yet); "add" succeeds.
+      159    f.setResponse("replace", "RTNETLINK error", errors.New("exit 2"))
+      160    f.setResponse("add", "", nil)
+      161
+      159 -  if err := Apply("veth0", 100); err != nil {
+      160 -    t.Fatalf("Apply: unexpected error: %v", err)
+      162 +  if _, err := ApplyInNetns("/proc/100/ns/net", "net1", 100); err != nil {
+      163 +    t.Fatalf("ApplyInNetns: unexpected error: %v", err)
+      164    }
+      165    if len(f.calls) != 2 {
+      166      t.Fatalf("expected 2 calls (replace then add), got %d", len(f.calls))
+     ...
+      168    assertArgContains(t, f.calls[1].args, "add")
+      169  }
+      170
+      168 -func TestApply_BothReplaceAndAddFail(t *testing.T) {
+      171 +func TestApplyInNetns_BothReplaceAndAddFail(t *testing.T) {
+      172    f := newFakeRunner()
+      173    defer f.install()()
+      174
+      175    f.setResponse("replace", "err", errors.New("replace failed"))
+      176    f.setResponse("add", "err", errors.New("add failed"))
+      177
+      175 -  if err := Apply("veth0", 50); err == nil {
+      176 -    t.Fatal("Apply expected error when both replace and add fail")
+      178 +  if _, err := ApplyInNetns("/proc/100/ns/net", "eth0", 50); err == nil {
+      179 +    t.Fatal("ApplyInNetns expected error when both replace and add fail")
+      180    }
+      181  }
+      182
+      180 -func TestApply_InvalidIface(t *testing.T) {
+      183 +func TestApplyInNetns_InvalidIface(t *testing.T) {
+      184    f := newFakeRunner()
+      185    defer f.install()()
+      186
+      184 -  if err := Apply("bad iface", 50); err == nil {
+      185 -    t.Fatal("Apply with invalid iface should return error")
+      187 +  if _, err := ApplyInNetns("/proc/100/ns/net", "bad iface", 50); err == nil {
+      188 +    t.Fatal("ApplyInNetns with invalid iface should return error")
+      189    }
+      190    if len(f.calls) != 0 {
+      191      t.Fatal("runCmd should not be called for invalid iface")
+      192    }
+      193  }
+      194
+      192 -func TestApply_CommandContainsNetem(t *testing.T) {
+      195 +func TestApplyInNetns_CommandContainsNetem(t *testing.T) {
+      196    f := newFakeRunner()
+      197    defer f.install()()
+      198
+      199    f.setResponse("replace", "", nil)
+      197 -  _ = Apply("eth0", 25)
+      200 +  _ , _ = ApplyInNetns("/proc/100/ns/net", "eth0", 25)
+      201
+      202    assertArgContains(t, f.calls[0].args, "netem")
+      203  }
+      204
+      202 -// ---- Remove ----
+      205 +// ---- RemoveInNetns ----
+      206
+      204 -func TestRemove_Success(t *testing.T) {
+      207 +func TestRemoveInNetns_Success(t *testing.T) {
+      208    f := newFakeRunner()
+      209    defer f.install()()
+      210
+      211    f.setResponse("del", "", nil)
+      212
+      210 -  if err := Remove("veth0"); err != nil {
+      211 -    t.Fatalf("Remove: unexpected error: %v", err)
+      213 +  if err := RemoveInNetns("/proc/100/ns/net", "eth0"); err != nil {
+      214 +    t.Fatalf("RemoveInNetns: unexpected error: %v", err)
+      215    }
+      216    assertArgContains(t, f.calls[0].args, "del")
+      217  }
+      218
+      216 -func TestRemove_NoopWhenQdiscAbsent(t *testing.T) {
+      219 +func TestRemoveInNetns_NoopWhenQdiscAbsent(t *testing.T) {
+      220    f := newFakeRunner()
+      221    defer f.install()()
+      222
+      220 -  // tc prints "RTNETLINK answers: No such file or directory" when qdisc is missing.
+      223    f.setResponse("del", "RTNETLINK answers: No such file or directory", errors.New("exit 2"))
+      224
+      223 -  if err := Remove("veth0"); err != nil {
+      224 -    t.Fatalf("Remove should be a no-op when qdisc is absent, got: %v", err)
+      225 +  if err := RemoveInNetns("/proc/100/ns/net", "eth0"); err != nil {
+      226 +    t.Fatalf("RemoveInNetns should be a no-op when qdisc is absent, got: %v", err)
+      227    }
+      228  }
+      229
+      228 -func TestRemove_ReturnsErrorOnUnexpectedFailure(t *testing.T) {
+      230 +func TestRemoveInNetns_NoopWhenNetnsGone(t *testing.T) {
+      231    f := newFakeRunner()
+      232    defer f.install()()
+      233
+      234 +  f.setResponse("del", "Cannot open network namespace", errors.New("exit 1"))
+      235 +
+      236 +  if err := RemoveInNetns("/proc/99999/ns/net", "eth0"); err != nil {
+      237 +    t.Fatalf("RemoveInNetns should be a no-op when netns is gone, got: %v", err)
+      238 +  }
+      239 +}
+      240 +
+      241 +func TestRemoveInNetns_ReturnsErrorOnUnexpectedFailure(t *testing.T) {
+      242 +  f := newFakeRunner()
+      243 +  defer f.install()()
+      244 +
+      245    f.setResponse("del", "some unexpected error", errors.New("exit 1"))
+      246
+      234 -  if err := Remove("veth0"); err == nil {
+      235 -    t.Fatal("Remove expected error on unexpected failure")
+      247 +  if err := RemoveInNetns("/proc/100/ns/net", "eth0"); err == nil {
+      248 +    t.Fatal("RemoveInNetns expected error on unexpected failure")
+      249    }
+      250  }
+      251
+      239 -func TestRemove_InvalidIface(t *testing.T) {
+      252 +func TestRemoveInNetns_InvalidIface(t *testing.T) {
+      253    f := newFakeRunner()
+      254    defer f.install()()
+      255
+      243 -  if err := Remove(""); err == nil {
+      244 -    t.Fatal("Remove with empty iface should return error")
+      256 +  if err := RemoveInNetns("/proc/100/ns/net", ""); err == nil {
+      257 +    t.Fatal("RemoveInNetns with empty iface should return error")
+      258    }
+      259    if len(f.calls) != 0 {
+      260      t.Fatal("runCmd should not be called for invalid iface")
+     ...
+      270    expected := "qdisc netem 1: root refcnt 2 limit 1000 delay 50ms"
+      271    f.setResponse("show", expected, nil)
+      272
+      260 -  out, err := Show("veth0")
+      273 +  out, err := Show("/proc/100/ns/net", "eth0")
+      274    if err != nil {
+      275      t.Fatalf("Show: unexpected error: %v", err)
+      276    }
+     ...
+      283    f := newFakeRunner()
+      284    defer f.install()()
+      285
+      273 -  if _, err := Show("bad;iface"); err == nil {
+      286 +  if _, err := Show("/proc/100/ns/net", "bad;iface"); err == nil {
+      287      t.Fatal("Show with invalid iface should return error")
+      288    }
+      289  }
+     ...
+      300    t.Errorf("tc args %v do not contain %q", args, want)
+      301  }
+      302
+      290 -func ExampleApply() {
+      291 -  // Replace runCmd so this example works without a real tc binary.
+      303 +func ExampleApplyInNetns() {
+      304 +  // Replace runCmd so this example works without a real nsenter binary.
+      305    prev := runCmd
+      306    runCmd = func(_ string, args ...string) (string, error) {
+      294 -    fmt.Println("tc", strings.Join(args, " "))
+      307 +    fmt.Println("nsenter", strings.Join(args, " "))
+      308      return "", nil
+      309    }
+      310    defer func() { runCmd = prev }()
+      311
+      299 -  _ = Apply("veth0abc", 50)
+      312 +  _, _ = ApplyInNetns("/proc/1234/ns/net", "eth0", 50)
+      313    // Output:
+      301 -  // tc qdisc replace dev veth0abc root handle 1: netem delay 50ms
+      314 +  // nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev eth0 root handle 1: netem delay 50ms
+      315  }
+  ⎿  Found 12 new diagnostic issues in 2 files (ctrl+o to expand)
+
+⏺ 診断は書き込み前のスキャン結果なので無視して続行します。次に pkg/veth/finder.go から veth 探索ロジックを削除：
+
+⏺ Write(pkg/veth/finder.go)
+  ⎿  Added 3 lines, removed 104 lines
+       1 -// Package veth provides utilities to find the host-side veth interface
+       2 -// for a pod running with OVN-Kubernetes CNI.
+       1 +// Package veth provides utilities to resolve a pod's network namespace path
+       2 +// from its container ID via the CRI (Container Runtime Interface).
+       3  package veth
+       4
+       5  import (
+       6    "context"
+       7    "encoding/json"
+       8    "fmt"
+       9 -  "net"
+       9    "os"
+      11 -  "runtime"
+      10    "strings"
+      11
+      14 -  "github.com/vishvananda/netlink"
+      15 -  "github.com/vishvananda/netns"
+      12    "google.golang.org/grpc"
+      13    "google.golang.org/grpc/credentials/insecure"
+      14    criapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+     ...
+      24    "/var/run/crio/crio.sock",
+      25  }
+      26
+      31 -// Finder resolves pod container IDs to host-side veth interface names.
+      27 +// Finder resolves pod container IDs to the pod's network namespace path.
+      28  type Finder struct {
+      29    criSocket string
+      30    criClient criapi.RuntimeServiceClient
+     ...
+       87    return f.resolveNetnsPath(ctx, id)
+       88  }
+       89
+       94 -// FindHostVeth returns the host-side veth interface name and ifindex for the
+       95 -// pod container. containerID should be in the form "containerd://<id>" or
+       96 -// "cri-o://<id>" as stored in pod status.
+       97 -func (f *Finder) FindHostVeth(ctx context.Context, containerID string) (string, int, error) {
+       98 -  id := stripRuntimePrefix(containerID)
+       99 -  if id == "" {
+      100 -    return "", 0, fmt.Errorf("empty container ID after stripping runtime prefix: %q", containerID)
+      101 -  }
+      102 -
+      103 -  netnsPath, err := f.resolveNetnsPath(ctx, id)
+      104 -  if err != nil {
+      105 -    return "", 0, fmt.Errorf("get netns for container %s: %w", id, err)
+      106 -  }
+      107 -
+      108 -  return findHostVethFromNetns(netnsPath)
+      109 -}
+      110 -
+       90  // resolveNetnsPath determines the network namespace path for the given container.
+       91  //
+       92  // Strategy (works for both containerd and CRI-O):
+     ...
+      188    return fmt.Sprintf("%s/%d/ns/net", procMountPath, pid)
+      189  }
+      190
+      212 -// findHostVethFromNetns enters the pod network namespace, obtains the peer
+      213 -// ifindex of the veth interface, then maps it back to a host interface name
+      214 -// and ifindex.
+      215 -func findHostVethFromNetns(netnsPath string) (string, int, error) {
+      216 -  if _, err := os.Stat(netnsPath); err != nil {
+      217 -    return "", 0, fmt.Errorf("netns path %s not accessible: %w", netnsPath, err)
+      218 -  }
+      219 -
+      220 -  hostNS, err := netns.Get()
+      221 -  if err != nil {
+      222 -    return "", 0, fmt.Errorf("get host netns: %w", err)
+      223 -  }
+      224 -  defer hostNS.Close()
+      225 -
+      226 -  podNS, err := netns.GetFromPath(netnsPath)
+      227 -  if err != nil {
+      228 -    return "", 0, fmt.Errorf("open pod netns %s: %w", netnsPath, err)
+      229 -  }
+      230 -  defer podNS.Close()
+      231 -
+      232 -  // LockOSThread pins this goroutine to its OS thread so that netns.Set,
+      233 -  // which calls setns(2), takes effect only for this thread.
+      234 -  runtime.LockOSThread()
+      235 -  defer runtime.UnlockOSThread()
+      236 -
+      237 -  if err := netns.Set(podNS); err != nil {
+      238 -    return "", 0, fmt.Errorf("enter pod netns: %w", err)
+      239 -  }
+      240 -
+      241 -  peerIdx, findErr := podVethPeerIndex()
+      242 -
+      243 -  // Always restore the host namespace, even on error.
+      244 -  if restoreErr := netns.Set(hostNS); restoreErr != nil {
+      245 -    // This is unrecoverable: the goroutine's thread is stuck in the wrong netns.
+      246 -    panic(fmt.Sprintf("tc-injector: failed to restore host netns: %v", restoreErr))
+      247 -  }
+      248 -
+      249 -  if findErr != nil {
+      250 -    return "", 0, fmt.Errorf("find veth peer index in pod netns: %w", findErr)
+      251 -  }
+      252 -
+      253 -  // Look up the peer interface by ifindex in the host default netns.
+      254 -  link, err := netlink.LinkByIndex(peerIdx)
+      255 -  if err != nil {
+      256 -    return "", 0, fmt.Errorf("lookup host link by index %d: %w", peerIdx, err)
+      257 -  }
+      258 -
+      259 -  return link.Attrs().Name, link.Attrs().Index, nil
+      260 -}
+      261 -
+      262 -// podVethPeerIndex returns the peer ifindex of the first non-loopback veth
+      263 -// inside the currently active network namespace.
+      264 -//
+      265 -// We use Attrs().ParentIndex (IFLA_LINK) instead of Veth.PeerName because
+      266 -// netlink.LinkList() issues RTM_GETLINK in dump mode (NLM_F_DUMP), which does
+      267 -// not include VETH_INFO_PEER data when the peer resides in a different network
+      268 -// namespace. IFLA_LINK (the peer ifindex) is always present in dump responses
+      269 -// and corresponds to the "@ifN" suffix shown by "ip link".
+      270 -func podVethPeerIndex() (int, error) {
+      271 -  links, err := netlink.LinkList()
+      272 -  if err != nil {
+      273 -    return 0, fmt.Errorf("list links in pod netns: %w", err)
+      274 -  }
+      275 -
+      276 -  for _, link := range links {
+      277 -    if link.Type() != "veth" {
+      278 -      continue
+      279 -    }
+      280 -    if link.Attrs().Flags&net.FlagLoopback != 0 {
+      281 -      continue
+      282 -    }
+      283 -    peerIdx := link.Attrs().ParentIndex
+      284 -    if peerIdx == 0 {
+      285 -      continue
+      286 -    }
+      287 -    return peerIdx, nil
+      288 -  }
+      289 -  return 0, fmt.Errorf("no veth interface with a valid peer index found in pod netns")
+      290 -}
+      291 -
+      191  // stripRuntimePrefix removes scheme prefixes like "containerd://", "cri-o://",
+      192  // "docker://", leaving only the bare container ID.
+      193  func stripRuntimePrefix(containerID string) string {
+  ⎿  Found 3 new diagnostic issues in 1 file (ctrl+o to expand)
+
+⏺ 次は types.go の InterfaceIndex を削除してコメント更新：
+
+⏺ Update(pkg/api/v1alpha1/types.go)
+  ⎿  Added 3 lines, removed 4 lines
+      83    Namespace string `json:"namespace"`
+      84    // PodName is the name of the target pod.
+      85    PodName string `json:"podName"`
+      86 -  // Interface is the host-side network interface name.
+      86 +  // Interface is the pod-side network interface name on which tc delay is injected
+      87 +  // (e.g. "eth0"). Empty when injectPrimaryInterface is false.
+      88    Interface string `json:"interface"`
+      88 -  // InterfaceIndex is the ifindex of the host-side interface.
+      89 -  InterfaceIndex int32 `json:"interfaceIndex"`
+      89    // DelayMs is the injected delay in milliseconds.
+      90    DelayMs int32 `json:"delayMs"`
+      92 -  // TCCommand is the tc command line that was applied.
+      91 +  // TCCommand is the tc command line that was applied to the primary interface.
+      92    TCCommand string `json:"tcCommand"`
+      93    // MultusInterfaces lists tc rules applied to Multus-managed interfaces of this pod.
+      94    // +optional
+  ⎿  Found 4 new diagnostic issues in 3 files (ctrl+o to expand)
+
+⏺ コントローラを書き直します。これが最大の変更です：
+
+⏺ Write(pkg/controller/tcinjector_controller.go)
+  ⎿  Added 162 lines, removed 223 lines
+      33  // as NetworkStatusAnnot = "k8s.v1.cni.cncf.io/network-status" (no trailing 's' on "network").
+      34  const multusNetworkStatusAnnotation = "k8s.v1.cni.cncf.io/network-status"
+      35
+      36 -// VethFinder resolves a container ID to the host-side veth interface name/ifindex
+      37 -// and to the pod's network namespace path.
+      38 -type VethFinder interface {
+      39 -  FindHostVeth(ctx context.Context, containerID string) (ifaceName string, ifaceIndex int, err error)
+      36 +// primaryIfaceName is the pod-side primary network interface name.
+      37 +// tc delay is applied to this interface inside the pod netns when injectPrimaryInterface is true.
+      38 +const primaryIfaceName = "eth0"
+      39 +
+      40 +// PodFinder resolves a container ID to the pod's network namespace path.
+      41 +type PodFinder interface {
+      42    FindNetnsPath(ctx context.Context, containerID string) (string, error)
+      43  }
+      44
+      43 -// TCApplier applies and removes tc netem delay rules on network interfaces.
+      45 +// TCApplier applies and removes tc netem delay rules on network interfaces
+      46 +// inside pod network namespaces via nsenter(1).
+      47  type TCApplier interface {
+      45 -  Apply(iface string, delayMs int32) error
+      46 -  Remove(iface string) error
+      48    // ApplyInNetns installs or replaces a netem qdisc on iface inside the network
+      49    // namespace at netnsPath. Returns the tc command string that was executed.
+      50    ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error)
+     ...
+      56  // RealTCApplier delegates to the tc package and is used in production.
+      57  type RealTCApplier struct{}
+      58
+      58 -func (RealTCApplier) Apply(iface string, delayMs int32) error { return tc.Apply(iface, delayMs) }
+      59 -func (RealTCApplier) Remove(iface string) error               { return tc.Remove(iface) }
+      59  func (RealTCApplier) ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error) {
+      60    return tc.ApplyInNetns(netnsPath, iface, delayMs)
+      61  }
+     ...
+      63    return tc.RemoveInNetns(netnsPath, iface)
+      64  }
+      65
+      67 -// multusInjectedState records the tc rule applied to a single Multus-managed interface.
+      68 -type multusInjectedState struct {
+      69 -  nadName   string // NetworkAttachmentDefinition identifier from the annotation
+      70 -  ifaceName string // interface name inside the pod (e.g. net1)
+      71 -  netnsPath string // /proc/<pid>/ns/net used to enter the pod network namespace
+      66 +// ifaceInjectedState records the tc rule applied to a single interface inside the pod.
+      67 +type ifaceInjectedState struct {
+      68 +  nadName   string // empty for the primary interface; NAD identifier for Multus
+      69 +  ifaceName string // interface name inside the pod (e.g. "eth0", "net1")
+      70    delayMs   int32
+      71    tcCmd     string
+      72  }
+      73
+      74  // injectedState records all tc rules currently applied to a pod.
+      75  type injectedState struct {
+      78 -  ifaceName        string // host-side veth interface name
+      79 -  ifaceIndex       int
+      80 -  podName          string
+      81 -  podNamespace     string
+      82 -  delayMs          int32
+      83 -  primaryInjected  bool // true when a tc rule is active on the primary interface
+      84 -  tcCmd            string
+      85 -  multusInterfaces []multusInjectedState
+      76 +  podName      string
+      77 +  podNamespace string
+      78 +  netnsPath    string               // /proc/<pid>/ns/net stored for cleanup after pod deletion
+      79 +  delayMs      int32
+      80 +  interfaces   []ifaceInjectedState // primary (eth0) and/or Multus interfaces
+      81  }
+      82
+      83 +// ifaceDesired describes one interface to inject delay into.
+      84 +type ifaceDesired struct {
+      85 +  nadName   string // empty for the primary interface
+      86 +  ifaceName string
+      87 +}
+      88 +
+      89  // desiredPodState holds the computed tc configuration that should be applied to a pod.
+      90  type desiredPodState struct {
+      90 -  delayMs          int32
+      91 -  injectPrimary    bool // whether to inject delay on the primary interface
+      92 -  multusInterfaces []multusDesiredIface
+      91 +  delayMs    int32
+      92 +  interfaces []ifaceDesired
+      93  }
+      94
+      95  // multusDesiredIface identifies a Multus-managed interface to inject delay into.
+     ...
+      109    client.Client
+      110    Scheme    *runtime.Scheme
+      111    NodeName  string
+      112 -  Finder    VethFinder
+      112 +  Finder    PodFinder
+      113    TCApplier TCApplier
+      114
+      115    // mu guards injected.
+     ...
+      185          if !podSel.Matches(labels.Set(pod.Labels)) {
+      186            continue
+      187          }
+      188 -        // Use empty labels if namespace is not found (e.g., recently deleted).
+      189 -        // An empty NamespaceSelector matches all namespaces including this case.
+      188          nsLabels := namespaceLabelMap[pod.Namespace]
+      189          if !nsSel.Matches(nsLabels) {
+      190            continue
+      191          }
+      192          uid := string(pod.UID)
+      195 -        // Preserve the existing delay when the pod is already injected and
+      196 -        // periodic rotation is not active. This prevents re-randomizing on
+      197 -        // every reconcile triggered by unrelated pod or resource changes.
+      198 -        // Last matching rule wins; earlier rules can be overridden.
+      193          var delayMs int32
+      194          if existing, alreadyInjected := r.injected[uid]; alreadyInjected && !shouldRotate {
+      195            delayMs = existing.delayMs
+      196          } else {
+      197            delayMs = tc.RandomDelay(rule.MinDelay, rule.MaxDelay)
+      198          }
+      199 +
+      200 +        // Build the desired interface list for this pod.
+      201 +        var ifaces []ifaceDesired
+      202 +        injectPrimary := rule.InjectPrimaryInterface == nil || *rule.InjectPrimaryInterface
+      203 +        if injectPrimary {
+      204 +          ifaces = append(ifaces, ifaceDesired{nadName: "", ifaceName: primaryIfaceName})
+      205 +        }
+      206          multusIfaces := resolveMultusInterfaces(logger, &pod, rule.MultusNetworks)
+      207          if len(rule.MultusNetworks) > 0 && len(multusIfaces) == 0 {
+      208            logger.Info("no multus interfaces resolved for pod; check annotation and NAD names",
+      209              "pod", pod.Name, "namespace", pod.Namespace,
+      210              "multusNetworks", rule.MultusNetworks)
+      211          }
+      212 +        for _, mi := range multusIfaces {
+      213 +          ifaces = append(ifaces, ifaceDesired{nadName: mi.nadName, ifaceName: mi.ifaceName})
+      214 +        }
+      215 +
+      216          desired[uid] = desiredPodState{
+      212 -          delayMs:          delayMs,
+      213 -          injectPrimary:    rule.InjectPrimaryInterface == nil || *rule.InjectPrimaryInterface,
+      214 -          multusInterfaces: multusIfaces,
+      217 +          delayMs:    delayMs,
+      218 +          interfaces: ifaces,
+      219          }
+      220        }
+      221      }
+     ...
+      224    // Remove tc rules for pods that are no longer in the desired set.
+      225    for uid, state := range r.injected {
+      226      if _, ok := desired[uid]; !ok {
+      223 -      logger.Info("removing tc rules", "podUID", uid, "iface", state.ifaceName)
+      224 -      if state.primaryInjected {
+      225 -        if err := r.TCApplier.Remove(state.ifaceName); err != nil {
+      226 -          logger.Error(err, "failed to remove tc rule", "iface", state.ifaceName)
+      227 +      logger.Info("removing tc rules", "podUID", uid)
+      228 +      for _, iface := range state.interfaces {
+      229 +        if err := r.TCApplier.RemoveInNetns(state.netnsPath, iface.ifaceName); err != nil {
+      230 +          logger.Error(err, "failed to remove tc rule",
+      231 +            "iface", iface.ifaceName, "nad", iface.nadName)
+      232          }
+      233        }
+      229 -      for _, mi := range state.multusInterfaces {
+      230 -        if err := r.TCApplier.RemoveInNetns(mi.netnsPath, mi.ifaceName); err != nil {
+      231 -          logger.Error(err, "failed to remove multus tc rule",
+      232 -            "iface", mi.ifaceName, "nad", mi.nadName)
+      233 -        }
+      234 -      }
+      234        delete(r.injected, uid)
+      235      }
+      236    }
+     ...
+      249        continue
+      250      }
+      251
+      253 -    iface, ifaceIdx, err := r.Finder.FindHostVeth(ctx, containerID)
+      252 +    netnsPath, err := r.Finder.FindNetnsPath(ctx, containerID)
+      253      if err != nil {
+      255 -      logger.Error(err, "cannot find host veth", "pod", pod.Name, "containerID", containerID)
+      254 +      logger.Error(err, "cannot find netns path", "pod", pod.Name, "containerID", containerID)
+      255        continue
+      256      }
+      257
+      259 -    // Resolve netns path only when Multus interfaces are requested.
+      260 -    var netnsPath string
+      261 -    if len(des.multusInterfaces) > 0 {
+      262 -      netnsPath, err = r.Finder.FindNetnsPath(ctx, containerID)
+      263 -      if err != nil {
+      264 -        logger.Error(err, "cannot find netns path for multus injection", "pod", pod.Name)
+      265 -        // Continue: the primary interface can still be processed.
+      266 -      }
+      267 -    }
+      268 -
+      258      existing := r.injected[uid]
+      259
+      271 -    // Check whether primary interface or Multus interfaces changed.
+      272 -    // primaryUnchanged considers both the desired injection flag and the current state.
+      273 -    var primaryUnchanged bool
+      274 -    if !des.injectPrimary {
+      275 -      // Desired: no primary injection. Unchanged only if primary was already not injected.
+      276 -      primaryUnchanged = !existing.primaryInjected
+      277 -    } else {
+      278 -      // Desired: inject primary. Unchanged if same iface, same delay, and was already injected.
+      279 -      primaryUnchanged = existing.primaryInjected &&
+      280 -        existing.ifaceName == iface &&
+      281 -        existing.delayMs == des.delayMs
+      282 -    }
+      283 -    multusUnchanged := multusIfaceSetsEqual(existing.multusInterfaces, des.multusInterfaces, des.delayMs)
+      284 -    if primaryUnchanged && multusUnchanged {
+      260 +    // Skip if nothing changed: same netns, same delay, same interface set.
+      261 +    if existing.netnsPath == netnsPath &&
+      262 +      existing.delayMs == des.delayMs &&
+      263 +      ifaceSetsEqual(existing.interfaces, des.interfaces) {
+      264        injectedCount++
+      265        continue
+      266      }
+      267
+      289 -    // Apply or remove the primary interface rule as needed.
+      290 -    var newTCCmd string
+      291 -    if !primaryUnchanged {
+      292 -      if des.injectPrimary {
+      293 -        newTCCmd = fmt.Sprintf("tc qdisc replace dev %s root handle 1: netem delay %dms", iface, des.delayMs)
+      294 -        logger.Info("applying tc delay", "pod", pod.Name, "iface", iface,
+      295 -          "delayMs", des.delayMs, "tcCmd", newTCCmd)
+      296 -        if err := r.TCApplier.Apply(iface, des.delayMs); err != nil {
+      297 -          logger.Error(err, "tc apply failed", "iface", iface)
+      298 -          continue
+      268 +    // Remove interfaces that are no longer in the desired set.
+      269 +    desiredIfaceSet := make(map[string]bool, len(des.interfaces))
+      270 +    for _, di := range des.interfaces {
+      271 +      desiredIfaceSet[di.ifaceName] = true
+      272 +    }
+      273 +    for _, ei := range existing.interfaces {
+      274 +      if !desiredIfaceSet[ei.ifaceName] {
+      275 +        if err := r.TCApplier.RemoveInNetns(existing.netnsPath, ei.ifaceName); err != nil {
+      276 +          logger.Error(err, "failed to remove tc rule for removed interface",
+      277 +            "pod", pod.Name, "iface", ei.ifaceName, "nad", ei.nadName)
+      278          }
+      300 -      } else if existing.primaryInjected {
+      301 -        // injectPrimary toggled from true to false — remove the existing rule.
+      302 -        logger.Info("removing primary tc rule (injectPrimaryInterface=false)",
+      303 -          "pod", pod.Name, "iface", iface)
+      304 -        if err := r.TCApplier.Remove(iface); err != nil {
+      305 -          logger.Error(err, "tc remove failed", "iface", iface)
+      306 -        }
+      279        }
+      308 -    } else {
+      309 -      newTCCmd = existing.tcCmd
+      280      }
+      281
+      312 -    // Build a map of existing Multus state for efficient lookup.
+      313 -    existingMultusMap := make(map[string]multusInjectedState, len(existing.multusInterfaces))
+      314 -    for _, mi := range existing.multusInterfaces {
+      315 -      existingMultusMap[mi.nadName] = mi
+      282 +    // Build a map of existing interface state for efficient lookup.
+      283 +    existingIfaceMap := make(map[string]ifaceInjectedState, len(existing.interfaces))
+      284 +    for _, ei := range existing.interfaces {
+      285 +      existingIfaceMap[ei.ifaceName] = ei
+      286      }
+      287
+      318 -    // Remove Multus interfaces that are no longer desired (NAD removed from rule).
+      319 -    desiredNADs := make(map[string]bool, len(des.multusInterfaces))
+      320 -    for _, dmi := range des.multusInterfaces {
+      321 -      desiredNADs[dmi.nadName] = true
+      322 -    }
+      323 -    for _, mi := range existing.multusInterfaces {
+      324 -      if !desiredNADs[mi.nadName] {
+      325 -        if err := r.TCApplier.RemoveInNetns(mi.netnsPath, mi.ifaceName); err != nil {
+      326 -          logger.Error(err, "failed to remove multus tc rule",
+      327 -            "iface", mi.ifaceName, "nad", mi.nadName)
+      328 -        }
+      329 -      }
+      330 -    }
+      331 -
+      332 -    // Apply desired Multus interfaces (add new or update changed ones).
+      333 -    newMultus := make([]multusInjectedState, 0, len(des.multusInterfaces))
+      334 -    for _, dmi := range des.multusInterfaces {
+      335 -      emi, wasInjected := existingMultusMap[dmi.nadName]
+      336 -      miUnchanged := wasInjected &&
+      337 -        emi.ifaceName == dmi.ifaceName &&
+      338 -        emi.delayMs == des.delayMs
+      339 -
+      340 -      if miUnchanged {
+      341 -        newMultus = append(newMultus, emi)
+      288 +    // Apply or re-apply each desired interface.
+      289 +    newIfaces := make([]ifaceInjectedState, 0, len(des.interfaces))
+      290 +    for _, di := range des.interfaces {
+      291 +      ei, wasInjected := existingIfaceMap[di.ifaceName]
+      292 +      ifaceUnchanged := wasInjected &&
+      293 +        ei.delayMs == des.delayMs &&
+      294 +        existing.netnsPath == netnsPath
+      295 +      if ifaceUnchanged {
+      296 +        newIfaces = append(newIfaces, ei)
+      297          continue
+      298        }
+      299
+      345 -      if netnsPath == "" {
+      346 -        logger.Info("skipping multus interface: netns path unavailable",
+      347 -          "pod", pod.Name, "nad", dmi.nadName)
+      348 -        continue
+      300 +      nadLabel := di.nadName
+      301 +      if nadLabel == "" {
+      302 +        nadLabel = "primary"
+      303        }
+      350 -
+      351 -      miCmd, err := r.TCApplier.ApplyInNetns(netnsPath, dmi.ifaceName, des.delayMs)
+      304 +      tcCmd, err := r.TCApplier.ApplyInNetns(netnsPath, di.ifaceName, des.delayMs)
+      305        if err != nil {
+      353 -        logger.Error(err, "multus tc apply failed",
+      354 -          "pod", pod.Name, "iface", dmi.ifaceName, "nad", dmi.nadName)
+      306 +        logger.Error(err, "tc apply failed",
+      307 +          "pod", pod.Name, "iface", di.ifaceName, "nad", nadLabel)
+      308          continue
+      309        }
+      357 -      logger.Info("applying multus tc delay", "pod", pod.Name,
+      358 -        "nad", dmi.nadName, "iface", dmi.ifaceName, "delayMs", des.delayMs,
+      359 -        "tcCmd", miCmd)
+      360 -      newMultus = append(newMultus, multusInjectedState{
+      361 -        nadName:   dmi.nadName,
+      362 -        ifaceName: dmi.ifaceName,
+      363 -        netnsPath: netnsPath,
+      310 +      logger.Info("applying tc delay",
+      311 +        "pod", pod.Name, "iface", di.ifaceName, "nad", nadLabel,
+      312 +        "delayMs", des.delayMs, "tcCmd", tcCmd)
+      313 +      newIfaces = append(newIfaces, ifaceInjectedState{
+      314 +        nadName:   di.nadName,
+      315 +        ifaceName: di.ifaceName,
+      316          delayMs:   des.delayMs,
+      365 -        tcCmd:     miCmd,
+      317 +        tcCmd:     tcCmd,
+      318        })
+      319      }
+      320
+      321      r.injected[uid] = injectedState{
+      370 -      ifaceName:        iface,
+      371 -      ifaceIndex:       ifaceIdx,
+      372 -      podName:          pod.Name,
+      373 -      podNamespace:     pod.Namespace,
+      374 -      delayMs:          des.delayMs,
+      375 -      primaryInjected:  des.injectPrimary,
+      376 -      tcCmd:            newTCCmd,
+      377 -      multusInterfaces: newMultus,
+      322 +      podName:      pod.Name,
+      323 +      podNamespace: pod.Namespace,
+      324 +      netnsPath:    netnsPath,
+      325 +      delayMs:      des.delayMs,
+      326 +      interfaces:   newIfaces,
+      327      }
+      328      injectedCount++
+      329    }
+     ...
+      333    // same TCInjector status concurrently. On conflict we re-read the latest
+      334    // resource version and re-merge before retrying.
+      335    if req.Name != "" {
+      387 -    // Build this node's details once; they do not change between retries.
+      336      thisNodeDetails := make([]tcv1alpha1.InjectedPodStatus, 0, len(r.injected))
+      337      for _, state := range r.injected {
+      338        podStatus := tcv1alpha1.InjectedPodStatus{
+     ...
+      341          PodName:   state.podName,
+      342          DelayMs:   state.delayMs,
+      343        }
+      396 -      if state.primaryInjected {
+      397 -        podStatus.Interface      = state.ifaceName
+      398 -        podStatus.InterfaceIndex = int32(state.ifaceIndex)
+      399 -        podStatus.TCCommand      = state.tcCmd
+      344 +      for _, iface := range state.interfaces {
+      345 +        if iface.nadName == "" {
+      346 +          // Primary interface (eth0): populate top-level fields.
+      347 +          podStatus.Interface  = iface.ifaceName
+      348 +          podStatus.TCCommand  = iface.tcCmd
+      349 +        } else {
+      350 +          // Multus interface: append to MultusInterfaces.
+      351 +          podStatus.MultusInterfaces = append(podStatus.MultusInterfaces,
+      352 +            tcv1alpha1.InjectedInterfaceStatus{
+      353 +              NADName:   iface.nadName,
+      354 +              Interface: iface.ifaceName,
+      355 +              DelayMs:   iface.delayMs,
+      356 +              TCCommand: iface.tcCmd,
+      357 +            })
+      358 +        }
+      359        }
+      401 -      for _, mi := range state.multusInterfaces {
+      402 -        podStatus.MultusInterfaces = append(podStatus.MultusInterfaces,
+      403 -          tcv1alpha1.InjectedInterfaceStatus{
+      404 -            NADName:   mi.nadName,
+      405 -            Interface: mi.ifaceName,
+      406 -            DelayMs:   mi.delayMs,
+      407 -            TCCommand: mi.tcCmd,
+      408 -          })
+      409 -      }
+      360        thisNodeDetails = append(thisNodeDetails, podStatus)
+      361      }
+      362      for attempt := 0; attempt < 5; attempt++ {
+     ...
+      368          logger.Error(err, "failed to get TCInjector for status update")
+      369          break
+      370        }
+      421 -      // Preserve entries from other nodes; replace only this node's entries.
+      371        merged := make([]tcv1alpha1.InjectedPodStatus, 0, len(injector.Status.InjectedPodDetails))
+      372        for _, d := range injector.Status.InjectedPodDetails {
+      373          if d.NodeName != r.NodeName {
+     ...
+      377        merged = append(merged, thisNodeDetails...)
+      378        injector.Status.InjectedPods = int32(len(merged))
+      379        injector.Status.InjectedPodDetails = merged
+      431 -      // Use the node name as the condition type so each node upserts its own condition.
+      380        setCondition(injector, metav1.Condition{
+      381          Type:               r.NodeName,
+      382          Status:             metav1.ConditionTrue,
+     ...
+      415  // SetupWithManager registers the controller with the manager, watching both
+      416  // TCInjector resources and Pods on this node.
+      417  func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+      470 -  // Index pods by spec.nodeName for efficient listing.
+      418    if err := mgr.GetFieldIndexer().IndexField(
+      419      context.Background(),
+      420      &corev1.Pod{},
+     ...
+      428    }
+      429
+      430    return ctrl.NewControllerManagedBy(mgr).
+      484 -    // GenerationChangedPredicate prevents reconciles triggered by status
+      485 -    // updates, which do not increment metadata.generation. Without this,
+      486 -    // each Status().Update() call would re-trigger reconcile indefinitely.
+      431      For(&tcv1alpha1.TCInjector{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+      488 -    // Also trigger reconcile when pods on this node change.
+      432      Watches(
+      433        &corev1.Pod{},
+      434        handler.EnqueueRequestsFromMapFunc(r.podToTCInjector),
+     ...
+      451    requests := make([]reconcile.Request, 0, len(injectorList.Items))
+      452    for _, injector := range injectorList.Items {
+      453      requests = append(requests, reconcile.Request{
+      511 -      NamespacedName: client.ObjectKey{Name: injector.Name, Namespace: injector.Namespace},
+      454 +      NamespacedName: client.ObjectKey{Name: injector.Name},
+      455      })
+      456    }
+      457    return requests
+      458  }
+      459
+      460 +// isPodReady returns true when the pod is Running with all containers ready.
+      461 +func isPodReady(pod *corev1.Pod) bool {
+      462 +  if pod.Status.Phase != corev1.PodRunning {
+      463 +    return false
+      464 +  }
+      465 +  for _, cs := range pod.Status.ContainerStatuses {
+      466 +    if !cs.Ready {
+      467 +      return false
+      468 +    }
+      469 +  }
+      470 +  return true
+      471 +}
+      472 +
+      473 +// firstReadyContainerID returns the container ID of the first ready container.
+      474 +func firstReadyContainerID(pod *corev1.Pod) string {
+      475 +  for _, cs := range pod.Status.ContainerStatuses {
+      476 +    if cs.Ready && cs.ContainerID != "" {
+      477 +      return cs.ContainerID
+      478 +    }
+      479 +  }
+      480 +  return ""
+      481 +}
+      482 +
+      483 +// findPodByUID returns the pod with the given UID, or nil if not found.
+      484 +func findPodByUID(pods []corev1.Pod, uid string) *corev1.Pod {
+      485 +  for i := range pods {
+      486 +    if string(pods[i].UID) == uid {
+      487 +      return &pods[i]
+      488 +    }
+      489 +  }
+      490 +  return nil
+      491 +}
+      492 +
+      493 +// ifaceSetsEqual returns true when the set of interface names in existing
+      494 +// matches the set in desired (order-independent, delay-agnostic).
+      495 +// The caller checks delayMs separately before deciding whether to re-apply.
+      496 +func ifaceSetsEqual(existing []ifaceInjectedState, desired []ifaceDesired) bool {
+      497 +  if len(existing) != len(desired) {
+      498 +    return false
+      499 +  }
+      500 +  em := make(map[string]bool, len(existing))
+      501 +  for _, ei := range existing {
+      502 +    em[ei.ifaceName] = true
+      503 +  }
+      504 +  for _, di := range desired {
+      505 +    if !em[di.ifaceName] {
+      506 +      return false
+      507 +    }
+      508 +  }
+      509 +  return true
+      510 +}
+      511 +
+      512  // resolveMultusInterfaces parses the Multus networks-status annotation on the pod and
+      513  // returns the interfaces that match any of the requested NAD names.
+      519 -// It logs the reason when no interfaces are resolved so operators can diagnose mismatches.
+      514  func resolveMultusInterfaces(logger logr.Logger, pod *corev1.Pod, nadNames []string) []multusDesiredIface {
+      515    if len(nadNames) == 0 {
+      516      return nil
+     ...
+      528        "pod", pod.Name, "namespace", pod.Namespace)
+      529      return nil
+      530    }
+      537 -  // Collect the NAD names present in the annotation for diagnostic logging.
+      531    annotationNames := make([]string, 0, len(statuses))
+      532    for _, s := range statuses {
+      533      annotationNames = append(annotationNames, s.Name)
+     ...
+      564    if annotationName == nadName {
+      565      return true
+      566    }
+      574 -  // If the user-specified name contains no slash, match the name part only.
+      567    if !strings.Contains(nadName, "/") {
+      568      if _, name, found := strings.Cut(annotationName, "/"); found {
+      569        return name == nadName
+     ...
+      572    return false
+      573  }
+      574
+      583 -// multusIfaceSetsEqual returns true if the existing Multus injected state exactly
+      584 -// matches the desired Multus interfaces (same set of NADs, same interface names,
+      585 -// and the same delayMs).
+      586 -func multusIfaceSetsEqual(existing []multusInjectedState, desired []multusDesiredIface, delayMs int32) bool {
+      587 -  if len(existing) != len(desired) {
+      588 -    return false
+      589 -  }
+      590 -  em := make(map[string]multusInjectedState, len(existing))
+      591 -  for _, mi := range existing {
+      592 -    em[mi.nadName] = mi
+      593 -  }
+      594 -  for _, dmi := range desired {
+      595 -    emi, ok := em[dmi.nadName]
+      596 -    if !ok || emi.ifaceName != dmi.ifaceName || emi.delayMs != delayMs {
+      597 -      return false
+      598 -    }
+      599 -  }
+      600 -  return true
+      601 -}
+      602 -
+      603 -// isPodReady returns true if the pod is running and all containers are ready.
+      604 -func isPodReady(pod *corev1.Pod) bool {
+      605 -  if pod.Status.Phase != corev1.PodRunning {
+      606 -    return false
+      607 -  }
+      608 -  for _, cs := range pod.Status.ContainerStatuses {
+      609 -    if !cs.Ready {
+      610 -      return false
+      611 -    }
+      612 -  }
+      613 -  return true
+      614 -}
+      615 -
+      616 -// firstReadyContainerID returns the container ID of the first ready container.
+      617 -func firstReadyContainerID(pod *corev1.Pod) string {
+      618 -  for _, cs := range pod.Status.ContainerStatuses {
+      619 -    if cs.Ready && cs.ContainerID != "" {
+      620 -      return cs.ContainerID
+      621 -    }
+      622 -  }
+      623 -  return ""
+      624 -}
+      625 -
+      626 -// findPodByUID returns the pod with the given UID from the list.
+      627 -func findPodByUID(pods []corev1.Pod, uid string) *corev1.Pod {
+      628 -  for i := range pods {
+      629 -    if string(pods[i].UID) == uid {
+      630 -      return &pods[i]
+      631 -    }
+      632 -  }
+      633 -  return nil
+      634 -}
+      635 -
+      636 -// setCondition upserts a condition on the TCInjector status.
+      575 +// setCondition upserts a Condition into the TCInjector status by type.
+      576  func setCondition(injector *tcv1alpha1.TCInjector, cond metav1.Condition) {
+      638 -  for i, existing := range injector.Status.Conditions {
+      639 -    if existing.Type == cond.Type {
+      577 +  for i, c := range injector.Status.Conditions {
+      578 +    if c.Type == cond.Type {
+      579        injector.Status.Conditions[i] = cond
+      580        return
+      581      }
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ 次にテストファイルを全面書き直しします：
+
+⏺ Write(pkg/controller/tcinjector_controller_test.go)
+  ⎿  Added 301 lines, removed 313 lines
+      22
+      23  // ---- fakes ----
+      24
+      25 -// fakeVethFinder maps containerID -> interface name and containerID -> netns path.
+      26 -// Returns an error for unknown IDs.
+      27 -type fakeVethFinder struct {
+      25 +// fakePodFinder maps containerID -> netns path.
+      26 +// Returns an error for unknown container IDs.
+      27 +type fakePodFinder struct {
+      28    mu           sync.Mutex
+      29 -  mapping      map[string]string // containerID -> host-side veth iface name
+      30 -  netnsMapping map[string]string // containerID -> netns path
+      29 +  netnsMapping map[string]string // containerID -> /proc/<pid>/ns/net
+      30  }
+      31
+      33 -func newFakeVethFinder(m map[string]string) *fakeVethFinder {
+      34 -  return &fakeVethFinder{mapping: m}
+      32 +func newFakePodFinder(m map[string]string) *fakePodFinder {
+      33 +  return &fakePodFinder{netnsMapping: m}
+      34  }
+      35
+      37 -func (f *fakeVethFinder) FindHostVeth(_ context.Context, containerID string) (string, int, error) {
+      36 +func (f *fakePodFinder) FindNetnsPath(_ context.Context, containerID string) (string, error) {
+      37    f.mu.Lock()
+      38    defer f.mu.Unlock()
+      40 -  if iface, ok := f.mapping[containerID]; ok {
+      41 -    return iface, 0, nil
+      42 -  }
+      43 -  return "", 0, fmt.Errorf("no veth mapping for container %q", containerID)
+      44 -}
+      45 -
+      46 -func (f *fakeVethFinder) FindNetnsPath(_ context.Context, containerID string) (string, error) {
+      47 -  f.mu.Lock()
+      48 -  defer f.mu.Unlock()
+      39    if path, ok := f.netnsMapping[containerID]; ok {
+      40      return path, nil
+      41    }
+      42    return "", fmt.Errorf("no netns mapping for container %q", containerID)
+      43  }
+      44
+      55 -// fakeTCApplier records Apply, Remove, ApplyInNetns, and RemoveInNetns calls.
+      45 +// fakeTCApplier records ApplyInNetns and RemoveInNetns calls.
+      46  type fakeTCApplier struct {
+      47    mu           sync.Mutex
+      58 -  applied      map[string]int32 // iface -> last applied delayMs (host iface)
+      48    appliedNetns map[string]int32 // "netnsPath:iface" -> last applied delayMs
+      60 -  removed      []string
+      61 -  removedNetns []string // "netnsPath:iface"
+      49 +  removedNetns []string         // "netnsPath:iface"
+      50    applyErr     error
+      51    removeErr    error
+      52  }
+      53
+      54  func newFakeTCApplier() *fakeTCApplier {
+      55    return &fakeTCApplier{
+      68 -    applied:      make(map[string]int32),
+      56      appliedNetns: make(map[string]int32),
+      57    }
+      58  }
+      59
+      73 -func (f *fakeTCApplier) Apply(iface string, delayMs int32) error {
+      74 -  f.mu.Lock()
+      75 -  defer f.mu.Unlock()
+      76 -  if f.applyErr != nil {
+      77 -    return f.applyErr
+      78 -  }
+      79 -  f.applied[iface] = delayMs
+      80 -  return nil
+      81 -}
+      82 -
+      83 -func (f *fakeTCApplier) Remove(iface string) error {
+      84 -  f.mu.Lock()
+      85 -  defer f.mu.Unlock()
+      86 -  if f.removeErr != nil {
+      87 -    return f.removeErr
+      88 -  }
+      89 -  delete(f.applied, iface)
+      90 -  f.removed = append(f.removed, iface)
+      91 -  return nil
+      92 -}
+      93 -
+      60  func (f *fakeTCApplier) ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error) {
+      61    f.mu.Lock()
+      62    defer f.mu.Unlock()
+     ...
+       81    return nil
+       82  }
+       83
+      118 -func (f *fakeTCApplier) isApplied(iface string) bool {
+      119 -  f.mu.Lock()
+      120 -  defer f.mu.Unlock()
+      121 -  _, ok := f.applied[iface]
+      122 -  return ok
+      123 -}
+      124 -
+       84  func (f *fakeTCApplier) isAppliedInNetns(netnsPath, iface string) bool {
+       85    f.mu.Lock()
+       86    defer f.mu.Unlock()
+     ...
+       88    return ok
+       89  }
+       90
+      132 -func (f *fakeTCApplier) wasRemoved(iface string) bool {
+       91 +func (f *fakeTCApplier) wasRemovedInNetns(netnsPath, iface string) bool {
+       92    f.mu.Lock()
+       93    defer f.mu.Unlock()
+      135 -  for _, r := range f.removed {
+      136 -    if r == iface {
+       94 +  key := netnsPath + ":" + iface
+       95 +  for _, r := range f.removedNetns {
+       96 +    if r == key {
+       97        return true
+       98      }
+       99    }
+     ...
+      113  func buildReconciler(
+      114    t *testing.T,
+      115    objs []client.Object,
+      156 -  finder *fakeVethFinder,
+      116 +  finder *fakePodFinder,
+      117    applier *fakeTCApplier,
+      118  ) (*Reconciler, *fake.ClientBuilder) {
+      119    t.Helper()
+     ...
+      181    return &metav1.Duration{Duration: d}
+      182  }
+      183
+      184 +func boolPtr(b bool) *bool { return &b }
+      185 +
+      186  func reconcileReq(name string) reconcile.Request {
+      187    return reconcile.Request{NamespacedName: client.ObjectKey{Name: name}}
+      188  }
+      189
+      190 +// testNetns returns a predictable netns path for use in tests.
+      191 +func testNetns(id string) string { return "/proc/test/" + id + "/ns/net" }
+      192 +
+      193  // ---- Reconcile tests ----
+      194
+      195  func TestReconcile_NoTCInjectors(t *testing.T) {
+      196    pod := readyPod("pod1", "default", "node-1", "containerd://aaa", map[string]string{"app": "x"})
+      232 -  finder := newFakeVethFinder(map[string]string{"containerd://aaa": "veth0"})
+      197 +  finder := newFakePodFinder(map[string]string{"containerd://aaa": testNetns("aaa")})
+      198    applier := newFakeTCApplier()
+      199    r, _ := buildReconciler(t, []client.Object{pod}, finder, applier)
+      200
+     ...
+      202    if err != nil {
+      203      t.Fatalf("Reconcile error: %v", err)
+      204    }
+      240 -  if len(applier.applied) != 0 {
+      241 -    t.Errorf("expected no tc rules applied, got %v", applier.applied)
+      205 +  if len(applier.appliedNetns) != 0 {
+      206 +    t.Errorf("expected no tc rules applied, got %v", applier.appliedNetns)
+      207    }
+      208  }
+      209
+      210  func TestReconcile_AppliesRuleToMatchingPod(t *testing.T) {
+      246 -  pod := readyPod("pod1", "default", "node-1", "containerd://bbb",
+      211 +  const containerID = "containerd://bbb"
+      212 +  pod := readyPod("pod1", "default", "node-1", containerID,
+      213      map[string]string{"app": "backend"})
+      214    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      215      {
+     ...
+      218        MaxDelay: 50,
+      219      },
+      220    })
+      255 -  finder := newFakeVethFinder(map[string]string{"containerd://bbb": "veth1abc"})
+      221 +  ns := testNetns("bbb")
+      222 +  finder := newFakePodFinder(map[string]string{containerID: ns})
+      223    applier := newFakeTCApplier()
+      224    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      225
+     ...
+      227    if err != nil {
+      228      t.Fatalf("Reconcile error: %v", err)
+      229    }
+      263 -  if !applier.isApplied("veth1abc") {
+      264 -    t.Error("expected tc rule applied to veth1abc")
+      230 +  if !applier.isAppliedInNetns(ns, "eth0") {
+      231 +    t.Errorf("expected tc rule applied inside netns %s on eth0", ns)
+      232    }
+      266 -  if delay := applier.applied["veth1abc"]; delay != 50 {
+      233 +  if delay := applier.appliedNetns[ns+":eth0"]; delay != 50 {
+      234      t.Errorf("delay = %d, want 50", delay)
+      235    }
+      236  }
+     ...
+      245        MaxDelay: 100,
+      246      },
+      247    })
+      281 -  finder := newFakeVethFinder(map[string]string{"containerd://ccc": "veth2"})
+      248 +  finder := newFakePodFinder(map[string]string{"containerd://ccc": testNetns("ccc")})
+      249    applier := newFakeTCApplier()
+      250    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      251
+     ...
+      253    if err != nil {
+      254      t.Fatalf("Reconcile error: %v", err)
+      255    }
+      289 -  if len(applier.applied) != 0 {
+      290 -    t.Errorf("expected no tc rules applied, got %v", applier.applied)
+      256 +  if len(applier.appliedNetns) != 0 {
+      257 +    t.Errorf("expected no tc rules applied, got %v", applier.appliedNetns)
+      258    }
+      259  }
+      260
+     ...
+      268        MaxDelay: 10,
+      269      },
+      270    })
+      304 -  finder := newFakeVethFinder(map[string]string{"containerd://ddd": "veth3"})
+      271 +  finder := newFakePodFinder(map[string]string{"containerd://ddd": testNetns("ddd")})
+      272    applier := newFakeTCApplier()
+      273    // Reconciler is on node-1; pod is on node-2.
+      274    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+     ...
+      277    if err != nil {
+      278      t.Fatalf("Reconcile error: %v", err)
+      279    }
+      313 -  if len(applier.applied) != 0 {
+      280 +  if len(applier.appliedNetns) != 0 {
+      281      t.Errorf("expected no rules for pods on other nodes")
+      282    }
+      283  }
+     ...
+      298        MinDelay: 10, MaxDelay: 10,
+      299      },
+      300    })
+      334 -  finder := newFakeVethFinder(map[string]string{})
+      301 +  finder := newFakePodFinder(map[string]string{})
+      302    applier := newFakeTCApplier()
+      303    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      304
+     ...
+      306    if err != nil {
+      307      t.Fatalf("Reconcile error: %v", err)
+      308    }
+      342 -  if len(applier.applied) != 0 {
+      309 +  if len(applier.appliedNetns) != 0 {
+      310      t.Error("expected no tc rules for non-ready pod")
+      311    }
+      312  }
+      313
+      314  func TestReconcile_RemovesRuleWhenPodNoLongerMatches(t *testing.T) {
+      348 -  // First reconcile: pod matches → rule applied.
+      349 -  pod := readyPod("pod1", "default", "node-1", "containerd://eee",
+      315 +  const containerID = "containerd://eee"
+      316 +  ns := testNetns("eee")
+      317 +  pod := readyPod("pod1", "default", "node-1", containerID,
+      318      map[string]string{"app": "backend"})
+      319    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      320      {
+     ...
+      322        MinDelay: 20, MaxDelay: 20,
+      323      },
+      324    })
+      357 -  finder := newFakeVethFinder(map[string]string{"containerd://eee": "veth4"})
+      325 +  finder := newFakePodFinder(map[string]string{containerID: ns})
+      326    applier := newFakeTCApplier()
+      327    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      328
+     ...
+      330    if err != nil {
+      331      t.Fatalf("first Reconcile error: %v", err)
+      332    }
+      365 -  if !applier.isApplied("veth4") {
+      333 +  if !applier.isAppliedInNetns(ns, "eth0") {
+      334      t.Fatal("expected rule applied after first reconcile")
+      335    }
+      336
+     ...
+      343    if err != nil {
+      344      t.Fatalf("second Reconcile error: %v", err)
+      345    }
+      378 -  if applier.isApplied("veth4") {
+      346 +  if applier.isAppliedInNetns(ns, "eth0") {
+      347      t.Error("expected rule removed after TCInjector deletion")
+      348    }
+      381 -  if !applier.wasRemoved("veth4") {
+      382 -    t.Error("expected Remove called on veth4")
+      349 +  if !applier.wasRemovedInNetns(ns, "eth0") {
+      350 +    t.Error("expected RemoveInNetns called for eth0")
+      351    }
+      352  }
+      353
+      354  func TestReconcile_MultipleRulesLastWins(t *testing.T) {
+      387 -  // A pod that matches two rules: the second rule's delay should win.
+      388 -  pod := readyPod("pod1", "default", "node-1", "containerd://fff",
+      355 +  const containerID = "containerd://fff"
+      356 +  ns := testNetns("fff")
+      357 +  pod := readyPod("pod1", "default", "node-1", containerID,
+      358      map[string]string{"app": "backend", "tier": "slow"})
+      359    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      360      {
+     ...
+      366        MinDelay: 200, MaxDelay: 200,
+      367      },
+      368    })
+      400 -  finder := newFakeVethFinder(map[string]string{"containerd://fff": "veth5"})
+      369 +  finder := newFakePodFinder(map[string]string{containerID: ns})
+      370    applier := newFakeTCApplier()
+      371    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      372
+     ...
+      376    }
+      377    // Both rules match; map iteration order is non-deterministic, so we only
+      378    // assert the final delay is one of the two defined values.
+      410 -  delay := applier.applied["veth5"]
+      379 +  delay := applier.appliedNetns[ns+":eth0"]
+      380    if delay != 10 && delay != 200 {
+      381      t.Errorf("delay = %d, want 10 or 200", delay)
+      382    }
+      383  }
+      384
+      416 -func TestReconcile_VethFinderError_SkipsPod(t *testing.T) {
+      385 +func TestReconcile_PodFinderError_SkipsPod(t *testing.T) {
+      386    pod := readyPod("pod1", "default", "node-1", "containerd://ggg",
+      387      map[string]string{"app": "backend"})
+      388    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+     ...
+      392      },
+      393    })
+      394    // Finder has no mapping for this container ID → will error.
+      426 -  finder := newFakeVethFinder(map[string]string{})
+      395 +  finder := newFakePodFinder(map[string]string{})
+      396    applier := newFakeTCApplier()
+      397    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      398
+      399    // Should not return an error (just logs and skips the pod).
+      400    _, err := r.Reconcile(context.Background(), reconcileReq("test"))
+      401    if err != nil {
+      433 -    t.Fatalf("Reconcile should not fail when veth lookup fails: %v", err)
+      402 +    t.Fatalf("Reconcile should not fail when pod finder fails: %v", err)
+      403    }
+      435 -  if len(applier.applied) != 0 {
+      436 -    t.Error("expected no rules applied when veth lookup fails")
+      404 +  if len(applier.appliedNetns) != 0 {
+      405 +    t.Error("expected no rules applied when pod finder fails")
+      406    }
+      407  }
+      408
+      409  func TestReconcile_NoRequeueWhenNoTCInjectors(t *testing.T) {
+      441 -  // With no TCInjectors at all, periodic rotation cannot be enabled → no requeue.
+      442 -  r, _ := buildReconciler(t, nil, newFakeVethFinder(nil), newFakeTCApplier())
+      410 +  r, _ := buildReconciler(t, nil, newFakePodFinder(nil), newFakeTCApplier())
+      411    result, err := r.Reconcile(context.Background(), reconcileReq(""))
+      412    if err != nil {
+      413      t.Fatalf("Reconcile error: %v", err)
+     ...
+      420  // ---- periodic delay rotation tests ----
+      421
+      422  func TestReconcile_PeriodicRotation_DisabledByDefault_NoRequeue(t *testing.T) {
+      455 -  // enablePeriodicDelayRotation defaults to false → reconciler must not requeue.
+      423    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      424      {
+      425        Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+      426        MinDelay: 10, MaxDelay: 10,
+      427      },
+      428    })
+      462 -  r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+      429 +  r, _ := buildReconciler(t, []client.Object{injector}, newFakePodFinder(nil), newFakeTCApplier())
+      430
+      431    result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+      432    if err != nil {
+     ...
+      438  }
+      439
+      440  func TestReconcile_PeriodicRotation_ExplicitlyDisabled_NoRequeue(t *testing.T) {
+      474 -  // enablePeriodicDelayRotation: false explicitly → no requeue.
+      441    injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
+      442      {
+      443        Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+      444        MinDelay: 10, MaxDelay: 10,
+      445      },
+      446    }, false, durationPtr(5*time.Second))
+      481 -  r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+      447 +  r, _ := buildReconciler(t, []client.Object{injector}, newFakePodFinder(nil), newFakeTCApplier())
+      448
+      449    result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+      450    if err != nil {
+     ...
+      456  }
+      457
+      458  func TestReconcile_PeriodicRotation_Enabled_DefaultInterval(t *testing.T) {
+      493 -  // enablePeriodicDelayRotation: true, delayInterval: nil → default 30s.
+      459    injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
+      460      {
+      461        Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+      462        MinDelay: 10, MaxDelay: 10,
+      463      },
+      464    }, true, nil)
+      500 -  r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+      465 +  r, _ := buildReconciler(t, []client.Object{injector}, newFakePodFinder(nil), newFakeTCApplier())
+      466
+      467    result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+      468    if err != nil {
+     ...
+      474  }
+      475
+      476  func TestReconcile_PeriodicRotation_Enabled_CustomInterval(t *testing.T) {
+      512 -  // enablePeriodicDelayRotation: true with a custom delayInterval → use that interval.
+      477    injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
+      478      {
+      479        Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+      480        MinDelay: 10, MaxDelay: 10,
+      481      },
+      482    }, true, durationPtr(2*time.Minute))
+      519 -  r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+      483 +  r, _ := buildReconciler(t, []client.Object{injector}, newFakePodFinder(nil), newFakeTCApplier())
+      484
+      485    result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+      486    if err != nil {
+     ...
+      492  }
+      493
+      494  func TestReconcile_PeriodicRotation_MultipleInjectors_MinIntervalUsed(t *testing.T) {
+      531 -  // Two injectors both enabled with different intervals → shortest wins.
+      495    injectorA := tcInjectorWithRotation("injector-a", []tcv1alpha1.DelayRule{
+      496      {
+      497        Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}},
+     ...
+      504        MinDelay: 20, MaxDelay: 20,
+      505      },
+      506    }, true, durationPtr(15*time.Second))
+      544 -  r, _ := buildReconciler(t, []client.Object{injectorA, injectorB}, newFakeVethFinder(nil), newFakeTCApplier())
+      507 +  r, _ := buildReconciler(t, []client.Object{injectorA, injectorB}, newFakePodFinder(nil), newFakeTCApplier())
+      508
+      509    result, err := r.Reconcile(context.Background(), reconcileReq("injector-a"))
+      510    if err != nil {
+     ...
+      516  }
+      517
+      518  func TestReconcile_PeriodicRotation_OnlyEnabledInjectorCounted(t *testing.T) {
+      556 -  // One injector enabled, one disabled → use only the enabled one's interval.
+      519    enabled := tcInjectorWithRotation("enabled", []tcv1alpha1.DelayRule{
+      520      {
+      521        Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}},
+     ...
+      528        MinDelay: 20, MaxDelay: 20,
+      529      },
+      530    }, false, durationPtr(5*time.Second))
+      569 -  r, _ := buildReconciler(t, []client.Object{enabled, disabled}, newFakeVethFinder(nil), newFakeTCApplier())
+      531 +  r, _ := buildReconciler(t, []client.Object{enabled, disabled}, newFakePodFinder(nil), newFakeTCApplier())
+      532
+      533    result, err := r.Reconcile(context.Background(), reconcileReq("enabled"))
+      534    if err != nil {
+     ...
+      540  }
+      541
+      542  func TestReconcile_PeriodicRotation_ZeroInterval_FallsBackToDefault(t *testing.T) {
+      581 -  // delayInterval of 0 is treated as unset → fall back to 30s default.
+      543    injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
+      544      {
+      545        Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
+      546        MinDelay: 10, MaxDelay: 10,
+      547      },
+      548    }, true, durationPtr(0))
+      588 -  r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+      549 +  r, _ := buildReconciler(t, []client.Object{injector}, newFakePodFinder(nil), newFakeTCApplier())
+      550
+      551    result, err := r.Reconcile(context.Background(), reconcileReq("test"))
+      552    if err != nil {
+     ...
+      558  }
+      559
+      560  func TestReconcile_PeriodicRotation_Enabled_AppliesDelay(t *testing.T) {
+      600 -  // Verifies that with periodic rotation enabled, tc rules are still applied normally.
+      601 -  pod := readyPod("pod1", "default", "node-1", "containerd://rot1",
+      561 +  const containerID = "containerd://rot1"
+      562 +  ns := testNetns("rot1")
+      563 +  pod := readyPod("pod1", "default", "node-1", containerID,
+      564      map[string]string{"app": "backend"})
+      565    injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
+      566      {
+     ...
+      568        MinDelay: 100, MaxDelay: 100,
+      569      },
+      570    }, true, durationPtr(10*time.Second))
+      609 -  finder := newFakeVethFinder(map[string]string{"containerd://rot1": "vethR1"})
+      571 +  finder := newFakePodFinder(map[string]string{containerID: ns})
+      572    applier := newFakeTCApplier()
+      573    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      574
+     ...
+      576    if err != nil {
+      577      t.Fatalf("Reconcile error: %v", err)
+      578    }
+      617 -  if !applier.isApplied("vethR1") {
+      618 -    t.Error("expected tc rule applied to vethR1")
+      579 +  if !applier.isAppliedInNetns(ns, "eth0") {
+      580 +    t.Error("expected tc rule applied to eth0 inside pod netns")
+      581    }
+      620 -  if applier.applied["vethR1"] != 100 {
+      621 -    t.Errorf("delay = %d, want 100", applier.applied["vethR1"])
+      582 +  if applier.appliedNetns[ns+":eth0"] != 100 {
+      583 +    t.Errorf("delay = %d, want 100", applier.appliedNetns[ns+":eth0"])
+      584    }
+      585    if result.RequeueAfter != 10*time.Second {
+      586      t.Errorf("RequeueAfter = %v, want 10s", result.RequeueAfter)
+      587    }
+      588  }
+      589
+      628 -// ---- helper function tests ----
+      629 -
+      630 -func TestIsPodReady(t *testing.T) {
+      631 -  tests := []struct {
+      632 -    name string
+      633 -    pod  *corev1.Pod
+      634 -    want bool
+      635 -  }{
+      636 -    {
+      637 -      name: "running all ready",
+      638 -      pod: &corev1.Pod{
+      639 -        Status: corev1.PodStatus{
+      640 -          Phase: corev1.PodRunning,
+      641 -          ContainerStatuses: []corev1.ContainerStatus{
+      642 -            {Ready: true},
+      643 -            {Ready: true},
+      644 -          },
+      645 -        },
+      646 -      },
+      647 -      want: true,
+      648 -    },
+      649 -    {
+      650 -      name: "running one not ready",
+      651 -      pod: &corev1.Pod{
+      652 -        Status: corev1.PodStatus{
+      653 -          Phase: corev1.PodRunning,
+      654 -          ContainerStatuses: []corev1.ContainerStatus{
+      655 -            {Ready: true},
+      656 -            {Ready: false},
+      657 -          },
+      658 -        },
+      659 -      },
+      660 -      want: false,
+      661 -    },
+      662 -    {
+      663 -      name: "pending phase",
+      664 -      pod: &corev1.Pod{
+      665 -        Status: corev1.PodStatus{Phase: corev1.PodPending},
+      666 -      },
+      667 -      want: false,
+      668 -    },
+      669 -    {
+      670 -      name: "running no container statuses",
+      671 -      pod: &corev1.Pod{
+      672 -        Status: corev1.PodStatus{Phase: corev1.PodRunning},
+      673 -      },
+      674 -      want: true,
+      675 -    },
+      676 -  }
+      677 -  for _, tt := range tests {
+      678 -    t.Run(tt.name, func(t *testing.T) {
+      679 -      if got := isPodReady(tt.pod); got != tt.want {
+      680 -        t.Errorf("isPodReady() = %v, want %v", got, tt.want)
+      681 -      }
+      682 -    })
+      683 -  }
+      684 -}
+      685 -
+      686 -func TestFirstReadyContainerID(t *testing.T) {
+      687 -  tests := []struct {
+      688 -    name string
+      689 -    pod  *corev1.Pod
+      690 -    want string
+      691 -  }{
+      692 -    {
+      693 -      name: "first ready",
+      694 -      pod: &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+      695 -        {ContainerID: "containerd://abc", Ready: true},
+      696 -      }}},
+      697 -      want: "containerd://abc",
+      698 -    },
+      699 -    {
+      700 -      name: "skips not-ready then returns ready",
+      701 -      pod: &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+      702 -        {ContainerID: "containerd://bad", Ready: false},
+      703 -        {ContainerID: "containerd://good", Ready: true},
+      704 -      }}},
+      705 -      want: "containerd://good",
+      706 -    },
+      707 -    {
+      708 -      name: "skips empty container ID",
+      709 -      pod: &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+      710 -        {ContainerID: "", Ready: true},
+      711 -        {ContainerID: "containerd://ok", Ready: true},
+      712 -      }}},
+      713 -      want: "containerd://ok",
+      714 -    },
+      715 -    {
+      716 -      name: "none ready",
+      717 -      pod: &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+      718 -        {ContainerID: "containerd://abc", Ready: false},
+      719 -      }}},
+      720 -      want: "",
+      721 -    },
+      722 -  }
+      723 -  for _, tt := range tests {
+      724 -    t.Run(tt.name, func(t *testing.T) {
+      725 -      if got := firstReadyContainerID(tt.pod); got != tt.want {
+      726 -        t.Errorf("firstReadyContainerID() = %q, want %q", got, tt.want)
+      727 -      }
+      728 -    })
+      729 -  }
+      730 -}
+      731 -
+      732 -func TestFindPodByUID(t *testing.T) {
+      733 -  pods := []corev1.Pod{
+      734 -    {ObjectMeta: metav1.ObjectMeta{UID: "uid-a"}},
+      735 -    {ObjectMeta: metav1.ObjectMeta{UID: "uid-b"}},
+      736 -  }
+      737 -  if p := findPodByUID(pods, "uid-a"); p == nil || string(p.UID) != "uid-a" {
+      738 -    t.Error("findPodByUID failed to find uid-a")
+      739 -  }
+      740 -  if p := findPodByUID(pods, "uid-missing"); p != nil {
+      741 -    t.Error("findPodByUID should return nil for unknown UID")
+      742 -  }
+      743 -}
+      744 -
+      745 -func TestSetCondition(t *testing.T) {
+      746 -  injector := &tcv1alpha1.TCInjector{}
+      747 -
+      748 -  cond := metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "R", Message: "m"}
+      749 -  setCondition(injector, cond)
+      750 -  if len(injector.Status.Conditions) != 1 {
+      751 -    t.Fatalf("expected 1 condition, got %d", len(injector.Status.Conditions))
+      752 -  }
+      753 -
+      754 -  // Upsert the same type → should replace, not append.
+      755 -  cond.Message = "updated"
+      756 -  setCondition(injector, cond)
+      757 -  if len(injector.Status.Conditions) != 1 {
+      758 -    t.Fatalf("expected 1 condition after upsert, got %d", len(injector.Status.Conditions))
+      759 -  }
+      760 -  if injector.Status.Conditions[0].Message != "updated" {
+      761 -    t.Errorf("condition message = %q, want \"updated\"", injector.Status.Conditions[0].Message)
+      762 -  }
+      763 -
+      764 -  // Adding a different type → should append.
+      765 -  setCondition(injector, metav1.Condition{Type: "Other", Status: metav1.ConditionFalse, Reason: "R"})
+      766 -  if len(injector.Status.Conditions) != 2 {
+      767 -    t.Fatalf("expected 2 conditions, got %d", len(injector.Status.Conditions))
+      768 -  }
+      769 -}
+      770 -
+      590  // ---- injectPrimaryInterface tests ----
+      591
+      773 -func boolPtr(b bool) *bool { return &b }
+      774 -
+      592  func TestReconcile_InjectPrimaryInterface_Default_AppliesPrimary(t *testing.T) {
+      776 -  // nil InjectPrimaryInterface (default) must apply tc to the primary interface.
+      777 -  pod := readyPod("pod1", "default", "node-1", "containerd://ipi1",
+      593 +  // nil InjectPrimaryInterface (default) must apply tc to eth0 inside the pod netns.
+      594 +  const containerID = "containerd://ipi1"
+      595 +  ns := testNetns("ipi1")
+      596 +  pod := readyPod("pod1", "default", "node-1", containerID,
+      597      map[string]string{"app": "worker"})
+      598    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      599      {
+     ...
+      602        // InjectPrimaryInterface: nil → treated as true
+      603      },
+      604    })
+      786 -  finder := newFakeVethFinder(map[string]string{"containerd://ipi1": "vethIPI1"})
+      605 +  finder := newFakePodFinder(map[string]string{containerID: ns})
+      606    applier := newFakeTCApplier()
+      607    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      608
+     ...
+      610    if err != nil {
+      611      t.Fatalf("Reconcile error: %v", err)
+      612    }
+      794 -  if !applier.isApplied("vethIPI1") {
+      795 -    t.Error("expected tc rule applied to primary interface vethIPI1")
+      613 +  if !applier.isAppliedInNetns(ns, "eth0") {
+      614 +    t.Error("expected tc rule applied to eth0 (default injectPrimaryInterface)")
+      615    }
+      616  }
+      617
+      618  func TestReconcile_InjectPrimaryInterface_True_AppliesPrimary(t *testing.T) {
+      800 -  // Explicit true must apply tc to the primary interface.
+      801 -  pod := readyPod("pod1", "default", "node-1", "containerd://ipi2",
+      619 +  // Explicit true must apply tc to eth0.
+      620 +  const containerID = "containerd://ipi2"
+      621 +  ns := testNetns("ipi2")
+      622 +  pod := readyPod("pod1", "default", "node-1", containerID,
+      623      map[string]string{"app": "worker"})
+      624    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      625      {
+     ...
+      628        InjectPrimaryInterface: boolPtr(true),
+      629      },
+      630    })
+      810 -  finder := newFakeVethFinder(map[string]string{"containerd://ipi2": "vethIPI2"})
+      631 +  finder := newFakePodFinder(map[string]string{containerID: ns})
+      632    applier := newFakeTCApplier()
+      633    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      634
+     ...
+      636    if err != nil {
+      637      t.Fatalf("Reconcile error: %v", err)
+      638    }
+      818 -  if !applier.isApplied("vethIPI2") {
+      819 -    t.Error("expected tc rule applied to primary interface vethIPI2")
+      639 +  if !applier.isAppliedInNetns(ns, "eth0") {
+      640 +    t.Error("expected tc rule applied to eth0 (explicit injectPrimaryInterface=true)")
+      641    }
+      642  }
+      643
+      644  func TestReconcile_InjectPrimaryInterface_False_SkipsPrimary(t *testing.T) {
+      645    // injectPrimaryInterface: false with no multusNetworks → no tc applied at all.
+      825 -  pod := readyPod("pod1", "default", "node-1", "containerd://ipi3",
+      646 +  const containerID = "containerd://ipi3"
+      647 +  ns := testNetns("ipi3")
+      648 +  pod := readyPod("pod1", "default", "node-1", containerID,
+      649      map[string]string{"app": "worker"})
+      650    injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      651      {
+     ...
+      654        InjectPrimaryInterface: boolPtr(false),
+      655      },
+      656    })
+      834 -  finder := newFakeVethFinder(map[string]string{"containerd://ipi3": "vethIPI3"})
+      657 +  finder := newFakePodFinder(map[string]string{containerID: ns})
+      658    applier := newFakeTCApplier()
+      659    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      660
+     ...
+      662    if err != nil {
+      663      t.Fatalf("Reconcile error: %v", err)
+      664    }
+      842 -  if applier.isApplied("vethIPI3") {
+      843 -    t.Error("expected primary interface to be skipped, but tc was applied")
+      665 +  if applier.isAppliedInNetns(ns, "eth0") {
+      666 +    t.Error("expected eth0 to be skipped when injectPrimaryInterface=false")
+      667    }
+      845 -  if len(applier.applied) != 0 || len(applier.appliedNetns) != 0 {
+      846 -    t.Errorf("expected no tc rules applied at all, got host=%v netns=%v",
+      847 -      applier.applied, applier.appliedNetns)
+      668 +  if len(applier.appliedNetns) != 0 {
+      669 +    t.Errorf("expected no tc rules applied at all, got %v", applier.appliedNetns)
+      670    }
+      671  }
+      672
+      673  func TestReconcile_InjectPrimaryInterface_False_MultusOnly(t *testing.T) {
+      674    // injectPrimaryInterface: false + multusNetworks → only Multus interface gets tc,
+      853 -  // primary interface is untouched.
+      675 +  // eth0 is untouched.
+      676    const containerID = "containerd://ipi4"
+      855 -  const netnsPath = "/proc/9999/ns/net"
+      677 +  ns := testNetns("ipi4")
+      678    const multusAnnotation = `[{"name":"default/mynetwork","interface":"net1"}]`
+      679
+      680    pod := readyPod("pod1", "default", "node-1", containerID,
+     ...
+      690        InjectPrimaryInterface: boolPtr(false),
+      691      },
+      692    })
+      871 -  finder := &fakeVethFinder{
+      872 -    mapping:      map[string]string{containerID: "vethIPI4"},
+      873 -    netnsMapping: map[string]string{containerID: netnsPath},
+      874 -  }
+      693 +  finder := newFakePodFinder(map[string]string{containerID: ns})
+      694    applier := newFakeTCApplier()
+      695    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      696
+     ...
+      698    if err != nil {
+      699      t.Fatalf("Reconcile error: %v", err)
+      700    }
+      882 -  if applier.isApplied("vethIPI4") {
+      883 -    t.Error("primary interface should be skipped when injectPrimaryInterface=false")
+      701 +  if applier.isAppliedInNetns(ns, "eth0") {
+      702 +    t.Error("eth0 should be skipped when injectPrimaryInterface=false")
+      703    }
+      885 -  if !applier.isAppliedInNetns(netnsPath, "net1") {
+      704 +  if !applier.isAppliedInNetns(ns, "net1") {
+      705      t.Error("expected tc rule applied inside netns for Multus interface net1")
+      706    }
+      888 -  if applier.appliedNetns[netnsPath+":net1"] != 60 {
+      889 -    t.Errorf("Multus delay = %d, want 60", applier.appliedNetns[netnsPath+":net1"])
+      707 +  if applier.appliedNetns[ns+":net1"] != 60 {
+      708 +    t.Errorf("Multus delay = %d, want 60", applier.appliedNetns[ns+":net1"])
+      709    }
+      710  }
+      711
+      712  func TestReconcile_InjectPrimaryInterface_ToggleFalse_RemovesPrimary(t *testing.T) {
+      894 -  // First reconcile: injectPrimaryInterface=true → primary tc applied.
+      895 -  // Second reconcile: injectPrimaryInterface=false → primary tc removed.
+      713 +  // First reconcile: injectPrimaryInterface=true → eth0 tc applied.
+      714 +  // Second reconcile: injectPrimaryInterface=false → eth0 tc removed.
+      715    const containerID = "containerd://ipi5"
+      716 +  ns := testNetns("ipi5")
+      717
+      718    pod := readyPod("pod1", "default", "node-1", containerID,
+      719      map[string]string{"app": "worker"})
+     ...
+      724        InjectPrimaryInterface: boolPtr(true),
+      725      },
+      726    })
+      907 -  finder := newFakeVethFinder(map[string]string{containerID: "vethIPI5"})
+      727 +  finder := newFakePodFinder(map[string]string{containerID: ns})
+      728    applier := newFakeTCApplier()
+      729    r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      730
+      911 -  // First reconcile: primary should be injected.
+      731    if _, err := r.Reconcile(context.Background(), reconcileReq("test")); err != nil {
+      732      t.Fatalf("first Reconcile error: %v", err)
+      733    }
+      915 -  if !applier.isApplied("vethIPI5") {
+      916 -    t.Fatal("expected primary interface to be injected after first reconcile")
+      734 +  if !applier.isAppliedInNetns(ns, "eth0") {
+      735 +    t.Fatal("expected eth0 to be injected after first reconcile")
+      736    }
+      737
+      738    // Update the injector to disable primary injection.
+     ...
+      745      t.Fatalf("Update injector: %v", err)
+      746    }
+      747
+      929 -  // Second reconcile: primary should be removed.
+      748    if _, err := r.Reconcile(context.Background(), reconcileReq("test")); err != nil {
+      749      t.Fatalf("second Reconcile error: %v", err)
+      750    }
+      933 -  if applier.isApplied("vethIPI5") {
+      934 -    t.Error("expected primary interface tc to be removed after injectPrimaryInterface toggled to false")
+      751 +  if applier.isAppliedInNetns(ns, "eth0") {
+      752 +    t.Error("expected eth0 tc to be removed after injectPrimaryInterface toggled to false")
+      753    }
+      936 -  if !applier.wasRemoved("vethIPI5") {
+      937 -    t.Error("expected Remove to be called for vethIPI5")
+      754 +  if !applier.wasRemovedInNetns(ns, "eth0") {
+      755 +    t.Error("expected RemoveInNetns to be called for eth0")
+      756    }
+      757  }
+      758
+      759 +// ---- Multus interface tests ----
+      760 +
+      761 +func TestReconcile_MultusInterface_Applied(t *testing.T) {
+      762 +  const containerID = "containerd://mul1"
+      763 +  ns := testNetns("mul1")
+      764 +  const multusAnnotation = `[{"name":"default/mynetwork","interface":"net1"}]`
+      765 +
+      766 +  pod := readyPod("pod1", "default", "node-1", containerID,
+      767 +    map[string]string{"app": "worker"})
+      768 +  pod.Annotations = map[string]string{
+      769 +    multusNetworkStatusAnnotation: multusAnnotation,
+      770 +  }
+      771 +  injector := tcInjector("test", []tcv1alpha1.DelayRule{
+      772 +    {
+      773 +      Selector:       metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+      774 +      MinDelay:       80, MaxDelay: 80,
+      775 +      MultusNetworks: []string{"default/mynetwork"},
+      776 +    },
+      777 +  })
+      778 +  finder := newFakePodFinder(map[string]string{containerID: ns})
+      779 +  applier := newFakeTCApplier()
+      780 +  r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+      781 +
+      782 +  _, err := r.Reconcile(context.Background(), reconcileReq("test"))
+      783 +  if err != nil {
+      784 +    t.Fatalf("Reconcile error: %v", err)
+      785 +  }
+      786 +  // Both primary and Multus should be applied in the same netns.
+      787 +  if !applier.isAppliedInNetns(ns, "eth0") {
+      788 +    t.Error("expected tc rule applied to eth0 (primary)")
+      789 +  }
+      790 +  if !applier.isAppliedInNetns(ns, "net1") {
+      791 +    t.Error("expected tc rule applied to net1 (Multus)")
+      792 +  }
+      793 +  if applier.appliedNetns[ns+":eth0"] != 80 {
+      794 +    t.Errorf("primary delay = %d, want 80", applier.appliedNetns[ns+":eth0"])
+      795 +  }
+      796 +  if applier.appliedNetns[ns+":net1"] != 80 {
+      797 +    t.Errorf("multus delay = %d, want 80", applier.appliedNetns[ns+":net1"])
+      798 +  }
+      799 +}
+      800 +
+      801  // ---- nadMatches tests ----
+      802
+      803  func TestNadMatches(t *testing.T) {
+     ...
+      806      nadName        string
+      807      want           bool
+      808    }{
+      949 -    // Exact namespace/name match.
+      809      {"default/mynetwork", "default/mynetwork", true},
+      951 -    // Name-only matches any namespace.
+      810      {"default/mynetwork", "mynetwork", true},
+      811      {"kube-system/mynetwork", "mynetwork", true},
+      954 -    // Name-only does not match a different name.
+      812      {"default/mynetwork", "other", false},
+      956 -    // Fully qualified nadName does not match different namespace.
+      813      {"default/mynetwork", "kube-system/mynetwork", false},
+      958 -    // Annotation name without namespace, exact match.
+      814      {"mynetwork", "mynetwork", true},
+      960 -    // Annotation name without namespace, name-only search (no slash in nadName).
+      961 -    // strings.Cut won't find "/" in annotationName → falls through to false.
+      815      {"mynetwork", "other", false},
+      816    }
+      817    for _, tt := range tests {
+     ...
+       846    t.Run("invalid JSON returns nil", func(t *testing.T) {
+       847      pod := &corev1.Pod{
+       848        ObjectMeta: metav1.ObjectMeta{
+       996 -        Name:      "p",
+       997 -        Namespace: "default",
+       998 -        Annotations: map[string]string{
+       999 -          multusNetworkStatusAnnotation: "not-json",
+      1000 -        },
+       849 +        Name: "p", Namespace: "default",
+       850 +        Annotations: map[string]string{multusNetworkStatusAnnotation: "not-json"},
+       851        },
+       852      }
+       853      if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
+     ...
+       858    t.Run("exact namespace/name match", func(t *testing.T) {
+       859      pod := &corev1.Pod{
+       860        ObjectMeta: metav1.ObjectMeta{
+      1011 -        Name:      "p",
+      1012 -        Namespace: "default",
+       861 +        Name: "p", Namespace: "default",
+       862          Annotations: map[string]string{
+       863            multusNetworkStatusAnnotation: `[{"name":"default/mynetwork","interface":"net1"}]`,
+       864          },
+     ...
+       876    t.Run("name-only match across namespace", func(t *testing.T) {
+       877      pod := &corev1.Pod{
+       878        ObjectMeta: metav1.ObjectMeta{
+      1030 -        Name:      "p",
+      1031 -        Namespace: "default",
+       879 +        Name: "p", Namespace: "default",
+       880          Annotations: map[string]string{
+       881            multusNetworkStatusAnnotation: `[{"name":"kube-system/mynetwork","interface":"net2"}]`,
+       882          },
+     ...
+       894    t.Run("no match returns nil", func(t *testing.T) {
+       895      pod := &corev1.Pod{
+       896        ObjectMeta: metav1.ObjectMeta{
+      1049 -        Name:      "p",
+      1050 -        Namespace: "default",
+       897 +        Name: "p", Namespace: "default",
+       898          Annotations: map[string]string{
+       899            multusNetworkStatusAnnotation: `[{"name":"default/other","interface":"net1"}]`,
+       900          },
+     ...
+       908    t.Run("skips entry with empty interface name", func(t *testing.T) {
+       909      pod := &corev1.Pod{
+       910        ObjectMeta: metav1.ObjectMeta{
+      1064 -        Name:      "p",
+      1065 -        Namespace: "default",
+       911 +        Name: "p", Namespace: "default",
+       912          Annotations: map[string]string{
+      1067 -          // First entry has no interface (typical for the pod's own default network).
+       913            multusNetworkStatusAnnotation: `[{"name":"default/mynetwork","interface":""},{"name":"default/mynetwork","interface":"net1"}]`,
+       914          },
+       915        },
+     ...
+       923      }
+       924    })
+       925  }
+       926 +
+       927 +// ---- helper function tests ----
+       928 +
+       929 +func TestIsPodReady(t *testing.T) {
+       930 +  tests := []struct {
+       931 +    name string
+       932 +    pod  *corev1.Pod
+       933 +    want bool
+       934 +  }{
+       935 +    {
+       936 +      name: "running all ready",
+       937 +      pod: &corev1.Pod{
+       938 +        Status: corev1.PodStatus{
+       939 +          Phase: corev1.PodRunning,
+       940 +          ContainerStatuses: []corev1.ContainerStatus{
+       941 +            {Ready: true},
+       942 +            {Ready: true},
+       943 +          },
+       944 +        },
+       945 +      },
+       946 +      want: true,
+       947 +    },
+       948 +    {
+       949 +      name: "running one not ready",
+       950 +      pod: &corev1.Pod{
+       951 +        Status: corev1.PodStatus{
+       952 +          Phase: corev1.PodRunning,
+       953 +          ContainerStatuses: []corev1.ContainerStatus{
+       954 +            {Ready: true},
+       955 +            {Ready: false},
+       956 +          },
+       957 +        },
+       958 +      },
+       959 +      want: false,
+       960 +    },
+       961 +    {
+       962 +      name: "pending phase",
+       963 +      pod: &corev1.Pod{
+       964 +        Status: corev1.PodStatus{Phase: corev1.PodPending},
+       965 +      },
+       966 +      want: false,
+       967 +    },
+       968 +    {
+       969 +      name: "running no container statuses",
+       970 +      pod: &corev1.Pod{
+       971 +        Status: corev1.PodStatus{Phase: corev1.PodRunning},
+       972 +      },
+       973 +      want: true,
+       974 +    },
+       975 +  }
+       976 +  for _, tt := range tests {
+       977 +    t.Run(tt.name, func(t *testing.T) {
+       978 +      if got := isPodReady(tt.pod); got != tt.want {
+       979 +        t.Errorf("isPodReady() = %v, want %v", got, tt.want)
+       980 +      }
+       981 +    })
+       982 +  }
+       983 +}
+       984 +
+       985 +func TestFirstReadyContainerID(t *testing.T) {
+       986 +  tests := []struct {
+       987 +    name string
+       988 +    pod  *corev1.Pod
+       989 +    want string
+       990 +  }{
+       991 +    {
+       992 +      name: "first ready",
+       993 +      pod: &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+       994 +        {ContainerID: "containerd://abc", Ready: true},
+       995 +      }}},
+       996 +      want: "containerd://abc",
+       997 +    },
+       998 +    {
+       999 +      name: "skips not-ready then returns ready",
+      1000 +      pod: &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+      1001 +        {ContainerID: "containerd://bad", Ready: false},
+      1002 +        {ContainerID: "containerd://good", Ready: true},
+      1003 +      }}},
+      1004 +      want: "containerd://good",
+      1005 +    },
+      1006 +    {
+      1007 +      name: "skips empty container ID",
+      1008 +      pod: &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+      1009 +        {ContainerID: "", Ready: true},
+      1010 +        {ContainerID: "containerd://ok", Ready: true},
+      1011 +      }}},
+      1012 +      want: "containerd://ok",
+      1013 +    },
+      1014 +    {
+      1015 +      name: "none ready",
+      1016 +      pod: &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+      1017 +        {ContainerID: "containerd://abc", Ready: false},
+      1018 +      }}},
+      1019 +      want: "",
+      1020 +    },
+      1021 +  }
+      1022 +  for _, tt := range tests {
+      1023 +    t.Run(tt.name, func(t *testing.T) {
+      1024 +      if got := firstReadyContainerID(tt.pod); got != tt.want {
+      1025 +        t.Errorf("firstReadyContainerID() = %q, want %q", got, tt.want)
+      1026 +      }
+      1027 +    })
+      1028 +  }
+      1029 +}
+      1030 +
+      1031 +func TestFindPodByUID(t *testing.T) {
+      1032 +  pods := []corev1.Pod{
+      1033 +    {ObjectMeta: metav1.ObjectMeta{UID: "uid-a"}},
+      1034 +    {ObjectMeta: metav1.ObjectMeta{UID: "uid-b"}},
+      1035 +  }
+      1036 +  if p := findPodByUID(pods, "uid-a"); p == nil || string(p.UID) != "uid-a" {
+      1037 +    t.Error("findPodByUID failed to find uid-a")
+      1038 +  }
+      1039 +  if p := findPodByUID(pods, "uid-missing"); p != nil {
+      1040 +    t.Error("findPodByUID should return nil for unknown UID")
+      1041 +  }
+      1042 +}
+      1043 +
+      1044 +func TestSetCondition(t *testing.T) {
+      1045 +  injector := &tcv1alpha1.TCInjector{}
+      1046 +
+      1047 +  cond := metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "R", Message: "m"}
+      1048 +  setCondition(injector, cond)
+      1049 +  if len(injector.Status.Conditions) != 1 {
+      1050 +    t.Fatalf("expected 1 condition, got %d", len(injector.Status.Conditions))
+      1051 +  }
+      1052 +
+      1053 +  // Upsert the same type → should replace, not append.
+      1054 +  cond.Message = "updated"
+      1055 +  setCondition(injector, cond)
+      1056 +  if len(injector.Status.Conditions) != 1 {
+      1057 +    t.Fatalf("expected 1 condition after upsert, got %d", len(injector.Status.Conditions))
+      1058 +  }
+      1059 +  if injector.Status.Conditions[0].Message != "updated" {
+      1060 +    t.Errorf("condition message = %q, want \"updated\"", injector.Status.Conditions[0].Message)
+      1061 +  }
+      1062 +
+      1063 +  // Adding a different type → should append.
+      1064 +  setCondition(injector, metav1.Condition{Type: "Other", Status: metav1.ConditionFalse, Reason: "R"})
+      1065 +  if len(injector.Status.Conditions) != 2 {
+      1066 +    t.Fatalf("expected 2 conditions, got %d", len(injector.Status.Conditions))
+      1067 +  }
+      1068 +}
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ ここでビルドとテストを確認します：
+
+⏺ Bash(go build ./... 2>&1)
+  ⎿  (No output)
+  ⎿  Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+⏺ Bash(go test ./... 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       0.732s
+     … +2 lines (ctrl+o to expand)
+
+⏺ 全テストパス。次に go mod tidy で不要な依存を削除：
+
+⏺ Bash(go mod tidy 2>&1)
+  ⎿  (No output)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ 依存が削除されました。次に CRD YAML から interfaceIndex を削除してフィールド説明を更新：
+
+⏺ Update(config/crd/tcinjector.yaml)
+  ⎿  Added 3 lines, removed 5 lines
+      143                          description: Name of the target pod.
+      144                        interface:
+      145                          type: string
+      146 -                        description: Host-side network interface name.
+      147 -                      interfaceIndex:
+      148 -                        type: integer
+      149 -                        format: int32
+      150 -                        description: ifindex of the host-side interface.
+      146 +                        description: >
+      147 +                          Pod-side network interface name on which tc delay is injected
+      148 +                          (e.g. "eth0"). Empty when injectPrimaryInterface is false.
+      149                        delayMs:
+      150                          type: integer
+      151                          format: int32
+
+⏺ CRD の required リストから interfaceIndex を削除：
+
+⏺ Update(config/crd/tcinjector.yaml)
+  ⎿  Added 1 line, removed 1 line
+      130                    description: Details of tc rules currently applied on this node.
+      131                    items:
+      132                      type: object
+      133 -                    required: [nodeName, namespace, podName, interface, interfaceIndex, delayMs, tcCommand]
+      133 +                    required: [nodeName, namespace, podName, interface, delayMs, tcCommand]
+      134                      properties:
+      135                        nodeName:
+      136                          type: string
+
+⏺ 次に daemonset.yaml から hostNetwork: true を削除し、コメントを更新：
+
+⏺ Update(config/deploy/daemonset.yaml)
+  ⎿  Removed 1 line
+      19          app: tc-injector
+      20      spec:
+      21        serviceAccountName: tc-injector
+      22 -      hostNetwork: true
+      22        # hostPID is required so that /proc/<pid>/ns/net of target containers
+      23        # is reachable from within the DaemonSet pod.
+      24        hostPID: true
+
+⏺ Update(config/deploy/daemonset.yaml)
+  ⎿  Added 4 lines, removed 4 lines
+      48              privileged: false
+      49              capabilities:
+      50                add:
+      51 -                - NET_ADMIN    # Required for tc(8)/netem and netlink operations.
+      52 -                - SYS_ADMIN    # Required for setns(2) to enter pod network namespaces.
+      53 -                - SYS_PTRACE   # Required to access /proc/<pid>/ns/net for arbitrary PIDs (ptrace_may_access check).
+      54 -            runAsUser: 0      # Root is required to open /proc/<pid>/ns/net for arbitrary PIDs.
+      51 +                - NET_ADMIN    # Required: nsenter runs tc(8) inside the pod netns — tc requires NET_ADMIN.
+      52 +                - SYS_ADMIN    # Required: nsenter calls setns(2) to enter pod network namespaces.
+      53 +                - SYS_PTRACE   # Required: nsenter opens /proc/<pid>/ns/net of other processes.
+      54 +            runAsUser: 0      # Root is required to open /proc/<pid>/ entries of other processes.
+      55            resources:
+      56              requests:
+      57                cpu: 50m
+
+⏺ 次に scc.yaml を更新：
+
+⏺ Write(config/deploy/scc.yaml)
+  ⎿  Added 7 lines, removed 9 lines
+       8  allowHostPID: true
+       9  allowHostDirVolumePlugin: true
+      10  allowHostIPC: false
+      11 -# hostNetwork is required so the DaemonSet pod shares the host's default
+      12 -# network namespace, enabling netlink and tc(8) to reach host-side veth
+      13 -# interfaces (e.g. OVN-Kubernetes ports under ovs-system).
+      14 -allowHostNetwork: true
+      11 +# hostNetwork is not required: tc is applied inside pod network namespaces via nsenter,
+      12 +# so the DaemonSet pod does not need to share the host's default network namespace.
+      13 +allowHostNetwork: false
+      14  allowHostPorts: false
+      16 -# NET_ADMIN is required for tc/netem operations.
+      17 -# SYS_ADMIN is required for netlink and network namespace (setns) operations.
+      18 -# SYS_PTRACE is required to pass the kernel's ptrace_may_access() check when
+      19 -# opening /proc/<pid>/ns/net for containers running as a different UID.
+      15 +# NET_ADMIN is required for tc/netem operations run via nsenter inside the pod netns.
+      16 +# SYS_ADMIN is required for nsenter to call setns(2) when entering pod network namespaces.
+      17 +# SYS_PTRACE is required for nsenter to open /proc/<pid>/ns/net of other processes.
+      18  allowedCapabilities:
+      19    - NET_ADMIN
+      20    - SYS_ADMIN
+      21    - SYS_PTRACE
+      22  defaultAddCapabilities: []
+      23  requiredDropCapabilities: []
+      26 -# Must run as root: setns(2) requires UID 0 or CAP_SYS_ADMIN.
+      24 +# Must run as root: opening /proc/<pid>/ entries of other processes requires UID 0.
+      25  runAsUser:
+      26    type: RunAsAny
+      27  seLinuxContext:
+
+⏺ 最後に README を更新します：
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 14 lines, removed 12 lines
+       9  When a matching pod becomes ready on the node, tc-injector:
+      10
+      11  1. Connects to the node's CRI socket (containerd or CRI-O) to look up the container's PID.
+      12 -2. Enters the container's network namespace via `/proc/<pid>/ns/net`.
+      13 -3. Identifies the host-side `veth` interface that backs the container's `eth0`.
+      14 -4. Applies a `tc netem` qdisc to that veth interface, injecting the specified delay on all outbound traffic from the pod.
+      12 +2. Uses `nsenter --net=/proc/<pid>/ns/net` to enter the pod's network namespace.
+      13 +3. Applies a `tc netem` qdisc directly to `eth0` (and any Multus-managed interfaces) **inside** the pod, injecting the specified delay on all **outgoing** traffic
+         +from the pod.
+      14
+      15  When the pod is deleted or no longer matches any rule, the qdisc is removed and normal scheduling is restored.
+      16
+     ...
+      22  │  │  tc-injector │ ←────────────── │  TCInjector CRD  │ │
+      23  │  │  (DaemonSet) │                  └──────────────────┘ │
+      24  │  └──────┬───────┘                                        │
+      26 -│         │  tc qdisc replace dev vethXXXX                 │
+      25 +│         │  nsenter --net=/proc/<pid>/ns/net              │
+      26  │         ▼                                                 │
+      27  │  ┌─────────────────────────────────────────────────────┐ │
+      29 -│  │  host network namespace                              │ │
+      28 +│  │  pod network namespace                               │ │
+      29  │  │                                                      │ │
+      31 -│  │  vethXXXX ──[netem delay 30ms]──► pod eth0          │ │
+      30 +│  │  eth0 ──[netem delay 30ms]──► outbound packets      │ │
+      31 +│  │  net1 ──[netem delay 30ms]──► (Multus, if requested)│ │
+      32  │  └─────────────────────────────────────────────────────┘ │
+      33  └─────────────────────────────────────────────────────────┘
+      34  ```
+      35
+      36 +> **Direction**: tc delay is applied to **egress** traffic leaving the pod (outgoing packets).
+      37 +> This is the opposite of applying tc to the host-side veth peer, which would delay ingress.
+      38 +> For round-trip latency measurement (e.g. `ping`) the direction does not affect the observed RTT.
+      39 +
+      40  ### Multus Interface Support
+      41
+      38 -When a rule specifies `multusNetworks`, tc-injector also injects delay into interfaces added by [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) (e
+         -.g. ipvlan secondary interfaces). Because Multus-managed interfaces (such as ipvlan slaves) exist only inside the pod's network namespace — unlike primary `veth` i
+         -nterfaces which have a host-side peer — the `tc` rule must be applied **inside** the pod's network namespace using `nsenter`.
+      42 +When a rule specifies `multusNetworks`, tc-injector also injects delay into interfaces added by [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) (e
+         +.g. ipvlan secondary interfaces). Because all interfaces — both the primary `eth0` and Multus-managed ones — are targeted **inside** the pod's network namespace vi
+         +a `nsenter`, the same code path handles both uniformly.
+      43
+      44  ```
+      41 -# Primary interface (veth) — tc applied on host side (existing behavior)
+      42 -pod eth0  ←──peer──►  host vethXXXX  ←─[netem delay]
+      43 -
+      44 -# Multus interface (e.g. ipvlan) — tc applied inside pod netns
+      45 -pod net1 (ipvlan slave) ←─[netem delay, via nsenter]
+      45 +# All interfaces targeted inside the pod network namespace via nsenter
+      46 +nsenter --net=/proc/<pid>/ns/net -- tc qdisc replace dev eth0 root handle 1: netem delay 30ms
+      47 +nsenter --net=/proc/<pid>/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 30ms
+      48  ```
+      49
+      50  Multus writes the list of attached interfaces and their NetworkAttachmentDefinition (NAD) names into the `k8s.v1.cni.cncf.io/network-status` pod annotation. tc-inj
+          ector reads this annotation to resolve which interface name inside the pod corresponds to each requested NAD.
+
+⏺ 次に Prerequisites セクションとログの説明を更新します：
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+      65
+      66  - Kubernetes 1.26+ or OpenShift 4.12+
+      67  - CRI: containerd or CRI-O
+      68 -- `tc` and `netem` kernel module available on nodes (`iproute2` package)
+      68 +- `tc`, `nsenter`, and `netem` kernel module available on nodes (`iproute2` and `util-linux` packages)
+      69  - Cluster-admin privileges (required to apply CRD and RBAC)
+      70  - (Optional) [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) for secondary interface injection
+      71
+
+⏺ 次に「Verifying」セクションのログ例と tc qdisc show の手順を更新します：
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(README.md)
+  ⎿  Added 8 lines, removed 10 lines
+      391  A successful injection looks like:
+      392
+      393  ```
+      394 -INFO  applying tc delay  pod=backend-xxx  iface=veth1a2b3c  delayMs=37
+      394 +INFO  applying tc delay  pod=backend-xxx  iface=eth0  nad=primary  delayMs=37  tcCmd="nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev eth0 root handle 1:
+          +netem delay 37ms"
+      395  ```
+      396
+      397 -### 3. Inspect the tc qdisc directly on the node
+      397 +### 3. Inspect the tc qdisc inside the pod
+      398
+      399 -Exec into the tc-injector DaemonSet pod on the target node and run `tc qdisc show`:
+      399 +The exact tc command is recorded in `status.injectedPodDetails[].tcCommand`. You can verify the applied rule by running the same `nsenter` command from the Daemon
+          +Set pod on the target node:
+      400
+      401  ```bash
+      402  # Find the tc-injector pod on the target node
+      403  kubectl get pods -n tc-injector-system -o wide
+      404
+      405 -# Exec into it
+      406 -kubectl exec -it -n tc-injector-system <tc-injector-pod> -- bash
+      405 +# Get the PID of a process inside the target pod (from the status tcCommand or manually)
+      406 +kubectl get tcinjector <name> -o jsonpath='{.status.injectedPodDetails[*].tcCommand}'
+      407
+      408 -# List veth interfaces on the host
+      409 -ip link show | grep veth
+      410 -
+      411 -# Check the qdisc on a specific interface
+      412 -tc qdisc show dev <veth-iface>
+      408 +# Exec into the tc-injector DaemonSet pod and run nsenter
+      409 +kubectl exec -it -n tc-injector-system <tc-injector-pod> -- \
+      410 +  nsenter --net=/proc/<pid>/ns/net -- tc qdisc show dev eth0
+      411  ```
+      412
+      413  A successfully applied rule shows:
+
+⏺ 次にトラブルシューティング表と Multus デバッグコマンドを更新：
+
+⏺ Update(README.md)
+  ⎿  Added 3 lines, removed 3 lines
+      438  |---|---|---|
+      439  | `injectedPods: 0` | Selector mismatch | Check pod and namespace labels match the rule's selectors |
+      440  | No `applying tc delay` in logs | Pod not ready | Ensure pod is `Running` with all containers ready |
+      441 -| Log shows injection but no measured delay | tc applied to wrong interface | Verify with `tc qdisc show dev <iface>` inside the DaemonSet pod |
+      441 +| Log shows injection but no measured delay | tc applied, but direction mismatch | tc targets **egress** (packets leaving the pod); verify with `nsenter` (see ste
+          +p 3) |
+      442  | Pod is not targeted despite matching labels | Namespace labels missing | Run `kubectl get namespace <ns> --show-labels` and add required labels |
+      443  | Multus interface not injected (`multusInterfaces` empty in status) | Annotation missing or NAD name mismatch | Check the pod annotation and NAD name format (see
+            below) |
+      444 -| Log shows `skipping multus interface: netns path unavailable` | CRI lookup failed | Check DaemonSet logs for the preceding error from `FindNetnsPath` |
+      445 -| Primary interface delay unexpectedly absent | `injectPrimaryInterface: false` set in rule | This is intentional when targeting Multus interfaces only; set to `t
+          -rue` or omit to restore primary injection |
+      444 +| Log shows `cannot find netns path` | CRI lookup failed for container | Check DaemonSet logs; ensure the CRI socket is correctly mounted |
+      445 +| Primary interface delay unexpectedly absent | `injectPrimaryInterface: false` set in rule | Intentional when targeting only Multus interfaces; set to `true` or
+          +omit to restore primary injection |
+      446
+      447  ```bash
+      448  # Debug selector matching
+
+⏺ status の例も更新します：
+
+⏺ Update(README.md)
+  ⎿  Added 2 lines, removed 4 lines
+      354      - nodeName: worker-1
+      355        namespace: default
+      356        podName: worker-abc
+      357 -      interface: veth1a2b3c       # host-side veth for eth0
+      358 -      interfaceIndex: 42
+      357 +      interface: eth0             # pod-side primary interface name
+      358        delayMs: 37
+      360 -      tcCommand: "tc qdisc replace dev veth1a2b3c root handle 1: netem delay 37ms"
+      359 +      tcCommand: "nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev eth0 root handle 1: netem delay 37ms"
+      360        multusInterfaces:           # present when multusNetworks is specified
+      361          - nadName: default/mynetwork
+      362            interface: net1         # interface name inside the pod
+     ...
+      367        namespace: default
+      368        podName: multus-only-xyz
+      369        interface: ""               # empty: primary interface was skipped
+      371 -      interfaceIndex: 0
+      370        delayMs: 150
+      371        tcCommand: ""
+      372        multusInterfaces:
+
+⏺ 最後に全テストを実行して確認：
+
+⏺ Bash(go test ./... -count=1 2>&1)
+  ⎿  ?          github.com/tc-injector/tc-injector/cmd  [no test files]
+     ?          github.com/tc-injector/tc-injector/pkg/api/v1alpha1     [no test files]
+     ok         github.com/tc-injector/tc-injector/pkg/controller       0.809s
+     … +2 lines (ctrl+o to expand)
+
+⏺ 全テストパスです。変更内容をまとめます。
+
+  ---
+  実施内容
+
+  コード変更（機能）
+
+  pkg/tc/tc.go
+  - Rule 構造体、Apply、Remove 関数を削除
+  - ApplyInNetns/RemoveInNetns のみ残存
+  - Show(netnsPath, iface) のシグネチャを変更（netnsPath を受け取る）
+
+  pkg/veth/finder.go
+  - FindHostVeth、findHostVethFromNetns、podVethPeerIndex を削除
+  - netlink/netns パッケージ依存を除去（Go が veth ピア探索のために netns に入る処理が完全消滅）
+
+  pkg/controller/tcinjector_controller.go
+  - VethFinder → PodFinder（FindHostVeth を削除）
+  - TCApplier から Apply/Remove を削除
+  - injectedState を統一：host veth 名・ifindex・primaryInjected bool を廃止、interfaces []ifaceInjectedState（primary も Multus も同列）
+  - 調停ループを1本化：すべてのインターフェースを ApplyInNetns/RemoveInNetns で処理
+
+  pkg/api/v1alpha1/types.go
+  - InjectedPodStatus.InterfaceIndex を削除（意味がなくなったため）
+  - Interface フィールドのコメントを「pod-side interface name」に更新
+
+  go.mod
+  - github.com/vishvananda/netlink、github.com/vishvananda/netns を削除
+
+  セキュリティ変更
+
+  ┌─────────────┬────────┬───────────────┬─────────────────────────────────────────────────────────────────────────────────┐
+  │    設定     │ 変更前 │    変更後     │                                      理由                                       │
+  ├─────────────┼────────┼───────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ hostNetwork │ true   │ 削除（false） │ tc をホスト veth ではなく pod netns 内に適用するため、ホスト netns の共有が不要 │
+  ├─────────────┼────────┼───────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ NET_ADMIN   │ 必要   │ 維持          │ nsenter 経由の tc 実行に引き続き必要                                            │
+  ├─────────────┼────────┼───────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ SYS_ADMIN   │ 必要   │ 維持          │ nsenter が setns(2) を呼ぶために必要                                            │
+  ├─────────────┼────────┼───────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ SYS_PTRACE  │ 必要   │ 維持          │ nsenter が /proc/<pid>/ns/net を開くために必要                                  │
+  └─────────────┴────────┴───────────────┴─────────────────────────────────────────────────────────────────────────────────┘
+
+  hostNetwork: true の削除が最大のセキュリティ改善で、DaemonSet Pod がホストのネットワーク namespace を共有しなくなります。
+
+✻ Churned for 13m 36s
+```

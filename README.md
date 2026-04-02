@@ -9,9 +9,8 @@ tc-injector runs as a **DaemonSet** — one pod per node — and watches for `TC
 When a matching pod becomes ready on the node, tc-injector:
 
 1. Connects to the node's CRI socket (containerd or CRI-O) to look up the container's PID.
-2. Enters the container's network namespace via `/proc/<pid>/ns/net`.
-3. Identifies the host-side `veth` interface that backs the container's `eth0`.
-4. Applies a `tc netem` qdisc to that veth interface, injecting the specified delay on all outbound traffic from the pod.
+2. Uses `nsenter --net=/proc/<pid>/ns/net` to enter the pod's network namespace.
+3. Applies a `tc netem` qdisc directly to `eth0` (and any Multus-managed interfaces) **inside** the pod, injecting the specified delay on all **outgoing** traffic from the pod.
 
 When the pod is deleted or no longer matches any rule, the qdisc is removed and normal scheduling is restored.
 
@@ -23,26 +22,29 @@ When the pod is deleted or no longer matches any rule, the qdisc is removed and 
 │  │  tc-injector │ ←────────────── │  TCInjector CRD  │ │
 │  │  (DaemonSet) │                  └──────────────────┘ │
 │  └──────┬───────┘                                        │
-│         │  tc qdisc replace dev vethXXXX                 │
+│         │  nsenter --net=/proc/<pid>/ns/net              │
 │         ▼                                                 │
 │  ┌─────────────────────────────────────────────────────┐ │
-│  │  host network namespace                              │ │
+│  │  pod network namespace                               │ │
 │  │                                                      │ │
-│  │  vethXXXX ──[netem delay 30ms]──► pod eth0          │ │
+│  │  eth0 ──[netem delay 30ms]──► outbound packets      │ │
+│  │  net1 ──[netem delay 30ms]──► (Multus, if requested)│ │
 │  └─────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────┘
 ```
 
+> **Direction**: tc delay is applied to **egress** traffic leaving the pod (outgoing packets).
+> This is the opposite of applying tc to the host-side veth peer, which would delay ingress.
+> For round-trip latency measurement (e.g. `ping`) the direction does not affect the observed RTT.
+
 ### Multus Interface Support
 
-When a rule specifies `multusNetworks`, tc-injector also injects delay into interfaces added by [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) (e.g. ipvlan secondary interfaces). Because Multus-managed interfaces (such as ipvlan slaves) exist only inside the pod's network namespace — unlike primary `veth` interfaces which have a host-side peer — the `tc` rule must be applied **inside** the pod's network namespace using `nsenter`.
+When a rule specifies `multusNetworks`, tc-injector also injects delay into interfaces added by [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) (e.g. ipvlan secondary interfaces). Because all interfaces — both the primary `eth0` and Multus-managed ones — are targeted **inside** the pod's network namespace via `nsenter`, the same code path handles both uniformly.
 
 ```
-# Primary interface (veth) — tc applied on host side (existing behavior)
-pod eth0  ←──peer──►  host vethXXXX  ←─[netem delay]
-
-# Multus interface (e.g. ipvlan) — tc applied inside pod netns
-pod net1 (ipvlan slave) ←─[netem delay, via nsenter]
+# All interfaces targeted inside the pod network namespace via nsenter
+nsenter --net=/proc/<pid>/ns/net -- tc qdisc replace dev eth0 root handle 1: netem delay 30ms
+nsenter --net=/proc/<pid>/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 30ms
 ```
 
 Multus writes the list of attached interfaces and their NetworkAttachmentDefinition (NAD) names into the `k8s.v1.cni.cncf.io/network-status` pod annotation. tc-injector reads this annotation to resolve which interface name inside the pod corresponds to each requested NAD.
@@ -63,7 +65,7 @@ When `enablePeriodicDelayRotation: true` is set, the controller periodically re-
 
 - Kubernetes 1.26+ or OpenShift 4.12+
 - CRI: containerd or CRI-O
-- `tc` and `netem` kernel module available on nodes (`iproute2` package)
+- `tc`, `nsenter`, and `netem` kernel module available on nodes (`iproute2` and `util-linux` packages)
 - Cluster-admin privileges (required to apply CRD and RBAC)
 - (Optional) [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) for secondary interface injection
 
@@ -352,10 +354,9 @@ status:
     - nodeName: worker-1
       namespace: default
       podName: worker-abc
-      interface: veth1a2b3c       # host-side veth for eth0
-      interfaceIndex: 42
+      interface: eth0             # pod-side primary interface name
       delayMs: 37
-      tcCommand: "tc qdisc replace dev veth1a2b3c root handle 1: netem delay 37ms"
+      tcCommand: "nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev eth0 root handle 1: netem delay 37ms"
       multusInterfaces:           # present when multusNetworks is specified
         - nadName: default/mynetwork
           interface: net1         # interface name inside the pod
@@ -366,7 +367,6 @@ status:
       namespace: default
       podName: multus-only-xyz
       interface: ""               # empty: primary interface was skipped
-      interfaceIndex: 0
       delayMs: 150
       tcCommand: ""
       multusInterfaces:
@@ -389,25 +389,23 @@ kubectl logs -n tc-injector-system -l app=tc-injector -f
 A successful injection looks like:
 
 ```
-INFO  applying tc delay  pod=backend-xxx  iface=veth1a2b3c  delayMs=37
+INFO  applying tc delay  pod=backend-xxx  iface=eth0  nad=primary  delayMs=37  tcCmd="nsenter --net=/proc/1234/ns/net -- tc qdisc replace dev eth0 root handle 1: netem delay 37ms"
 ```
 
-### 3. Inspect the tc qdisc directly on the node
+### 3. Inspect the tc qdisc inside the pod
 
-Exec into the tc-injector DaemonSet pod on the target node and run `tc qdisc show`:
+The exact tc command is recorded in `status.injectedPodDetails[].tcCommand`. You can verify the applied rule by running the same `nsenter` command from the DaemonSet pod on the target node:
 
 ```bash
 # Find the tc-injector pod on the target node
 kubectl get pods -n tc-injector-system -o wide
 
-# Exec into it
-kubectl exec -it -n tc-injector-system <tc-injector-pod> -- bash
+# Get the PID of a process inside the target pod (from the status tcCommand or manually)
+kubectl get tcinjector <name> -o jsonpath='{.status.injectedPodDetails[*].tcCommand}'
 
-# List veth interfaces on the host
-ip link show | grep veth
-
-# Check the qdisc on a specific interface
-tc qdisc show dev <veth-iface>
+# Exec into the tc-injector DaemonSet pod and run nsenter
+kubectl exec -it -n tc-injector-system <tc-injector-pod> -- \
+  nsenter --net=/proc/<pid>/ns/net -- tc qdisc show dev eth0
 ```
 
 A successfully applied rule shows:
@@ -438,11 +436,11 @@ The measured RTT increase should correspond to the injected delay (`minDelay`-`m
 |---|---|---|
 | `injectedPods: 0` | Selector mismatch | Check pod and namespace labels match the rule's selectors |
 | No `applying tc delay` in logs | Pod not ready | Ensure pod is `Running` with all containers ready |
-| Log shows injection but no measured delay | tc applied to wrong interface | Verify with `tc qdisc show dev <iface>` inside the DaemonSet pod |
+| Log shows injection but no measured delay | tc applied, but direction mismatch | tc targets **egress** (packets leaving the pod); verify with `nsenter` (see step 3) |
 | Pod is not targeted despite matching labels | Namespace labels missing | Run `kubectl get namespace <ns> --show-labels` and add required labels |
 | Multus interface not injected (`multusInterfaces` empty in status) | Annotation missing or NAD name mismatch | Check the pod annotation and NAD name format (see below) |
-| Log shows `skipping multus interface: netns path unavailable` | CRI lookup failed | Check DaemonSet logs for the preceding error from `FindNetnsPath` |
-| Primary interface delay unexpectedly absent | `injectPrimaryInterface: false` set in rule | This is intentional when targeting Multus interfaces only; set to `true` or omit to restore primary injection |
+| Log shows `cannot find netns path` | CRI lookup failed for container | Check DaemonSet logs; ensure the CRI socket is correctly mounted |
+| Primary interface delay unexpectedly absent | `injectPrimaryInterface: false` set in rule | Intentional when targeting only Multus interfaces; set to `true` or omit to restore primary injection |
 
 ```bash
 # Debug selector matching

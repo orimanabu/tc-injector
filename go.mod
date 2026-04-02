@@ -4,8 +4,6 @@ go 1.22
 
 require (
 	github.com/go-logr/logr v1.4.1
-	github.com/vishvananda/netlink v1.1.0
-	github.com/vishvananda/netns v0.0.4
 	google.golang.org/grpc v1.62.0
 	k8s.io/api v0.29.3
 	k8s.io/apimachinery v0.29.3

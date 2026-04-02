@@ -22,28 +22,18 @@ import (
 
 // ---- fakes ----
 
-// fakeVethFinder maps containerID -> interface name and containerID -> netns path.
-// Returns an error for unknown IDs.
-type fakeVethFinder struct {
+// fakePodFinder maps containerID -> netns path.
+// Returns an error for unknown container IDs.
+type fakePodFinder struct {
 	mu           sync.Mutex
-	mapping      map[string]string // containerID -> host-side veth iface name
-	netnsMapping map[string]string // containerID -> netns path
+	netnsMapping map[string]string // containerID -> /proc/<pid>/ns/net
 }
 
-func newFakeVethFinder(m map[string]string) *fakeVethFinder {
-	return &fakeVethFinder{mapping: m}
+func newFakePodFinder(m map[string]string) *fakePodFinder {
+	return &fakePodFinder{netnsMapping: m}
 }
 
-func (f *fakeVethFinder) FindHostVeth(_ context.Context, containerID string) (string, int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if iface, ok := f.mapping[containerID]; ok {
-		return iface, 0, nil
-	}
-	return "", 0, fmt.Errorf("no veth mapping for container %q", containerID)
-}
-
-func (f *fakeVethFinder) FindNetnsPath(_ context.Context, containerID string) (string, error) {
+func (f *fakePodFinder) FindNetnsPath(_ context.Context, containerID string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if path, ok := f.netnsMapping[containerID]; ok {
@@ -52,43 +42,19 @@ func (f *fakeVethFinder) FindNetnsPath(_ context.Context, containerID string) (s
 	return "", fmt.Errorf("no netns mapping for container %q", containerID)
 }
 
-// fakeTCApplier records Apply, Remove, ApplyInNetns, and RemoveInNetns calls.
+// fakeTCApplier records ApplyInNetns and RemoveInNetns calls.
 type fakeTCApplier struct {
 	mu           sync.Mutex
-	applied      map[string]int32 // iface -> last applied delayMs (host iface)
 	appliedNetns map[string]int32 // "netnsPath:iface" -> last applied delayMs
-	removed      []string
-	removedNetns []string // "netnsPath:iface"
+	removedNetns []string         // "netnsPath:iface"
 	applyErr     error
 	removeErr    error
 }
 
 func newFakeTCApplier() *fakeTCApplier {
 	return &fakeTCApplier{
-		applied:      make(map[string]int32),
 		appliedNetns: make(map[string]int32),
 	}
-}
-
-func (f *fakeTCApplier) Apply(iface string, delayMs int32) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.applyErr != nil {
-		return f.applyErr
-	}
-	f.applied[iface] = delayMs
-	return nil
-}
-
-func (f *fakeTCApplier) Remove(iface string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.removeErr != nil {
-		return f.removeErr
-	}
-	delete(f.applied, iface)
-	f.removed = append(f.removed, iface)
-	return nil
 }
 
 func (f *fakeTCApplier) ApplyInNetns(netnsPath, iface string, delayMs int32) (string, error) {
@@ -115,13 +81,6 @@ func (f *fakeTCApplier) RemoveInNetns(netnsPath, iface string) error {
 	return nil
 }
 
-func (f *fakeTCApplier) isApplied(iface string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.applied[iface]
-	return ok
-}
-
 func (f *fakeTCApplier) isAppliedInNetns(netnsPath, iface string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -129,11 +88,12 @@ func (f *fakeTCApplier) isAppliedInNetns(netnsPath, iface string) bool {
 	return ok
 }
 
-func (f *fakeTCApplier) wasRemoved(iface string) bool {
+func (f *fakeTCApplier) wasRemovedInNetns(netnsPath, iface string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, r := range f.removed {
-		if r == iface {
+	key := netnsPath + ":" + iface
+	for _, r := range f.removedNetns {
+		if r == key {
 			return true
 		}
 	}
@@ -153,7 +113,7 @@ func init() {
 func buildReconciler(
 	t *testing.T,
 	objs []client.Object,
-	finder *fakeVethFinder,
+	finder *fakePodFinder,
 	applier *fakeTCApplier,
 ) (*Reconciler, *fake.ClientBuilder) {
 	t.Helper()
@@ -221,15 +181,20 @@ func durationPtr(d time.Duration) *metav1.Duration {
 	return &metav1.Duration{Duration: d}
 }
 
+func boolPtr(b bool) *bool { return &b }
+
 func reconcileReq(name string) reconcile.Request {
 	return reconcile.Request{NamespacedName: client.ObjectKey{Name: name}}
 }
+
+// testNetns returns a predictable netns path for use in tests.
+func testNetns(id string) string { return "/proc/test/" + id + "/ns/net" }
 
 // ---- Reconcile tests ----
 
 func TestReconcile_NoTCInjectors(t *testing.T) {
 	pod := readyPod("pod1", "default", "node-1", "containerd://aaa", map[string]string{"app": "x"})
-	finder := newFakeVethFinder(map[string]string{"containerd://aaa": "veth0"})
+	finder := newFakePodFinder(map[string]string{"containerd://aaa": testNetns("aaa")})
 	applier := newFakeTCApplier()
 	r, _ := buildReconciler(t, []client.Object{pod}, finder, applier)
 
@@ -237,13 +202,14 @@ func TestReconcile_NoTCInjectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile error: %v", err)
 	}
-	if len(applier.applied) != 0 {
-		t.Errorf("expected no tc rules applied, got %v", applier.applied)
+	if len(applier.appliedNetns) != 0 {
+		t.Errorf("expected no tc rules applied, got %v", applier.appliedNetns)
 	}
 }
 
 func TestReconcile_AppliesRuleToMatchingPod(t *testing.T) {
-	pod := readyPod("pod1", "default", "node-1", "containerd://bbb",
+	const containerID = "containerd://bbb"
+	pod := readyPod("pod1", "default", "node-1", containerID,
 		map[string]string{"app": "backend"})
 	injector := tcInjector("test", []tcv1alpha1.DelayRule{
 		{
@@ -252,7 +218,8 @@ func TestReconcile_AppliesRuleToMatchingPod(t *testing.T) {
 			MaxDelay: 50,
 		},
 	})
-	finder := newFakeVethFinder(map[string]string{"containerd://bbb": "veth1abc"})
+	ns := testNetns("bbb")
+	finder := newFakePodFinder(map[string]string{containerID: ns})
 	applier := newFakeTCApplier()
 	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
 
@@ -260,10 +227,10 @@ func TestReconcile_AppliesRuleToMatchingPod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile error: %v", err)
 	}
-	if !applier.isApplied("veth1abc") {
-		t.Error("expected tc rule applied to veth1abc")
+	if !applier.isAppliedInNetns(ns, "eth0") {
+		t.Errorf("expected tc rule applied inside netns %s on eth0", ns)
 	}
-	if delay := applier.applied["veth1abc"]; delay != 50 {
+	if delay := applier.appliedNetns[ns+":eth0"]; delay != 50 {
 		t.Errorf("delay = %d, want 50", delay)
 	}
 }
@@ -278,7 +245,7 @@ func TestReconcile_SkipsNonMatchingPod(t *testing.T) {
 			MaxDelay: 100,
 		},
 	})
-	finder := newFakeVethFinder(map[string]string{"containerd://ccc": "veth2"})
+	finder := newFakePodFinder(map[string]string{"containerd://ccc": testNetns("ccc")})
 	applier := newFakeTCApplier()
 	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
 
@@ -286,8 +253,8 @@ func TestReconcile_SkipsNonMatchingPod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile error: %v", err)
 	}
-	if len(applier.applied) != 0 {
-		t.Errorf("expected no tc rules applied, got %v", applier.applied)
+	if len(applier.appliedNetns) != 0 {
+		t.Errorf("expected no tc rules applied, got %v", applier.appliedNetns)
 	}
 }
 
@@ -301,7 +268,7 @@ func TestReconcile_SkipsPodOnDifferentNode(t *testing.T) {
 			MaxDelay: 10,
 		},
 	})
-	finder := newFakeVethFinder(map[string]string{"containerd://ddd": "veth3"})
+	finder := newFakePodFinder(map[string]string{"containerd://ddd": testNetns("ddd")})
 	applier := newFakeTCApplier()
 	// Reconciler is on node-1; pod is on node-2.
 	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
@@ -310,7 +277,7 @@ func TestReconcile_SkipsPodOnDifferentNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile error: %v", err)
 	}
-	if len(applier.applied) != 0 {
+	if len(applier.appliedNetns) != 0 {
 		t.Errorf("expected no rules for pods on other nodes")
 	}
 }
@@ -331,7 +298,7 @@ func TestReconcile_SkipsNotReadyPod(t *testing.T) {
 			MinDelay: 10, MaxDelay: 10,
 		},
 	})
-	finder := newFakeVethFinder(map[string]string{})
+	finder := newFakePodFinder(map[string]string{})
 	applier := newFakeTCApplier()
 	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
 
@@ -339,14 +306,15 @@ func TestReconcile_SkipsNotReadyPod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile error: %v", err)
 	}
-	if len(applier.applied) != 0 {
+	if len(applier.appliedNetns) != 0 {
 		t.Error("expected no tc rules for non-ready pod")
 	}
 }
 
 func TestReconcile_RemovesRuleWhenPodNoLongerMatches(t *testing.T) {
-	// First reconcile: pod matches → rule applied.
-	pod := readyPod("pod1", "default", "node-1", "containerd://eee",
+	const containerID = "containerd://eee"
+	ns := testNetns("eee")
+	pod := readyPod("pod1", "default", "node-1", containerID,
 		map[string]string{"app": "backend"})
 	injector := tcInjector("test", []tcv1alpha1.DelayRule{
 		{
@@ -354,7 +322,7 @@ func TestReconcile_RemovesRuleWhenPodNoLongerMatches(t *testing.T) {
 			MinDelay: 20, MaxDelay: 20,
 		},
 	})
-	finder := newFakeVethFinder(map[string]string{"containerd://eee": "veth4"})
+	finder := newFakePodFinder(map[string]string{containerID: ns})
 	applier := newFakeTCApplier()
 	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
 
@@ -362,7 +330,7 @@ func TestReconcile_RemovesRuleWhenPodNoLongerMatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Reconcile error: %v", err)
 	}
-	if !applier.isApplied("veth4") {
+	if !applier.isAppliedInNetns(ns, "eth0") {
 		t.Fatal("expected rule applied after first reconcile")
 	}
 
@@ -375,17 +343,18 @@ func TestReconcile_RemovesRuleWhenPodNoLongerMatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Reconcile error: %v", err)
 	}
-	if applier.isApplied("veth4") {
+	if applier.isAppliedInNetns(ns, "eth0") {
 		t.Error("expected rule removed after TCInjector deletion")
 	}
-	if !applier.wasRemoved("veth4") {
-		t.Error("expected Remove called on veth4")
+	if !applier.wasRemovedInNetns(ns, "eth0") {
+		t.Error("expected RemoveInNetns called for eth0")
 	}
 }
 
 func TestReconcile_MultipleRulesLastWins(t *testing.T) {
-	// A pod that matches two rules: the second rule's delay should win.
-	pod := readyPod("pod1", "default", "node-1", "containerd://fff",
+	const containerID = "containerd://fff"
+	ns := testNetns("fff")
+	pod := readyPod("pod1", "default", "node-1", containerID,
 		map[string]string{"app": "backend", "tier": "slow"})
 	injector := tcInjector("test", []tcv1alpha1.DelayRule{
 		{
@@ -397,7 +366,7 @@ func TestReconcile_MultipleRulesLastWins(t *testing.T) {
 			MinDelay: 200, MaxDelay: 200,
 		},
 	})
-	finder := newFakeVethFinder(map[string]string{"containerd://fff": "veth5"})
+	finder := newFakePodFinder(map[string]string{containerID: ns})
 	applier := newFakeTCApplier()
 	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
 
@@ -407,13 +376,13 @@ func TestReconcile_MultipleRulesLastWins(t *testing.T) {
 	}
 	// Both rules match; map iteration order is non-deterministic, so we only
 	// assert the final delay is one of the two defined values.
-	delay := applier.applied["veth5"]
+	delay := applier.appliedNetns[ns+":eth0"]
 	if delay != 10 && delay != 200 {
 		t.Errorf("delay = %d, want 10 or 200", delay)
 	}
 }
 
-func TestReconcile_VethFinderError_SkipsPod(t *testing.T) {
+func TestReconcile_PodFinderError_SkipsPod(t *testing.T) {
 	pod := readyPod("pod1", "default", "node-1", "containerd://ggg",
 		map[string]string{"app": "backend"})
 	injector := tcInjector("test", []tcv1alpha1.DelayRule{
@@ -423,23 +392,22 @@ func TestReconcile_VethFinderError_SkipsPod(t *testing.T) {
 		},
 	})
 	// Finder has no mapping for this container ID → will error.
-	finder := newFakeVethFinder(map[string]string{})
+	finder := newFakePodFinder(map[string]string{})
 	applier := newFakeTCApplier()
 	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
 
 	// Should not return an error (just logs and skips the pod).
 	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
 	if err != nil {
-		t.Fatalf("Reconcile should not fail when veth lookup fails: %v", err)
+		t.Fatalf("Reconcile should not fail when pod finder fails: %v", err)
 	}
-	if len(applier.applied) != 0 {
-		t.Error("expected no rules applied when veth lookup fails")
+	if len(applier.appliedNetns) != 0 {
+		t.Error("expected no rules applied when pod finder fails")
 	}
 }
 
 func TestReconcile_NoRequeueWhenNoTCInjectors(t *testing.T) {
-	// With no TCInjectors at all, periodic rotation cannot be enabled → no requeue.
-	r, _ := buildReconciler(t, nil, newFakeVethFinder(nil), newFakeTCApplier())
+	r, _ := buildReconciler(t, nil, newFakePodFinder(nil), newFakeTCApplier())
 	result, err := r.Reconcile(context.Background(), reconcileReq(""))
 	if err != nil {
 		t.Fatalf("Reconcile error: %v", err)
@@ -452,14 +420,13 @@ func TestReconcile_NoRequeueWhenNoTCInjectors(t *testing.T) {
 // ---- periodic delay rotation tests ----
 
 func TestReconcile_PeriodicRotation_DisabledByDefault_NoRequeue(t *testing.T) {
-	// enablePeriodicDelayRotation defaults to false → reconciler must not requeue.
 	injector := tcInjector("test", []tcv1alpha1.DelayRule{
 		{
 			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
 			MinDelay: 10, MaxDelay: 10,
 		},
 	})
-	r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+	r, _ := buildReconciler(t, []client.Object{injector}, newFakePodFinder(nil), newFakeTCApplier())
 
 	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
 	if err != nil {
@@ -471,14 +438,13 @@ func TestReconcile_PeriodicRotation_DisabledByDefault_NoRequeue(t *testing.T) {
 }
 
 func TestReconcile_PeriodicRotation_ExplicitlyDisabled_NoRequeue(t *testing.T) {
-	// enablePeriodicDelayRotation: false explicitly → no requeue.
 	injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
 		{
 			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
 			MinDelay: 10, MaxDelay: 10,
 		},
 	}, false, durationPtr(5*time.Second))
-	r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+	r, _ := buildReconciler(t, []client.Object{injector}, newFakePodFinder(nil), newFakeTCApplier())
 
 	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
 	if err != nil {
@@ -490,14 +456,13 @@ func TestReconcile_PeriodicRotation_ExplicitlyDisabled_NoRequeue(t *testing.T) {
 }
 
 func TestReconcile_PeriodicRotation_Enabled_DefaultInterval(t *testing.T) {
-	// enablePeriodicDelayRotation: true, delayInterval: nil → default 30s.
 	injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
 		{
 			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
 			MinDelay: 10, MaxDelay: 10,
 		},
 	}, true, nil)
-	r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+	r, _ := buildReconciler(t, []client.Object{injector}, newFakePodFinder(nil), newFakeTCApplier())
 
 	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
 	if err != nil {
@@ -509,14 +474,13 @@ func TestReconcile_PeriodicRotation_Enabled_DefaultInterval(t *testing.T) {
 }
 
 func TestReconcile_PeriodicRotation_Enabled_CustomInterval(t *testing.T) {
-	// enablePeriodicDelayRotation: true with a custom delayInterval → use that interval.
 	injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
 		{
 			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
 			MinDelay: 10, MaxDelay: 10,
 		},
 	}, true, durationPtr(2*time.Minute))
-	r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+	r, _ := buildReconciler(t, []client.Object{injector}, newFakePodFinder(nil), newFakeTCApplier())
 
 	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
 	if err != nil {
@@ -528,7 +492,6 @@ func TestReconcile_PeriodicRotation_Enabled_CustomInterval(t *testing.T) {
 }
 
 func TestReconcile_PeriodicRotation_MultipleInjectors_MinIntervalUsed(t *testing.T) {
-	// Two injectors both enabled with different intervals → shortest wins.
 	injectorA := tcInjectorWithRotation("injector-a", []tcv1alpha1.DelayRule{
 		{
 			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}},
@@ -541,7 +504,7 @@ func TestReconcile_PeriodicRotation_MultipleInjectors_MinIntervalUsed(t *testing
 			MinDelay: 20, MaxDelay: 20,
 		},
 	}, true, durationPtr(15*time.Second))
-	r, _ := buildReconciler(t, []client.Object{injectorA, injectorB}, newFakeVethFinder(nil), newFakeTCApplier())
+	r, _ := buildReconciler(t, []client.Object{injectorA, injectorB}, newFakePodFinder(nil), newFakeTCApplier())
 
 	result, err := r.Reconcile(context.Background(), reconcileReq("injector-a"))
 	if err != nil {
@@ -553,7 +516,6 @@ func TestReconcile_PeriodicRotation_MultipleInjectors_MinIntervalUsed(t *testing
 }
 
 func TestReconcile_PeriodicRotation_OnlyEnabledInjectorCounted(t *testing.T) {
-	// One injector enabled, one disabled → use only the enabled one's interval.
 	enabled := tcInjectorWithRotation("enabled", []tcv1alpha1.DelayRule{
 		{
 			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}},
@@ -566,7 +528,7 @@ func TestReconcile_PeriodicRotation_OnlyEnabledInjectorCounted(t *testing.T) {
 			MinDelay: 20, MaxDelay: 20,
 		},
 	}, false, durationPtr(5*time.Second))
-	r, _ := buildReconciler(t, []client.Object{enabled, disabled}, newFakeVethFinder(nil), newFakeTCApplier())
+	r, _ := buildReconciler(t, []client.Object{enabled, disabled}, newFakePodFinder(nil), newFakeTCApplier())
 
 	result, err := r.Reconcile(context.Background(), reconcileReq("enabled"))
 	if err != nil {
@@ -578,14 +540,13 @@ func TestReconcile_PeriodicRotation_OnlyEnabledInjectorCounted(t *testing.T) {
 }
 
 func TestReconcile_PeriodicRotation_ZeroInterval_FallsBackToDefault(t *testing.T) {
-	// delayInterval of 0 is treated as unset → fall back to 30s default.
 	injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
 		{
 			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "backend"}},
 			MinDelay: 10, MaxDelay: 10,
 		},
 	}, true, durationPtr(0))
-	r, _ := buildReconciler(t, []client.Object{injector}, newFakeVethFinder(nil), newFakeTCApplier())
+	r, _ := buildReconciler(t, []client.Object{injector}, newFakePodFinder(nil), newFakeTCApplier())
 
 	result, err := r.Reconcile(context.Background(), reconcileReq("test"))
 	if err != nil {
@@ -597,8 +558,9 @@ func TestReconcile_PeriodicRotation_ZeroInterval_FallsBackToDefault(t *testing.T
 }
 
 func TestReconcile_PeriodicRotation_Enabled_AppliesDelay(t *testing.T) {
-	// Verifies that with periodic rotation enabled, tc rules are still applied normally.
-	pod := readyPod("pod1", "default", "node-1", "containerd://rot1",
+	const containerID = "containerd://rot1"
+	ns := testNetns("rot1")
+	pod := readyPod("pod1", "default", "node-1", containerID,
 		map[string]string{"app": "backend"})
 	injector := tcInjectorWithRotation("test", []tcv1alpha1.DelayRule{
 		{
@@ -606,7 +568,7 @@ func TestReconcile_PeriodicRotation_Enabled_AppliesDelay(t *testing.T) {
 			MinDelay: 100, MaxDelay: 100,
 		},
 	}, true, durationPtr(10*time.Second))
-	finder := newFakeVethFinder(map[string]string{"containerd://rot1": "vethR1"})
+	finder := newFakePodFinder(map[string]string{containerID: ns})
 	applier := newFakeTCApplier()
 	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
 
@@ -614,15 +576,352 @@ func TestReconcile_PeriodicRotation_Enabled_AppliesDelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile error: %v", err)
 	}
-	if !applier.isApplied("vethR1") {
-		t.Error("expected tc rule applied to vethR1")
+	if !applier.isAppliedInNetns(ns, "eth0") {
+		t.Error("expected tc rule applied to eth0 inside pod netns")
 	}
-	if applier.applied["vethR1"] != 100 {
-		t.Errorf("delay = %d, want 100", applier.applied["vethR1"])
+	if applier.appliedNetns[ns+":eth0"] != 100 {
+		t.Errorf("delay = %d, want 100", applier.appliedNetns[ns+":eth0"])
 	}
 	if result.RequeueAfter != 10*time.Second {
 		t.Errorf("RequeueAfter = %v, want 10s", result.RequeueAfter)
 	}
+}
+
+// ---- injectPrimaryInterface tests ----
+
+func TestReconcile_InjectPrimaryInterface_Default_AppliesPrimary(t *testing.T) {
+	// nil InjectPrimaryInterface (default) must apply tc to eth0 inside the pod netns.
+	const containerID = "containerd://ipi1"
+	ns := testNetns("ipi1")
+	pod := readyPod("pod1", "default", "node-1", containerID,
+		map[string]string{"app": "worker"})
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay: 50, MaxDelay: 50,
+			// InjectPrimaryInterface: nil → treated as true
+		},
+	})
+	finder := newFakePodFinder(map[string]string{containerID: ns})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if !applier.isAppliedInNetns(ns, "eth0") {
+		t.Error("expected tc rule applied to eth0 (default injectPrimaryInterface)")
+	}
+}
+
+func TestReconcile_InjectPrimaryInterface_True_AppliesPrimary(t *testing.T) {
+	// Explicit true must apply tc to eth0.
+	const containerID = "containerd://ipi2"
+	ns := testNetns("ipi2")
+	pod := readyPod("pod1", "default", "node-1", containerID,
+		map[string]string{"app": "worker"})
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay:               40, MaxDelay: 40,
+			InjectPrimaryInterface: boolPtr(true),
+		},
+	})
+	finder := newFakePodFinder(map[string]string{containerID: ns})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if !applier.isAppliedInNetns(ns, "eth0") {
+		t.Error("expected tc rule applied to eth0 (explicit injectPrimaryInterface=true)")
+	}
+}
+
+func TestReconcile_InjectPrimaryInterface_False_SkipsPrimary(t *testing.T) {
+	// injectPrimaryInterface: false with no multusNetworks → no tc applied at all.
+	const containerID = "containerd://ipi3"
+	ns := testNetns("ipi3")
+	pod := readyPod("pod1", "default", "node-1", containerID,
+		map[string]string{"app": "worker"})
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay:               30, MaxDelay: 30,
+			InjectPrimaryInterface: boolPtr(false),
+		},
+	})
+	finder := newFakePodFinder(map[string]string{containerID: ns})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if applier.isAppliedInNetns(ns, "eth0") {
+		t.Error("expected eth0 to be skipped when injectPrimaryInterface=false")
+	}
+	if len(applier.appliedNetns) != 0 {
+		t.Errorf("expected no tc rules applied at all, got %v", applier.appliedNetns)
+	}
+}
+
+func TestReconcile_InjectPrimaryInterface_False_MultusOnly(t *testing.T) {
+	// injectPrimaryInterface: false + multusNetworks → only Multus interface gets tc,
+	// eth0 is untouched.
+	const containerID = "containerd://ipi4"
+	ns := testNetns("ipi4")
+	const multusAnnotation = `[{"name":"default/mynetwork","interface":"net1"}]`
+
+	pod := readyPod("pod1", "default", "node-1", containerID,
+		map[string]string{"app": "multus-only"})
+	pod.Annotations = map[string]string{
+		multusNetworkStatusAnnotation: multusAnnotation,
+	}
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "multus-only"}},
+			MinDelay:               60, MaxDelay: 60,
+			MultusNetworks:         []string{"default/mynetwork"},
+			InjectPrimaryInterface: boolPtr(false),
+		},
+	})
+	finder := newFakePodFinder(map[string]string{containerID: ns})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	if applier.isAppliedInNetns(ns, "eth0") {
+		t.Error("eth0 should be skipped when injectPrimaryInterface=false")
+	}
+	if !applier.isAppliedInNetns(ns, "net1") {
+		t.Error("expected tc rule applied inside netns for Multus interface net1")
+	}
+	if applier.appliedNetns[ns+":net1"] != 60 {
+		t.Errorf("Multus delay = %d, want 60", applier.appliedNetns[ns+":net1"])
+	}
+}
+
+func TestReconcile_InjectPrimaryInterface_ToggleFalse_RemovesPrimary(t *testing.T) {
+	// First reconcile: injectPrimaryInterface=true → eth0 tc applied.
+	// Second reconcile: injectPrimaryInterface=false → eth0 tc removed.
+	const containerID = "containerd://ipi5"
+	ns := testNetns("ipi5")
+
+	pod := readyPod("pod1", "default", "node-1", containerID,
+		map[string]string{"app": "worker"})
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay:               25, MaxDelay: 25,
+			InjectPrimaryInterface: boolPtr(true),
+		},
+	})
+	finder := newFakePodFinder(map[string]string{containerID: ns})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	if _, err := r.Reconcile(context.Background(), reconcileReq("test")); err != nil {
+		t.Fatalf("first Reconcile error: %v", err)
+	}
+	if !applier.isAppliedInNetns(ns, "eth0") {
+		t.Fatal("expected eth0 to be injected after first reconcile")
+	}
+
+	// Update the injector to disable primary injection.
+	var current tcv1alpha1.TCInjector
+	if err := r.Client.Get(context.Background(), client.ObjectKey{Name: "test"}, &current); err != nil {
+		t.Fatalf("Get injector: %v", err)
+	}
+	current.Spec.Rules[0].InjectPrimaryInterface = boolPtr(false)
+	if err := r.Client.Update(context.Background(), &current); err != nil {
+		t.Fatalf("Update injector: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), reconcileReq("test")); err != nil {
+		t.Fatalf("second Reconcile error: %v", err)
+	}
+	if applier.isAppliedInNetns(ns, "eth0") {
+		t.Error("expected eth0 tc to be removed after injectPrimaryInterface toggled to false")
+	}
+	if !applier.wasRemovedInNetns(ns, "eth0") {
+		t.Error("expected RemoveInNetns to be called for eth0")
+	}
+}
+
+// ---- Multus interface tests ----
+
+func TestReconcile_MultusInterface_Applied(t *testing.T) {
+	const containerID = "containerd://mul1"
+	ns := testNetns("mul1")
+	const multusAnnotation = `[{"name":"default/mynetwork","interface":"net1"}]`
+
+	pod := readyPod("pod1", "default", "node-1", containerID,
+		map[string]string{"app": "worker"})
+	pod.Annotations = map[string]string{
+		multusNetworkStatusAnnotation: multusAnnotation,
+	}
+	injector := tcInjector("test", []tcv1alpha1.DelayRule{
+		{
+			Selector:       metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+			MinDelay:       80, MaxDelay: 80,
+			MultusNetworks: []string{"default/mynetwork"},
+		},
+	})
+	finder := newFakePodFinder(map[string]string{containerID: ns})
+	applier := newFakeTCApplier()
+	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
+
+	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+	// Both primary and Multus should be applied in the same netns.
+	if !applier.isAppliedInNetns(ns, "eth0") {
+		t.Error("expected tc rule applied to eth0 (primary)")
+	}
+	if !applier.isAppliedInNetns(ns, "net1") {
+		t.Error("expected tc rule applied to net1 (Multus)")
+	}
+	if applier.appliedNetns[ns+":eth0"] != 80 {
+		t.Errorf("primary delay = %d, want 80", applier.appliedNetns[ns+":eth0"])
+	}
+	if applier.appliedNetns[ns+":net1"] != 80 {
+		t.Errorf("multus delay = %d, want 80", applier.appliedNetns[ns+":net1"])
+	}
+}
+
+// ---- nadMatches tests ----
+
+func TestNadMatches(t *testing.T) {
+	tests := []struct {
+		annotationName string
+		nadName        string
+		want           bool
+	}{
+		{"default/mynetwork", "default/mynetwork", true},
+		{"default/mynetwork", "mynetwork", true},
+		{"kube-system/mynetwork", "mynetwork", true},
+		{"default/mynetwork", "other", false},
+		{"default/mynetwork", "kube-system/mynetwork", false},
+		{"mynetwork", "mynetwork", true},
+		{"mynetwork", "other", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.annotationName+"~"+tt.nadName, func(t *testing.T) {
+			if got := nadMatches(tt.annotationName, tt.nadName); got != tt.want {
+				t.Errorf("nadMatches(%q, %q) = %v, want %v",
+					tt.annotationName, tt.nadName, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---- resolveMultusInterfaces tests ----
+
+func TestResolveMultusInterfaces(t *testing.T) {
+	logger := logr.Discard()
+
+	t.Run("empty nadNames returns nil", func(t *testing.T) {
+		pod := &corev1.Pod{}
+		if got := resolveMultusInterfaces(logger, pod, nil); got != nil {
+			t.Errorf("expected nil, got %v", got)
+		}
+	})
+
+	t.Run("annotation absent returns nil", func(t *testing.T) {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}}
+		if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
+			t.Errorf("expected nil when annotation absent, got %v", got)
+		}
+	})
+
+	t.Run("invalid JSON returns nil", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "p", Namespace: "default",
+				Annotations: map[string]string{multusNetworkStatusAnnotation: "not-json"},
+			},
+		}
+		if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
+			t.Errorf("expected nil on JSON error, got %v", got)
+		}
+	})
+
+	t.Run("exact namespace/name match", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "p", Namespace: "default",
+				Annotations: map[string]string{
+					multusNetworkStatusAnnotation: `[{"name":"default/mynetwork","interface":"net1"}]`,
+				},
+			},
+		}
+		got := resolveMultusInterfaces(logger, pod, []string{"default/mynetwork"})
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(got))
+		}
+		if got[0].nadName != "default/mynetwork" || got[0].ifaceName != "net1" {
+			t.Errorf("unexpected result: %+v", got[0])
+		}
+	})
+
+	t.Run("name-only match across namespace", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "p", Namespace: "default",
+				Annotations: map[string]string{
+					multusNetworkStatusAnnotation: `[{"name":"kube-system/mynetwork","interface":"net2"}]`,
+				},
+			},
+		}
+		got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"})
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(got))
+		}
+		if got[0].ifaceName != "net2" {
+			t.Errorf("expected interface net2, got %q", got[0].ifaceName)
+		}
+	})
+
+	t.Run("no match returns nil", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "p", Namespace: "default",
+				Annotations: map[string]string{
+					multusNetworkStatusAnnotation: `[{"name":"default/other","interface":"net1"}]`,
+				},
+			},
+		}
+		if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
+			t.Errorf("expected nil for no match, got %v", got)
+		}
+	})
+
+	t.Run("skips entry with empty interface name", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "p", Namespace: "default",
+				Annotations: map[string]string{
+					multusNetworkStatusAnnotation: `[{"name":"default/mynetwork","interface":""},{"name":"default/mynetwork","interface":"net1"}]`,
+				},
+			},
+		}
+		got := resolveMultusInterfaces(logger, pod, []string{"default/mynetwork"})
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result (empty interface skipped), got %d", len(got))
+		}
+		if got[0].ifaceName != "net1" {
+			t.Errorf("expected interface net1, got %q", got[0].ifaceName)
+		}
+	})
 }
 
 // ---- helper function tests ----
@@ -766,315 +1065,4 @@ func TestSetCondition(t *testing.T) {
 	if len(injector.Status.Conditions) != 2 {
 		t.Fatalf("expected 2 conditions, got %d", len(injector.Status.Conditions))
 	}
-}
-
-// ---- injectPrimaryInterface tests ----
-
-func boolPtr(b bool) *bool { return &b }
-
-func TestReconcile_InjectPrimaryInterface_Default_AppliesPrimary(t *testing.T) {
-	// nil InjectPrimaryInterface (default) must apply tc to the primary interface.
-	pod := readyPod("pod1", "default", "node-1", "containerd://ipi1",
-		map[string]string{"app": "worker"})
-	injector := tcInjector("test", []tcv1alpha1.DelayRule{
-		{
-			Selector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
-			MinDelay: 50, MaxDelay: 50,
-			// InjectPrimaryInterface: nil → treated as true
-		},
-	})
-	finder := newFakeVethFinder(map[string]string{"containerd://ipi1": "vethIPI1"})
-	applier := newFakeTCApplier()
-	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
-
-	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
-	if err != nil {
-		t.Fatalf("Reconcile error: %v", err)
-	}
-	if !applier.isApplied("vethIPI1") {
-		t.Error("expected tc rule applied to primary interface vethIPI1")
-	}
-}
-
-func TestReconcile_InjectPrimaryInterface_True_AppliesPrimary(t *testing.T) {
-	// Explicit true must apply tc to the primary interface.
-	pod := readyPod("pod1", "default", "node-1", "containerd://ipi2",
-		map[string]string{"app": "worker"})
-	injector := tcInjector("test", []tcv1alpha1.DelayRule{
-		{
-			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
-			MinDelay:               40, MaxDelay: 40,
-			InjectPrimaryInterface: boolPtr(true),
-		},
-	})
-	finder := newFakeVethFinder(map[string]string{"containerd://ipi2": "vethIPI2"})
-	applier := newFakeTCApplier()
-	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
-
-	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
-	if err != nil {
-		t.Fatalf("Reconcile error: %v", err)
-	}
-	if !applier.isApplied("vethIPI2") {
-		t.Error("expected tc rule applied to primary interface vethIPI2")
-	}
-}
-
-func TestReconcile_InjectPrimaryInterface_False_SkipsPrimary(t *testing.T) {
-	// injectPrimaryInterface: false with no multusNetworks → no tc applied at all.
-	pod := readyPod("pod1", "default", "node-1", "containerd://ipi3",
-		map[string]string{"app": "worker"})
-	injector := tcInjector("test", []tcv1alpha1.DelayRule{
-		{
-			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
-			MinDelay:               30, MaxDelay: 30,
-			InjectPrimaryInterface: boolPtr(false),
-		},
-	})
-	finder := newFakeVethFinder(map[string]string{"containerd://ipi3": "vethIPI3"})
-	applier := newFakeTCApplier()
-	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
-
-	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
-	if err != nil {
-		t.Fatalf("Reconcile error: %v", err)
-	}
-	if applier.isApplied("vethIPI3") {
-		t.Error("expected primary interface to be skipped, but tc was applied")
-	}
-	if len(applier.applied) != 0 || len(applier.appliedNetns) != 0 {
-		t.Errorf("expected no tc rules applied at all, got host=%v netns=%v",
-			applier.applied, applier.appliedNetns)
-	}
-}
-
-func TestReconcile_InjectPrimaryInterface_False_MultusOnly(t *testing.T) {
-	// injectPrimaryInterface: false + multusNetworks → only Multus interface gets tc,
-	// primary interface is untouched.
-	const containerID = "containerd://ipi4"
-	const netnsPath = "/proc/9999/ns/net"
-	const multusAnnotation = `[{"name":"default/mynetwork","interface":"net1"}]`
-
-	pod := readyPod("pod1", "default", "node-1", containerID,
-		map[string]string{"app": "multus-only"})
-	pod.Annotations = map[string]string{
-		multusNetworkStatusAnnotation: multusAnnotation,
-	}
-	injector := tcInjector("test", []tcv1alpha1.DelayRule{
-		{
-			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "multus-only"}},
-			MinDelay:               60, MaxDelay: 60,
-			MultusNetworks:         []string{"default/mynetwork"},
-			InjectPrimaryInterface: boolPtr(false),
-		},
-	})
-	finder := &fakeVethFinder{
-		mapping:      map[string]string{containerID: "vethIPI4"},
-		netnsMapping: map[string]string{containerID: netnsPath},
-	}
-	applier := newFakeTCApplier()
-	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
-
-	_, err := r.Reconcile(context.Background(), reconcileReq("test"))
-	if err != nil {
-		t.Fatalf("Reconcile error: %v", err)
-	}
-	if applier.isApplied("vethIPI4") {
-		t.Error("primary interface should be skipped when injectPrimaryInterface=false")
-	}
-	if !applier.isAppliedInNetns(netnsPath, "net1") {
-		t.Error("expected tc rule applied inside netns for Multus interface net1")
-	}
-	if applier.appliedNetns[netnsPath+":net1"] != 60 {
-		t.Errorf("Multus delay = %d, want 60", applier.appliedNetns[netnsPath+":net1"])
-	}
-}
-
-func TestReconcile_InjectPrimaryInterface_ToggleFalse_RemovesPrimary(t *testing.T) {
-	// First reconcile: injectPrimaryInterface=true → primary tc applied.
-	// Second reconcile: injectPrimaryInterface=false → primary tc removed.
-	const containerID = "containerd://ipi5"
-
-	pod := readyPod("pod1", "default", "node-1", containerID,
-		map[string]string{"app": "worker"})
-	injector := tcInjector("test", []tcv1alpha1.DelayRule{
-		{
-			Selector:               metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
-			MinDelay:               25, MaxDelay: 25,
-			InjectPrimaryInterface: boolPtr(true),
-		},
-	})
-	finder := newFakeVethFinder(map[string]string{containerID: "vethIPI5"})
-	applier := newFakeTCApplier()
-	r, _ := buildReconciler(t, []client.Object{pod, injector}, finder, applier)
-
-	// First reconcile: primary should be injected.
-	if _, err := r.Reconcile(context.Background(), reconcileReq("test")); err != nil {
-		t.Fatalf("first Reconcile error: %v", err)
-	}
-	if !applier.isApplied("vethIPI5") {
-		t.Fatal("expected primary interface to be injected after first reconcile")
-	}
-
-	// Update the injector to disable primary injection.
-	var current tcv1alpha1.TCInjector
-	if err := r.Client.Get(context.Background(), client.ObjectKey{Name: "test"}, &current); err != nil {
-		t.Fatalf("Get injector: %v", err)
-	}
-	current.Spec.Rules[0].InjectPrimaryInterface = boolPtr(false)
-	if err := r.Client.Update(context.Background(), &current); err != nil {
-		t.Fatalf("Update injector: %v", err)
-	}
-
-	// Second reconcile: primary should be removed.
-	if _, err := r.Reconcile(context.Background(), reconcileReq("test")); err != nil {
-		t.Fatalf("second Reconcile error: %v", err)
-	}
-	if applier.isApplied("vethIPI5") {
-		t.Error("expected primary interface tc to be removed after injectPrimaryInterface toggled to false")
-	}
-	if !applier.wasRemoved("vethIPI5") {
-		t.Error("expected Remove to be called for vethIPI5")
-	}
-}
-
-// ---- nadMatches tests ----
-
-func TestNadMatches(t *testing.T) {
-	tests := []struct {
-		annotationName string
-		nadName        string
-		want           bool
-	}{
-		// Exact namespace/name match.
-		{"default/mynetwork", "default/mynetwork", true},
-		// Name-only matches any namespace.
-		{"default/mynetwork", "mynetwork", true},
-		{"kube-system/mynetwork", "mynetwork", true},
-		// Name-only does not match a different name.
-		{"default/mynetwork", "other", false},
-		// Fully qualified nadName does not match different namespace.
-		{"default/mynetwork", "kube-system/mynetwork", false},
-		// Annotation name without namespace, exact match.
-		{"mynetwork", "mynetwork", true},
-		// Annotation name without namespace, name-only search (no slash in nadName).
-		// strings.Cut won't find "/" in annotationName → falls through to false.
-		{"mynetwork", "other", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.annotationName+"~"+tt.nadName, func(t *testing.T) {
-			if got := nadMatches(tt.annotationName, tt.nadName); got != tt.want {
-				t.Errorf("nadMatches(%q, %q) = %v, want %v",
-					tt.annotationName, tt.nadName, got, tt.want)
-			}
-		})
-	}
-}
-
-// ---- resolveMultusInterfaces tests ----
-
-func TestResolveMultusInterfaces(t *testing.T) {
-	logger := logr.Discard()
-
-	t.Run("empty nadNames returns nil", func(t *testing.T) {
-		pod := &corev1.Pod{}
-		if got := resolveMultusInterfaces(logger, pod, nil); got != nil {
-			t.Errorf("expected nil, got %v", got)
-		}
-	})
-
-	t.Run("annotation absent returns nil", func(t *testing.T) {
-		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}}
-		if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
-			t.Errorf("expected nil when annotation absent, got %v", got)
-		}
-	})
-
-	t.Run("invalid JSON returns nil", func(t *testing.T) {
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "p",
-				Namespace: "default",
-				Annotations: map[string]string{
-					multusNetworkStatusAnnotation: "not-json",
-				},
-			},
-		}
-		if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
-			t.Errorf("expected nil on JSON error, got %v", got)
-		}
-	})
-
-	t.Run("exact namespace/name match", func(t *testing.T) {
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "p",
-				Namespace: "default",
-				Annotations: map[string]string{
-					multusNetworkStatusAnnotation: `[{"name":"default/mynetwork","interface":"net1"}]`,
-				},
-			},
-		}
-		got := resolveMultusInterfaces(logger, pod, []string{"default/mynetwork"})
-		if len(got) != 1 {
-			t.Fatalf("expected 1 result, got %d", len(got))
-		}
-		if got[0].nadName != "default/mynetwork" || got[0].ifaceName != "net1" {
-			t.Errorf("unexpected result: %+v", got[0])
-		}
-	})
-
-	t.Run("name-only match across namespace", func(t *testing.T) {
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "p",
-				Namespace: "default",
-				Annotations: map[string]string{
-					multusNetworkStatusAnnotation: `[{"name":"kube-system/mynetwork","interface":"net2"}]`,
-				},
-			},
-		}
-		got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"})
-		if len(got) != 1 {
-			t.Fatalf("expected 1 result, got %d", len(got))
-		}
-		if got[0].ifaceName != "net2" {
-			t.Errorf("expected interface net2, got %q", got[0].ifaceName)
-		}
-	})
-
-	t.Run("no match returns nil", func(t *testing.T) {
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "p",
-				Namespace: "default",
-				Annotations: map[string]string{
-					multusNetworkStatusAnnotation: `[{"name":"default/other","interface":"net1"}]`,
-				},
-			},
-		}
-		if got := resolveMultusInterfaces(logger, pod, []string{"mynetwork"}); got != nil {
-			t.Errorf("expected nil for no match, got %v", got)
-		}
-	})
-
-	t.Run("skips entry with empty interface name", func(t *testing.T) {
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "p",
-				Namespace: "default",
-				Annotations: map[string]string{
-					// First entry has no interface (typical for the pod's own default network).
-					multusNetworkStatusAnnotation: `[{"name":"default/mynetwork","interface":""},{"name":"default/mynetwork","interface":"net1"}]`,
-				},
-			},
-		}
-		got := resolveMultusInterfaces(logger, pod, []string{"default/mynetwork"})
-		if len(got) != 1 {
-			t.Fatalf("expected 1 result (empty interface skipped), got %d", len(got))
-		}
-		if got[0].ifaceName != "net1" {
-			t.Errorf("expected interface net1, got %q", got[0].ifaceName)
-		}
-	})
 }

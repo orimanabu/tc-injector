@@ -1,18 +1,14 @@
-// Package veth provides utilities to find the host-side veth interface
-// for a pod running with OVN-Kubernetes CNI.
+// Package veth provides utilities to resolve a pod's network namespace path
+// from its container ID via the CRI (Container Runtime Interface).
 package veth
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
-	"runtime"
 	"strings"
 
-	"github.com/vishvananda/netlink"
-	"github.com/vishvananda/netns"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	criapi "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -28,7 +24,7 @@ var knownCRISockets = []string{
 	"/var/run/crio/crio.sock",
 }
 
-// Finder resolves pod container IDs to host-side veth interface names.
+// Finder resolves pod container IDs to the pod's network namespace path.
 type Finder struct {
 	criSocket string
 	criClient criapi.RuntimeServiceClient
@@ -89,23 +85,6 @@ func (f *Finder) FindNetnsPath(ctx context.Context, containerID string) (string,
 		return "", fmt.Errorf("empty container ID after stripping runtime prefix: %q", containerID)
 	}
 	return f.resolveNetnsPath(ctx, id)
-}
-
-// FindHostVeth returns the host-side veth interface name and ifindex for the
-// pod container. containerID should be in the form "containerd://<id>" or
-// "cri-o://<id>" as stored in pod status.
-func (f *Finder) FindHostVeth(ctx context.Context, containerID string) (string, int, error) {
-	id := stripRuntimePrefix(containerID)
-	if id == "" {
-		return "", 0, fmt.Errorf("empty container ID after stripping runtime prefix: %q", containerID)
-	}
-
-	netnsPath, err := f.resolveNetnsPath(ctx, id)
-	if err != nil {
-		return "", 0, fmt.Errorf("get netns for container %s: %w", id, err)
-	}
-
-	return findHostVethFromNetns(netnsPath)
 }
 
 // resolveNetnsPath determines the network namespace path for the given container.
@@ -207,86 +186,6 @@ func pidFromInfoMap(info map[string]string) (int, bool) {
 // The DaemonSet mounts the host's /proc at procMountPath.
 func procNetnsPath(pid int) string {
 	return fmt.Sprintf("%s/%d/ns/net", procMountPath, pid)
-}
-
-// findHostVethFromNetns enters the pod network namespace, obtains the peer
-// ifindex of the veth interface, then maps it back to a host interface name
-// and ifindex.
-func findHostVethFromNetns(netnsPath string) (string, int, error) {
-	if _, err := os.Stat(netnsPath); err != nil {
-		return "", 0, fmt.Errorf("netns path %s not accessible: %w", netnsPath, err)
-	}
-
-	hostNS, err := netns.Get()
-	if err != nil {
-		return "", 0, fmt.Errorf("get host netns: %w", err)
-	}
-	defer hostNS.Close()
-
-	podNS, err := netns.GetFromPath(netnsPath)
-	if err != nil {
-		return "", 0, fmt.Errorf("open pod netns %s: %w", netnsPath, err)
-	}
-	defer podNS.Close()
-
-	// LockOSThread pins this goroutine to its OS thread so that netns.Set,
-	// which calls setns(2), takes effect only for this thread.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	if err := netns.Set(podNS); err != nil {
-		return "", 0, fmt.Errorf("enter pod netns: %w", err)
-	}
-
-	peerIdx, findErr := podVethPeerIndex()
-
-	// Always restore the host namespace, even on error.
-	if restoreErr := netns.Set(hostNS); restoreErr != nil {
-		// This is unrecoverable: the goroutine's thread is stuck in the wrong netns.
-		panic(fmt.Sprintf("tc-injector: failed to restore host netns: %v", restoreErr))
-	}
-
-	if findErr != nil {
-		return "", 0, fmt.Errorf("find veth peer index in pod netns: %w", findErr)
-	}
-
-	// Look up the peer interface by ifindex in the host default netns.
-	link, err := netlink.LinkByIndex(peerIdx)
-	if err != nil {
-		return "", 0, fmt.Errorf("lookup host link by index %d: %w", peerIdx, err)
-	}
-
-	return link.Attrs().Name, link.Attrs().Index, nil
-}
-
-// podVethPeerIndex returns the peer ifindex of the first non-loopback veth
-// inside the currently active network namespace.
-//
-// We use Attrs().ParentIndex (IFLA_LINK) instead of Veth.PeerName because
-// netlink.LinkList() issues RTM_GETLINK in dump mode (NLM_F_DUMP), which does
-// not include VETH_INFO_PEER data when the peer resides in a different network
-// namespace. IFLA_LINK (the peer ifindex) is always present in dump responses
-// and corresponds to the "@ifN" suffix shown by "ip link".
-func podVethPeerIndex() (int, error) {
-	links, err := netlink.LinkList()
-	if err != nil {
-		return 0, fmt.Errorf("list links in pod netns: %w", err)
-	}
-
-	for _, link := range links {
-		if link.Type() != "veth" {
-			continue
-		}
-		if link.Attrs().Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		peerIdx := link.Attrs().ParentIndex
-		if peerIdx == 0 {
-			continue
-		}
-		return peerIdx, nil
-	}
-	return 0, fmt.Errorf("no veth interface with a valid peer index found in pod netns")
 }
 
 // stripRuntimePrefix removes scheme prefixes like "containerd://", "cri-o://",

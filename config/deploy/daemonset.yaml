@@ -19,7 +19,6 @@ spec:
         app: tc-injector
     spec:
       serviceAccountName: tc-injector
-      hostNetwork: true
       # hostPID is required so that /proc/<pid>/ns/net of target containers
       # is reachable from within the DaemonSet pod.
       hostPID: true
@@ -49,10 +48,10 @@ spec:
             privileged: false
             capabilities:
               add:
-                - NET_ADMIN    # Required for tc(8)/netem and netlink operations.
-                - SYS_ADMIN    # Required for setns(2) to enter pod network namespaces.
-                - SYS_PTRACE   # Required to access /proc/<pid>/ns/net for arbitrary PIDs (ptrace_may_access check).
-            runAsUser: 0      # Root is required to open /proc/<pid>/ns/net for arbitrary PIDs.
+                - NET_ADMIN    # Required: nsenter runs tc(8) inside the pod netns — tc requires NET_ADMIN.
+                - SYS_ADMIN    # Required: nsenter calls setns(2) to enter pod network namespaces.
+                - SYS_PTRACE   # Required: nsenter opens /proc/<pid>/ns/net of other processes.
+            runAsUser: 0      # Root is required to open /proc/<pid>/ entries of other processes.
           resources:
             requests:
               cpu: 50m

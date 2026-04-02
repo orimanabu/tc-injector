@@ -8,22 +8,20 @@ allowPrivilegedContainer: false
 allowHostPID: true
 allowHostDirVolumePlugin: true
 allowHostIPC: false
-# hostNetwork is required so the DaemonSet pod shares the host's default
-# network namespace, enabling netlink and tc(8) to reach host-side veth
-# interfaces (e.g. OVN-Kubernetes ports under ovs-system).
-allowHostNetwork: true
+# hostNetwork is not required: tc is applied inside pod network namespaces via nsenter,
+# so the DaemonSet pod does not need to share the host's default network namespace.
+allowHostNetwork: false
 allowHostPorts: false
-# NET_ADMIN is required for tc/netem operations.
-# SYS_ADMIN is required for netlink and network namespace (setns) operations.
-# SYS_PTRACE is required to pass the kernel's ptrace_may_access() check when
-# opening /proc/<pid>/ns/net for containers running as a different UID.
+# NET_ADMIN is required for tc/netem operations run via nsenter inside the pod netns.
+# SYS_ADMIN is required for nsenter to call setns(2) when entering pod network namespaces.
+# SYS_PTRACE is required for nsenter to open /proc/<pid>/ns/net of other processes.
 allowedCapabilities:
   - NET_ADMIN
   - SYS_ADMIN
   - SYS_PTRACE
 defaultAddCapabilities: []
 requiredDropCapabilities: []
-# Must run as root: setns(2) requires UID 0 or CAP_SYS_ADMIN.
+# Must run as root: opening /proc/<pid>/ entries of other processes requires UID 0.
 runAsUser:
   type: RunAsAny
 seLinuxContext:
