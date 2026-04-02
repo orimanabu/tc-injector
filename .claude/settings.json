@@ -8,6 +8,7 @@
       "Bash(go test *)",
       "Bash(go doc *)",
       "Bash(go vet *)",
+      "Bash(go mod tidy *)",
       "Bash(make build *)",
       "Bash(make test *)",
       "Bash(grep *)"
