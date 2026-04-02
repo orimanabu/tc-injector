@@ -15,22 +15,22 @@ When a matching pod becomes ready on the node, tc-injector:
 When the pod is deleted or no longer matches any rule, the qdisc is removed and normal scheduling is restored.
 
 ```
-┌─────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │  Kubernetes Node                                         │
 │                                                          │
-│  ┌──────────────┐     watches      ┌──────────────────┐ │
-│  │  tc-injector │ ←────────────── │  TCInjector CRD  │ │
-│  │  (DaemonSet) │                  └──────────────────┘ │
+│  ┌──────────────┐     watches      ┌──────────────────┐  │
+│  │  tc-injector │ ←────────────── │  TCInjector CRD   │  │
+│  │  (DaemonSet) │                  └──────────────────┘  │
 │  └──────┬───────┘                                        │
 │         │  nsenter --net=/proc/<pid>/ns/net              │
-│         ▼                                                 │
+│         ▼                                                │
 │  ┌─────────────────────────────────────────────────────┐ │
-│  │  pod network namespace                               │ │
-│  │                                                      │ │
+│  │  pod network namespace                              │ │
+│  │                                                     │ │
 │  │  eth0 ──[netem delay 30ms]──► outbound packets      │ │
 │  │  net1 ──[netem delay 30ms]──► (Multus, if requested)│ │
 │  └─────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘
 ```
 
 > **Direction**: tc delay is applied to **egress** traffic leaving the pod (outgoing packets).
@@ -39,13 +39,7 @@ When the pod is deleted or no longer matches any rule, the qdisc is removed and 
 
 ### Multus Interface Support
 
-When a rule specifies `multusNetworks`, tc-injector also injects delay into interfaces added by [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) (e.g. ipvlan secondary interfaces). Because all interfaces — both the primary `eth0` and Multus-managed ones — are targeted **inside** the pod's network namespace via `nsenter`, the same code path handles both uniformly.
-
-```
-# All interfaces targeted inside the pod network namespace via nsenter
-nsenter --net=/proc/<pid>/ns/net -- tc qdisc replace dev eth0 root handle 1: netem delay 30ms
-nsenter --net=/proc/<pid>/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 30ms
-```
+When a rule specifies `multusNetworks`, tc-injector also injects delay into interfaces added by [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) (e.g. ipvlan secondary interfaces). 
 
 Multus writes the list of attached interfaces and their NetworkAttachmentDefinition (NAD) names into the `k8s.v1.cni.cncf.io/network-status` pod annotation. tc-injector reads this annotation to resolve which interface name inside the pod corresponds to each requested NAD.
 
@@ -75,7 +69,7 @@ When `enablePeriodicDelayRotation: true` is set, the controller periodically re-
 
 ```bash
 make image IMAGE=<your-registry>/tc-injector:latest
-docker push <your-registry>/tc-injector:latest
+podman push <your-registry>/tc-injector:latest
 ```
 
 Update the `image:` field in `config/deploy/daemonset.yaml` to point to your registry.
@@ -109,8 +103,6 @@ make deploy-openshift
 kubectl get daemonset -n tc-injector-system
 kubectl get pods -n tc-injector-system
 ```
-
-All pods should be in the `Running` state with `1/1` containers ready.
 
 ## Custom Resource Reference
 
@@ -422,17 +414,106 @@ If there is no qdisc or the output is `qdisc noqueue ...`, the rule has not been
 
 ### 4. Measure actual latency from inside the pod
 
-```bash
-kubectl exec -it <target-pod> -- bash
+Suppose the TCInjector custom resource is configured as follows:
 
-# Ping another pod or service to measure RTT
-ping -c 10 <other-pod-ip>
-
-# Or measure HTTP response time with curl
-curl -o /dev/null -s -w "time_total: %{time_total}s\n" http://<service>/
+```
+apiVersion: tc-injector.setns.net/v1alpha1
+kind: TCInjector
+metadata:
+  name: example-delay
+spec:
+  rules:
+    - selector:                    
+        matchLabels:                        # This rule applies to pods labeled `app=multus-ipvlan`
+          app: multus-ipvlan                # in the `tmp` namespace.
+      namespaceSelector:                    #
+        matchLabels:                        #
+          kubernetes.io/metadata.name: tmp  #
+      minDelay: 600           # Set a 600ms–700ms latency
+      maxDelay: 700           #
+      target:
+        primary: false        # Excluded from the pod's primary interface (eth0).
+        multusNetworks:       # Set latency on additional interfaces connected
+          - tmp/nad-ipvlan-1  # to `nad-ipvlan-1` in the `tmp` namespace.
 ```
 
-The measured RTT increase should correspond to the injected delay (`minDelay`-`maxDelay` ms).
+Checking the .status of TCInjector shows that a 699ms latency has been applied to pod pod-with-delay.
+
+```
+$ kubectl get tcinjector example-delay -o yaml | yq '.status.injectedPodDetails.[] | select(.podName | contains("pod-with"))'
+delayMs: 699
+interface: ""
+multusInterfaces:
+  - delayMs: 699
+    interface: net1
+    nadName: tmp/nad-ipvlan-1
+    tcCommand: 'nsenter --net=/proc/1313495/ns/net -- tc qdisc replace dev net1 root handle 1: netem delay 699ms'
+namespace: tmp
+nodeName: wk3
+podName: pod-with-delay
+tcCommand: ""
+```
+
+Inspect the interfaces of pod-without-delay (no latency) and pod-with-delay (with latency).
+This confirms that `qdisc netem` is applied to net1 of pod-with-latency.
+
+- pod-without-latency
+```
+$ kubectl exec pod-without-delay -- ip addr show
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host
+       valid_lft forever preferred_lft forever
+2: eth0@if5096: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1400 qdisc noqueue state UP group default
+    link/ether 0a:58:0a:80:06:0f brd ff:ff:ff:ff:ff:ff link-netnsid 0
+    inet 10.128.6.15/24 brd 10.128.6.255 scope global eth0
+       valid_lft forever preferred_lft forever
+    inet6 fe80::858:aff:fe80:60f/64 scope link
+       valid_lft forever preferred_lft forever
+3: net1@if3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/ether 52:54:00:b3:5a:e9 brd ff:ff:ff:ff:ff:ff link-netnsid 0
+    inet 172.17.20.10/24 brd 172.17.20.255 scope global net1
+       valid_lft forever preferred_lft forever
+    inet6 fe80::5254:0:3b3:5ae9/64 scope link
+       valid_lft forever preferred_lft forever
+```
+
+- pod-with-latency
+```
+$ kubectl exec pod-with-delay -- ip addr show
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host
+       valid_lft forever preferred_lft forever
+2: eth0@if4496: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1400 qdisc noqueue state UP group default
+    link/ether 0a:58:0a:80:07:35 brd ff:ff:ff:ff:ff:ff link-netnsid 0
+    inet 10.128.7.53/24 brd 10.128.7.255 scope global eth0
+       valid_lft forever preferred_lft forever
+    inet6 fe80::858:aff:fe80:735/64 scope link
+       valid_lft forever preferred_lft forever
+3: net1@if3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc netem state UNKNOWN group default qlen 1000
+    link/ether 52:54:00:73:ce:05 brd ff:ff:ff:ff:ff:ff link-netnsid 0
+    inet 172.17.20.11/24 brd 172.17.20.255 scope global net1
+       valid_lft forever preferred_lft forever
+    inet6 fe80::5254:0:273:ce05/64 scope link
+       valid_lft forever preferred_lft forever
+```
+
+Ping results via net1 reflect the applied latency.
+
+```
+$ kubectl exec pod-with-delay -- ping -c 5 172.17.20.10
+PING 172.17.20.10 (172.17.20.10) 56(84) bytes of data.
+64 bytes from 172.17.20.10: icmp_seq=1 ttl=64 time=1399 ms
+64 bytes from 172.17.20.10: icmp_seq=2 ttl=64 time=699 ms
+64 bytes from 172.17.20.10: icmp_seq=3 ttl=64 time=699 ms
+64 bytes from 172.17.20.10: icmp_seq=4 ttl=64 time=699 ms
+64 bytes from 172.17.20.10: icmp_seq=5 ttl=64 time=699 ms
+```
 
 ### 5. Troubleshooting checklist
 
