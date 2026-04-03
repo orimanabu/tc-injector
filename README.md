@@ -19,7 +19,7 @@ When the pod is deleted or no longer matches any rule, the qdisc is removed and 
 │  Kubernetes Node                                         │
 │                                                          │
 │  ┌──────────────┐     watches      ┌──────────────────┐  │
-│  │  tc-injector │ ←────────────── │  TCInjector CRD   │  │
+│  │  tc-injector │ ←─────────────── │  TCInjector CRD  │  │
 │  │  (DaemonSet) │                  └──────────────────┘  │
 │  └──────┬───────┘                                        │
 │         │  nsenter --net=/proc/<pid>/ns/net              │
